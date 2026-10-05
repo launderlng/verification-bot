@@ -31,7 +31,13 @@ class VerificationBot(commands.Bot):
     async def setup_hook(self):
         await db.init()
         for ext in EXTENSIONS:
-            await self.load_extension(ext)
+            try:
+                await self.load_extension(ext)
+                log.info("Loaded %s", ext)
+            except commands.ExtensionNotFound:
+                log.error("MISSING FILE: %s (expected %s.py in your repo). Skipping it.", ext, ext.replace(".", "/"))
+            except Exception:
+                log.exception("Could not load %s. Skipping it.", ext)
         if DEV_GUILD_ID:
             guild = discord.Object(id=int(DEV_GUILD_ID))
             self.tree.copy_global_to(guild=guild)
