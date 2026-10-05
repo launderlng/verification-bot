@@ -1,0 +1,77 @@
+import logging
+import os
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import db  # noqa: E402  (imported after load_dotenv so DB_PATH is picked up)
+from common import UserError  # noqa: E402
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+DEV_GUILD_ID = os.getenv("GUILD_ID")  # optional: instant command sync to one server while developing
+EXTENSIONS = ["cogs.verify", "cogs.general"]
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("verification-bot")
+
+
+class VerificationBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True  # privileged: needed to see joins, assign roles and kick unverified members
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await db.init()
+        for ext in EXTENSIONS:
+            await self.load_extension(ext)
+        if DEV_GUILD_ID:
+            guild = discord.Object(id=int(DEV_GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            log.info("Synced commands to dev guild %s", DEV_GUILD_ID)
+        else:
+            await self.tree.sync()
+            log.info("Synced commands globally (can take up to an hour to appear)")
+
+    async def on_ready(self):
+        log.info("Logged in as %s (%s) in %d server(s)", self.user, self.user.id, len(self.guilds))
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="the front door ✅"))
+
+
+bot = VerificationBot()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", None)
+    if isinstance(original, UserError):
+        msg = f"⚠️ {original}"
+    elif isinstance(error, app_commands.MissingPermissions):
+        msg = "You don't have permission to use that command."
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        msg = "That command only works inside a server."
+    elif isinstance(original, discord.Forbidden):
+        msg = "I don't have permission to do that. Check my role position and permissions."
+    else:
+        log.exception("Unhandled command error", exc_info=error)
+        msg = "Something went wrong running that command."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("Set DISCORD_TOKEN in your .env file (see .env.example).")
+    try:
+        bot.run(TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        raise SystemExit(
+            "Enable 'Server Members Intent' for your bot: Developer Portal → your app → Bot → Privileged Gateway Intents."
+        )
