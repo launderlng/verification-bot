@@ -13,7 +13,7 @@ from common import UserError  # noqa: E402
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEV_GUILD_ID = os.getenv("GUILD_ID")  # optional: instant command sync to one server while developing
-EXTENSIONS = ["cogs.verify", "cogs.general"]
+EXTENSIONS = ["cogs.verify", "cogs.welcome", "cogs.logs", "cogs.moderation", "cogs.setup", "cogs.general"]
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("verification-bot")
@@ -23,6 +23,9 @@ class VerificationBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True  # privileged: needed to see joins, assign roles and kick unverified members
+        # Optional privileged intent: lets the log show the TEXT of deleted/edited messages.
+        # Turn it on in the Developer Portal first, then set MESSAGE_CONTENT=true.
+        intents.message_content = os.getenv("MESSAGE_CONTENT", "").strip().lower() in ("1", "true", "yes")
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -40,7 +43,7 @@ class VerificationBot(commands.Bot):
 
     async def on_ready(self):
         log.info("Logged in as %s (%s) in %d server(s)", self.user, self.user.id, len(self.guilds))
-        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="the front door ✅"))
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="bypassing your check"))
 
 
 bot = VerificationBot()
@@ -53,6 +56,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         msg = f"⚠️ {original}"
     elif isinstance(error, app_commands.MissingPermissions):
         msg = "You don't have permission to use that command."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        msg = "I'm missing a permission I need for that. Check my role's permissions."
     elif isinstance(error, app_commands.NoPrivateMessage):
         msg = "That command only works inside a server."
     elif isinstance(original, discord.Forbidden):
@@ -73,5 +78,6 @@ if __name__ == "__main__":
         bot.run(TOKEN)
     except discord.PrivilegedIntentsRequired:
         raise SystemExit(
-            "Enable 'Server Members Intent' for your bot: Developer Portal → your app → Bot → Privileged Gateway Intents."
+            "Enable 'Server Members Intent' (and 'Message Content Intent' if MESSAGE_CONTENT=true) for your bot: "
+            "Developer Portal → your app → Bot → Privileged Gateway Intents."
         )
