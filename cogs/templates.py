@@ -155,6 +155,8 @@ class Templates(commands.GroupCog, group_name="template", group_description="Cop
         notes.append("Members and messages aren't copied.")
         notes.extend(parsed.get("notes", []))
         embed.add_field(name="What happens", value="\n".join(f"• {n}" for n in notes)[:1024], inline=False)
+        if parsed.get("excluded"):
+            embed.add_field(name="Left out on purpose", value=("Channels built around cracks, cheats, ban evasion, account selling or leaks: " + ", ".join(parsed["excluded"]))[:1024], inline=False)
         await interaction.followup.send(embed=embed, view=ConfirmView(self, interaction.user.id, parsed, skip_existing), ephemeral=True)
 
     @app_commands.command(name="import", description="Copy a template's roles and channels into this server")
@@ -170,7 +172,10 @@ class Templates(commands.GroupCog, group_name="template", group_description="Cop
 
     @app_commands.command(description="Build a ready-made server layout: roles, channels and permissions")
     @app_commands.describe(layout="Which layout to build", skip_existing="Skip roles/channels that already exist here (default: yes)")
-    @app_commands.choices(layout=[app_commands.Choice(name="Community server (staff, verification, tickets, voice)", value="community")])
+    @app_commands.choices(layout=[
+        app_commands.Choice(name="Community server (staff, verification, tickets, voice)", value="community"),
+        app_commands.Choice(name="FiveM mod community (rebuilt from screenshots, no piracy/cheats)", value="fivem"),
+    ])
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.checks.bot_has_permissions(manage_roles=True, manage_channels=True)
     async def preset(self, interaction: discord.Interaction, layout: app_commands.Choice[str], skip_existing: bool = True):
