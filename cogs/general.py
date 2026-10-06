@@ -9,7 +9,7 @@ from discord.ext import commands
 import db
 from common import COLOR, INFO, UserError, check_can_send, parse_color
 
-GROUP_TITLES = {"verify": "Verification", "welcome": "Welcome", "logs": "Logs", "shop": "Shop", "ticket": "Tickets", "template": "Templates"}
+GROUP_TITLES = {"verify": "Verification", "welcome": "Welcome", "logs": "Logs", "shop": "Shop", "ticket": "Tickets", "template": "Templates", "reviews": "Reviews", "linkcard": "Links", "giveaway": "Giveaways"}
 CATEGORY_META = {
     "Setup": ("🚀", "Get started quickly"),
     "Verification": ("✅", "Keep bots and raiders out"),
@@ -17,6 +17,9 @@ CATEGORY_META = {
     "Shop": ("🛒", "Sell products with a Stripe Buy button"),
     "Tickets": ("🎫", "Private support tickets with transcripts"),
     "Templates": ("🧩", "Copy and share server layouts"),
+    "Reviews": ("⭐", "Star reviews and leaderboards"),
+    "Giveaways": ("🎉", "Run giveaways with one-click entry"),
+    "Links": ("🔗", "Quick link cards like /pyrex and /spotless"),
     "Logs": ("📋", "See everything that happens"),
     "Moderation": ("🛡️", "Kick, ban, timeout, warn and clean up"),
     "Info & tools": ("ℹ️", "Server info and handy extras"),
@@ -27,7 +30,7 @@ CATEGORY_ORDER = list(CATEGORY_META)
 def category_of(cmd) -> str:
     if isinstance(cmd, app_commands.Group):
         return GROUP_TITLES.get(cmd.name, cmd.name.title())
-    return {"Moderation": "Moderation", "Setup": "Setup", "BuyCog": "Shop"}.get(type(getattr(cmd, "binding", None)).__name__, "Info & tools")
+    return {"Moderation": "Moderation", "Setup": "Setup", "BuyCog": "Shop", "ReviewCog": "Reviews", "LinkShow": "Links"}.get(type(getattr(cmd, "binding", None)).__name__, "Info & tools")
 
 
 def collect(bot: commands.Bot) -> dict[str, list]:
@@ -117,14 +120,14 @@ class General(commands.Cog):
 
         modules = [f"{'✅' if status == 'ok' else '❌'} `{name}`: {status}" for name, status in getattr(bot, "extension_status", {}).items()]
 
-        top_files = ["bot.py", "db.py", "common.py", "logutil.py", "stripeutil.py", "transcript.py", "templateutil.py", "presets.py", "welcomecard.py", "captcha.py"]
+        top_files = ["bot.py", "db.py", "common.py", "logutil.py", "stripeutil.py", "transcript.py", "templateutil.py", "presets.py", "ui.py", "giveawayutil.py", "welcomecard.py", "captcha.py"]
         missing = [f for f in top_files if not os.path.exists(os.path.join(base, f))]
-        misplaced = [f"{n}.py" for n in ("verify", "welcome", "logs", "moderation", "shop", "tickets", "templates", "setup", "general") if os.path.exists(os.path.join(base, f"{n}.py"))]
+        misplaced = [f"{n}.py" for n in ("verify", "welcome", "logs", "moderation", "shop", "tickets", "reviews", "giveaways", "linkcards", "templates", "setup", "general") if os.path.exists(os.path.join(base, f"{n}.py"))]
 
         expected_tables = {
             "config": {"verified_role_id", "rules_text"}, "verifications": set(), "welcome_config": {"style", "bg_url"}, "log_routes": set(),
             "warnings": set(), "products": {"buy_url", "available"}, "shop_settings": {"ticket_channel_id", "receipt_note"},
-            "orders": {"code", "livemode"}, "ticket_config": {"staff_roles"}, "ticket_types": {"needs_invoice"}, "tickets": {"rating"}, "ticket_blacklist": set(),
+            "orders": {"code", "livemode"}, "ticket_config": {"staff_roles"}, "ticket_types": {"needs_invoice"}, "tickets": {"rating"}, "ticket_blacklist": set(), "reviews": {"stars"}, "review_settings": {"require_purchase"}, "link_cards": {"link_url"}, "giveaways": {"required_role_id"}, "giveaway_entries": set(),
         }
         db_problems = []
         existing = {r["name"] for r in await db.fetch_all("SELECT name FROM sqlite_master WHERE type = 'table'")}
