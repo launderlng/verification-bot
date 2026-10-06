@@ -190,7 +190,114 @@ def community() -> dict:
     }
 
 
-PRESETS = {"community": community}
+# ---------------------------------------------------------------------------------------------
+# FiveM mod community, rebuilt from the screenshots of a server. Channels built around cracked software, cheats,
+# ban evasion, account selling and leaks are deliberately NOT included (see LEFT_OUT).
+# ---------------------------------------------------------------------------------------------
+LEFT_OUT = {
+    "leaker-app": "leaks", "account-sell": "account selling", "windows-activate": "cracked Windows activation",
+    "spotify-lifetime": "cracked Spotify", "capcut-pro": "cracked software", "fl-studio": "cracked software",
+    "email-gen": "email/account generators", "unban-method": "ban evasion", "bhop-macro": "game macros",
+    "val-triggerbot": "cheats", "r6-recoil": "cheats", "macro": "game macros", "fortnite-macro": "game macros",
+    "fake-lag": "game exploits", "fake-crashes": "game exploits",
+}
+
+STAFF_ROLE, BOOSTER_ROLE = 1, 2
+
+
+def _staff_only() -> list:
+    return overwrites((EVERYONE, 0, VIEW), (STAFF_ROLE, WRITE, 0))
+
+
+def _everyone_read() -> list:
+    return overwrites((EVERYONE, READ, SEND), (STAFF_ROLE, WRITE, 0))
+
+
+def _bot_post() -> list:
+    return overwrites((EVERYONE, READ, SEND), (STAFF_ROLE, WRITE, 0), (R["bots"], WRITE, 0))
+
+
+def _booster_read() -> list:
+    return overwrites((EVERYONE, 0, VIEW), ([BOOSTER_ROLE, STAFF_ROLE], READ, SEND), (STAFF_ROLE, WRITE, 0))
+
+
+def _booster_chat() -> list:
+    return overwrites((EVERYONE, 0, VIEW), ([BOOSTER_ROLE, STAFF_ROLE], WRITE, 0))
+
+
+def fivem_hub() -> dict:
+    staff_perms = BASE | P("manage_messages", "manage_channels", "kick", "ban", "moderate_members", "view_audit_log", "manage_threads")
+    roles = [
+        {"id": STAFF_ROLE, "name": "🛡️ Staff", "color": 0xE74C3C, "hoist": True, "mentionable": True, "permissions": staff_perms, "position": 2},
+        {"id": BOOSTER_ROLE, "name": "💎 Booster", "color": 0xF47FFF, "hoist": True, "mentionable": False, "permissions": BASE, "position": 1},
+    ]
+    deco = lambda name: f"╔═════ {name} ═════╗"
+    categories_spec = [
+        (101, deco("community"), []), (102, deco(".gg/uav"), []), (103, deco("fivem"), []), (104, deco("extras"), []),
+        (105, deco("rz"), []), (106, deco("boosters"), overwrites((EVERYONE, 0, VIEW), ([BOOSTER_ROLE, STAFF_ROLE], VIEW, 0))),
+        (107, deco("priv settings"), overwrites((EVERYONE, 0, VIEW), (STAFF_ROLE, VIEW, 0))),
+    ]
+    chat = []  # no overwrites: everyone can read and talk (inherits the category)
+    ch = [
+        # community
+        (101, "👋・joined", "text", _bot_post()), (101, "💥・custom-invite", "text", chat), (101, "💫・invite-checker", "text", chat),
+        # .gg/uav
+        (102, "🚨・anc", "text", _everyone_read()), (102, "🚨・mini-anc", "text", _everyone_read()), (102, "🔢・number-count", "text", chat),
+        (102, "📄・general", "text", chat), (102, "📷・montys", "text", _everyone_read()), (102, "🔮・giveaways", "text", _bot_post()),
+        (102, "🙌・reviews", "text", chat), (102, "🤡・clowns", "text", chat), (102, "🏷️・request", "text", chat),
+        (102, "📃・suggestions", "text", chat), (102, "👕・partners", "text", chat), (102, "💎・boosting-perks", "text", _everyone_read()),
+        (102, "💰・premium", "text", _everyone_read()), (102, "🚀・services", "text", _everyone_read()), (102, "💲・mlo-showcase", "text", chat),
+        (102, "🔥・discord-intro", "text", chat), (102, "🎫・create-ticket", "text", _bot_post()),
+        (102, "🔇・drag", "voice", chat), (102, "🔊・vc", "voice", chat), (102, "🎭・stage", "voice", chat),
+    ]
+    for symbol, name in (("✗", "fivem-reshades"), ("✗", "fivem-soundpacks"), ("✓", "monty-songs"), ("✗", "pink-reshade"), ("✗", "roads"), ("✗", "nve"),
+                         ("✗", "mods"), ("✗", "fps-rpf"), ("✗", "boost-fps"), ("✗", "crosshairs"), ("✗", "paid-fps-pack"),
+                         ("✗", "realistic-gp"), ("✗", "f8-commands"), ("✗", "how-to-install")):
+        ch.append((103, f"{symbol}・{name}", "text", _everyone_read()))
+    for name in ("spotify-settings", "spotify-playlist", "pfp", "banners", "pc-opti", "sizes", "discord-templates", "programs",
+                 "clip-trimmer", "kovakks-aimtrain", "intros", "separators"):
+        ch.append((104, f"✓・{name}", "text", _everyone_read()))
+    for name in ("rz-gang-clothing", "rz-fps-pack", "rz-bundles", "rz-soundpacks", "rz-reshades", "rz-bloodfx", "rz-killfx",
+                 "rz-tracers", "rz-ragdoll", "rz-ramps", "rz-crosshairs", "rz-opti-mods"):
+        ch.append((105, f"🟡・{name}", "text", _everyone_read()))
+    ch.append((106, "💎・booster-announcements", "text", _booster_read()))
+    ch.append((106, "💎・booster-chat", "text", _booster_chat()))
+    for name in ("36-vault-reshades", "fivem-compys", "fivem-clothing", "fivem-logos", "pure-mode", "rpf-files", "free-crosshair-x", "sites",
+                 "editing-presets", "invisible-username", "onlyday-onlynight", "free-vpn-sites", "custom-gif-maker", "backup-files", "quantv",
+                 "scripts", "better-tracking", "fivem-locos", "blur"):
+        ch.append((106, f"💎・{name}", "text", _booster_read()))
+    ch.append((107, "🔑・access", "text", _staff_only()))
+
+    categories = [
+        {"id": cid, "name": name, "kind": "category", "original_type": 4, "parent_id": None, "position": i, "topic": None, "nsfw": False,
+         "bitrate": None, "user_limit": 0, "slowmode": 0, "overwrites": ow}
+        for i, (cid, name, ow) in enumerate(categories_spec)
+    ]
+    channels = [
+        {"id": 300 + i, "name": name, "kind": kind, "original_type": 0 if kind == "text" else 2, "parent_id": parent, "position": i,
+         "topic": None, "nsfw": False, "bitrate": None, "user_limit": 0, "slowmode": 0, "overwrites": ow}
+        for i, (parent, name, kind, ow) in enumerate(ch)
+    ]
+    return {
+        "name": "FiveM mod community", "description": "Rebuilt from screenshots, minus piracy and cheat channels", "usage_count": 0,
+        "source_name": "Built-in layout", "everyone_id": EVERYONE, "roles": roles, "categories": categories, "channels": channels,
+        "skipped": 0, "converted": 0, "messages": [],
+        "excluded": [f"{name} ({why})" for name, why in LEFT_OUT.items()],
+        "notes": [
+            "This was rebuilt from screenshots, so emojis and symbols in channel names are my best guess. Rename anything you like afterwards.",
+            "`request`, `suggestions`, `partners` and `mlo-showcase` were forum channels. They become normal text channels here (forums need Community turned on).",
+            "Only 🛡️ Staff and 💎 Booster roles are created. Boosters see the boosters category; only Staff see `access`.",
+            "Content channels are read-only for members, and only staff can post in them.",
+        ],
+        "next_steps": [
+            "`/ticket setup channel:#🎫・create-ticket staff_role:🛡️ Staff`",
+            "`/welcome settings channel:#👋・joined`",
+            "Drag my role **above** the new roles, then run `/template create` to get your shareable template link.",
+        ],
+    }
+
+
+PRESETS = {"community": community, "fivem": fivem_hub}
 
 
 def build(name: str) -> dict:
