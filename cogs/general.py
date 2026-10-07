@@ -128,8 +128,8 @@ class General(commands.Cog):
 
         expected_tables = {
             "config": {"verified_role_id", "rules_text"}, "verifications": set(), "welcome_config": {"style", "bg_url"}, "log_routes": set(),
-            "warnings": set(), "products": {"buy_url", "available", "file_id"}, "shop_settings": {"ticket_channel_id", "receipt_note"},
-            "orders": {"code", "livemode"}, "ticket_config": {"staff_roles"}, "ticket_types": {"needs_invoice"}, "tickets": {"rating"}, "ticket_blacklist": set(), "reviews": {"stars", "kind", "staff_id", "ticket_id"}, "review_settings": {"require_purchase"}, "link_cards": {"link_url"}, "giveaways": {"required_role_id"}, "giveaway_entries": set(), "log_history": {"subject_id"}, "stored_files": {"data", "required_role_id", "path"}, "file_deliveries": set(),
+            "warnings": set(), "products": {"buy_url", "available", "file_id"}, "shop_settings": {"ticket_channel_id", "order_prefix", "order_style", "order_counter"},
+            "orders": {"code", "file_status", "source"}, "ticket_config": {"staff_roles"}, "ticket_types": {"needs_invoice"}, "tickets": {"rating"}, "ticket_blacklist": set(), "reviews": {"stars", "kind", "staff_id", "ticket_id"}, "review_settings": {"require_purchase"}, "link_cards": {"link_url"}, "giveaways": {"required_role_id"}, "giveaway_entries": set(), "log_history": {"subject_id"}, "stored_files": {"data", "required_role_id", "path"}, "file_deliveries": set(),
         }
         db_problems = []
         existing = {r["name"] for r in await db.fetch_all("SELECT name FROM sqlite_master WHERE type = 'table'")}

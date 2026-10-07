@@ -29,7 +29,7 @@ DEFAULT_TYPES = [
     ("Support", "🛠️", "Get help with anything", "Thanks for reaching out! A member of staff will be with you shortly. Please describe your issue in as much detail as you can.", 0),
     ("Purchase help", "🧾", "Questions about an order (have your Invoice ID ready)", "Thanks for your purchase! Staff will check your Invoice ID and sort out your order.", 1),
 ]
-INVOICE_RE = re.compile(r"^INV-[0-9A-F]{8}$")
+INVOICE_RE = re.compile(r"^[A-Z0-9]{2,10}-[A-Z0-9]{3,12}$")  # any prefix: INV-3F9A1C2E, 14K-0042 …
 
 
 # ---------------------------------------------------------- helpers ----
@@ -89,7 +89,7 @@ class TicketModal(discord.ui.Modal):
         self.add_item(self.subject_input)
         self.add_item(self.details_input)
         if ttype["needs_invoice"]:
-            self.invoice_input = discord.ui.TextInput(label="Invoice ID", max_length=20, placeholder="INV-3F9A1C2E (from your receipt DM)")
+            self.invoice_input = discord.ui.TextInput(label="Invoice ID", max_length=30, placeholder="INV-3F9A1C2E (from your receipt DM)")
             self.add_item(self.invoice_input)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -489,10 +489,13 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
 
         invoice_code = None
         if ttype["needs_invoice"]:
-            invoice_code = (invoice or "").strip().upper()
-            if invoice_code and not invoice_code.startswith("INV-"):
-                invoice_code = "INV-" + invoice_code
-            if not INVOICE_RE.match(invoice_code):
+            raw = (invoice or "").strip().upper()
+            invoice_code = raw if INVOICE_RE.match(raw) else None
+            if invoice_code is None and re.fullmatch(r"[A-Z0-9]{3,12}", raw):  # typed without the prefix
+                matches = await db.fetch_all("SELECT code FROM orders WHERE guild_id = ? AND code LIKE ? LIMIT 2", (guild.id, f"%-{raw}"))
+                if len(matches) == 1:
+                    invoice_code = matches[0]["code"]
+            if invoice_code is None:
                 raise UserError("That doesn't look like an Invoice ID. It looks like `INV-3F9A1C2E` and is in your receipt DM (or use `/myorders`).")
 
         await interaction.response.defer(ephemeral=True)
@@ -560,6 +563,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         embed.add_field(name="Product", value=order["product_name"])
         embed.add_field(name="Amount", value=order["amount"] or "—")
         embed.add_field(name="Paid", value=discord.utils.format_dt(parse_iso(order["created_at"]), "f"))
+        if order["source"] == "manual":
+            embed.add_field(name="Created by", value="Staff (manual order)")
         if not order["livemode"]:
             embed.set_footer(text="🧪 This was a test-mode payment")
         return embed

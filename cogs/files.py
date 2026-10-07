@@ -18,7 +18,7 @@ from discord.ext import commands
 
 import db
 import ui
-from common import SUCCESS, WARN, UserError, support_button
+from common import SUCCESS, WARN, UserError
 from fileutil import (ATTACH_LIMIT, LINK_SECONDS, blocked_extension, check_public_url, filename_from_url, human_size, make_token,
                       max_file_bytes, public_base_url, safe_filename, signing_key, storage_cap_bytes, verify_token)
 from logutil import emit
@@ -99,30 +99,42 @@ def dm_card(guild: discord.Guild, f, title: str = "📥 Your file", note: Option
     )
 
 
-async def send_file_dm(user: discord.abc.User, guild: discord.Guild, f, title: str = "📥 Your file", note: Optional[str] = None) -> bool:
-    """DM the stored file: attached if it's 25 MB or less, otherwise as a private download link.
-    Returns False if the person has DMs closed, the file is missing, or a big file has no web address to be served from."""
+async def file_payload(user: discord.abc.User, guild: discord.Guild, f, embed: Optional[discord.Embed] = None, title: str = "📥 Your file",
+                       note: Optional[str] = None, support_channel_id: Optional[int] = None) -> Optional[dict]:
+    """Everything needed to DM a stored file as keyword arguments for user.send(): the file attached (25 MB or less) or a private
+    Download button (bigger), plus a Support button. Pass your own `embed` to put the file in an existing message (e.g. a receipt).
+    Returns None if the file can't be sent (missing from disk, or a big file with no web address to serve it from)."""
     cfg = await db.get_ticket_config(guild.id)
     view = discord.ui.View()
-    if f["size"] <= ATTACH_LIMIT:
+    kwargs: dict = {}
+    linked = f["size"] > ATTACH_LIMIT
+    if not linked:
         try:
             data = await read_bytes(f)
         except OSError:
             log.exception("Stored file %s is missing from disk", f["id"])
-            return False
-        kwargs = {"embed": dm_card(guild, f, title, note), "file": discord.File(io.BytesIO(data), filename=f["filename"])}
+            return None
+        kwargs["file"] = discord.File(io.BytesIO(data), filename=f["filename"])
     else:
         base = public_base_url()
-        if not base or not f["path"]:
-            return False
+        if not base or not f["path"] or not os.path.exists(f["path"]):
+            return None
         url = f"{base}/dl/{make_token(f['id'], user.id, link_key())}"
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Download", emoji="⬇️", url=url))
-        kwargs = {"embed": dm_card(guild, f, title, note, linked=True)}
-    support = support_button(guild, cfg)
-    if support is not None:
-        view.add_item(support)
+    kwargs["embed"] = embed if embed is not None else dm_card(guild, f, title, note, linked=linked)
+    channel_id = support_channel_id or (cfg["panel_channel_id"] if cfg else None)
+    if channel_id:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{channel_id}"))
     if view.children:
         kwargs["view"] = view
+    return kwargs
+
+
+async def send_file_dm(user: discord.abc.User, guild: discord.Guild, f, title: str = "📥 Your file", note: Optional[str] = None) -> bool:
+    """DM the stored file. Returns False if the person has DMs closed or the file can't be sent."""
+    kwargs = await file_payload(user, guild, f, title=title, note=note)
+    if kwargs is None:
+        return False
     try:
         await user.send(**kwargs)
         return True
