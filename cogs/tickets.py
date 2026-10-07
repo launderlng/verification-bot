@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 
 import db
 import ui
-from common import ACCENT, COLOR, DANGER, INFO, SUCCESS, WARN, UserError, check_can_send, is_staff, parse_color, reply, staff_ids
+from common import ACCENT, COLOR, DANGER, INFO, SUCCESS, WARN, UserError, check_can_send, is_staff, parse_color, reply, staff_ids, support_button
 from cogs.reviews import add_ticket_review_comment, post_ticket_review
 from logutil import emit
 from transcript import render_transcript
@@ -172,15 +172,6 @@ class ChooseTypeView(discord.ui.View):
 
         select.callback = callback
         self.add_item(select)
-
-
-def support_button(guild: discord.Guild, cfg) -> Optional[discord.ui.Button]:
-    """A link button back to the support/ticket panel channel, for DMs."""
-    if not cfg or not cfg["panel_channel_id"]:
-        return None
-    return discord.ui.Button(
-        style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{cfg['panel_channel_id']}",
-    )
 
 
 class RateButton(discord.ui.DynamicItem[discord.ui.Button], template=r"ticket:rate:(?P<tid>[0-9]+):(?P<n>[1-5])"):

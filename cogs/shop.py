@@ -13,6 +13,7 @@ from discord.ext import commands
 
 import db
 import ui
+from cogs.files import file_autocomplete, record_delivery, send_file_dm
 from common import ACCENT, COLOR, INFO, SUCCESS, WARN, UserError, check_can_send, parse_color
 from logutil import emit
 from stripeutil import format_amount, make_ref, parse_ref, tracked_url, verify_signature, webhook_secrets
@@ -86,7 +87,8 @@ def build_product(guild: discord.Guild, p, shop, rating=None) -> discord.Embed:
     )
     embed.add_field(name="💰 Price", value=f"**{p['price'] or 'See checkout'}**")
     embed.add_field(name="⭐ Rating", value=ui.rating_line(average, count))
-    embed.add_field(name="📦 Stock", value="🟢 In stock" if p["available"] else "🔴 Sold out")
+    stock = "🟢 In stock" if p["available"] else "🔴 Sold out"
+    embed.add_field(name="📦 Stock", value=stock + ("\n📥 Instant delivery by DM" if p["file_id"] else ""))
     return embed
 
 
@@ -345,10 +347,12 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
                     return None  # Stripe delivered the same event twice
         raise RuntimeError("Couldn't generate a unique Invoice ID")
 
-    def receipt_message(self, guild: discord.Guild, order, shop, fallback_channel_id: Optional[int] = None) -> dict:
+    def receipt_message(self, guild: discord.Guild, order, shop, fallback_channel_id: Optional[int] = None, has_file: bool = False) -> dict:
         ticket_id = (shop["ticket_channel_id"] if shop else None) or fallback_channel_id
         where = f" in <#{ticket_id}>" if ticket_id else " in the server"
         steps = f"🎫 **Next step:** please **open a ticket**{where} and send your Invoice ID so we can sort out your order."
+        if has_file:
+            steps = "📥 **Your file is in the next message.**\n" + steps
         if shop and shop["receipt_note"]:
             steps += f"\n\n{shop['receipt_note']}"
         body = (
@@ -407,19 +411,28 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             except discord.HTTPException:
                 user = None
         delivered = False
+        file_sent = None  # None = this product has no file
         if user is not None:
             try:
                 tickets_cfg = await db.get_ticket_config(guild_id)
-                await user.send(**self.receipt_message(guild, order, shop, tickets_cfg["panel_channel_id"] if tickets_cfg else None))
+                stored = await db.fetch_one("SELECT * FROM stored_files WHERE id = ? AND guild_id = ?", (product["file_id"], guild_id)) if product and product["file_id"] else None
+                await user.send(**self.receipt_message(guild, order, shop, tickets_cfg["panel_channel_id"] if tickets_cfg else None, has_file=stored is not None))
                 delivered = True
+                if stored is not None:
+                    file_sent = await send_file_dm(user, guild, stored, title="📥 Your purchase", note=f"From order `{code}`")
+                    if file_sent:
+                        await record_delivery(stored["id"], user_id)
             except discord.HTTPException:
                 log.info("Couldn't DM the receipt for %s (DMs closed?)", code)
+        if not delivered and product and product["file_id"]:
+            file_sent = False  # no receipt DM means the file wasn't sent either
         await db.execute("UPDATE orders SET dm_sent = ? WHERE guild_id = ? AND code = ?", (int(delivered), guild_id, code))
 
         await emit(
             guild, "shop", "🧪 Test purchase" if not livemode else "💸 New purchase",
             f"<@{user_id}> bought **{order['product_name']}**\n\n"
-            + ui.kv(("💰 Amount", order["amount"]), ("🧾 Invoice ID", f"`{code}`"), ("📬 Receipt DM", "✅ delivered" if delivered else "❌ couldn't DM, they can use /myorders")),
+            + ui.kv(("💰 Amount", order["amount"]), ("🧾 Invoice ID", f"`{code}`"), ("📬 Receipt DM", "✅ delivered" if delivered else "❌ couldn't DM, they can use /myorders"),
+                  ("📥 File", None if file_sent is None else ("✅ delivered" if file_sent else "❌ not delivered, use /files send"))),
             SUCCESS if livemode else WARN,
         )
 
@@ -633,8 +646,9 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         button_label="Button text (type 'default' to reset)",
         color="Card colour as hex",
         available="Set to False to show 'Sold out' and disable the button",
+        delivery_file="A stored file (see /files add) sent to buyers by DM after they pay (or 'none')",
     )
-    @app_commands.autocomplete(product=product_autocomplete)
+    @app_commands.autocomplete(product=product_autocomplete, delivery_file=file_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def edit(
         self,
@@ -647,6 +661,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         button_label: Optional[app_commands.Range[str, 1, 30]] = None,
         color: Optional[str] = None,
         available: Optional[bool] = None,
+        delivery_file: Optional[str] = None,
     ):
         p = await resolve_product(interaction, product)
         updates: dict = {}
@@ -664,6 +679,14 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             updates["color"] = f"{parse_color(color):06X}"
         if available is not None:
             updates["available"] = int(available)
+        if delivery_file:
+            if delivery_file.strip().lower() == "none":
+                updates["file_id"] = None
+            else:
+                stored = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (interaction.guild_id, delivery_file.strip()))
+                if not stored:
+                    raise UserError(f"I can't find a stored file called **{delivery_file}**. Add one with `/files add` first.")
+                updates["file_id"] = stored["id"]
         if not updates:
             raise UserError("Nothing to change. Fill in at least one option.")
         try:
