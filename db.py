@@ -409,6 +409,8 @@ WELCOME_COLUMNS = {
 
 
 MIGRATIONS = [
+    ("orders", "buyer_email", "TEXT"),
+    ("orders", "buyer_country", "TEXT"),
     ("automod_settings", "strike_hours", "INTEGER NOT NULL DEFAULT 24"),
     ("automod_settings", "dm_user", "INTEGER NOT NULL DEFAULT 1"),
     ("config", "panel_title", "TEXT"),
