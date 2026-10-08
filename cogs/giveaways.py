@@ -8,6 +8,7 @@ from discord.ext import commands, tasks
 
 import db
 import ui
+from cogs.files import file_autocomplete, send_file_dm
 from cogs.tickets import support_button
 from common import ACCENT, COLOR, DANGER, SUCCESS, WARN, UserError, check_can_send, parse_duration
 from giveawayutil import pick_winners
@@ -43,13 +44,23 @@ def requirement_lines(g) -> tuple:
     )
 
 
+def prize_perks(g) -> str:
+    perks = []
+    if g["prize_role_id"]:
+        perks.append(f"🎭 Unlocks <@&{g['prize_role_id']}>")
+    if g["prize_file_id"]:
+        perks.append("📥 Instant delivery by DM")
+    return "  ·  ".join(perks)
+
+
 def active_embed(guild: discord.Guild, g, entries: int) -> discord.Embed:
     ends = parse_iso(g["ends_at"])
     info = ui.kv(
         ("⏰ Ends", card_time(ends)), ("🏆 Winners", f"{g['winners']}"), ("👥 Entries", f"{entries:,}"),
         ("🎭 Hosted by", f"<@{g['host_id']}>"), *requirement_lines(g),
     )
-    body = (f"{g['description']}\n\n" if g["description"] else "") + f"{ui.DIVIDER}\n{info}"
+    perks = prize_perks(g)
+    body = (f"{g['description']}\n\n" if g["description"] else "") + (f"{perks}\n\n" if perks else "") + f"{ui.DIVIDER}\n{info}"
     return ui.card(
         g["prize"], body, color=ACCENT, guild=guild, footer=f"Giveaway #{g['id']} · Press 🎉 below to enter",
         author=("🎁  GIVEAWAY", guild.icon.url if guild.icon else None), thumbnail=guild.icon.url if guild.icon else None, image=g["image_url"] or None,
@@ -250,17 +261,34 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
         except discord.HTTPException:
             log.warning("Couldn't announce giveaway %s", g["id"])
 
+    async def grant_prize_role(self, guild: discord.Guild, member: discord.Member, g) -> Optional[str]:
+        """Give the winner the role this giveaway unlocks. Returns 'granted', 'failed', or None if there's no role."""
+        if not g["prize_role_id"]:
+            return None
+        role = guild.get_role(g["prize_role_id"])
+        if role is None:
+            return "failed"
+        try:
+            await member.add_roles(role, reason=f"Giveaway #{g['id']} prize")
+            return "granted"
+        except discord.HTTPException:
+            log.warning("Couldn't give giveaway role %s to %s (is my role above it?)", g["prize_role_id"], member.id)
+            return "failed"
+
     async def dm_winners(self, guild: discord.Guild, g, winners: list, message) -> None:
         tickets_cfg = await db.get_ticket_config(guild.id)
+        prize_file = await db.fetch_one("SELECT * FROM stored_files WHERE id = ?", (g["prize_file_id"],)) if g["prize_file_id"] else None
         for uid in winners:
             member = guild.get_member(uid)
             if member is None:
                 continue
-            body = (
-                "Congratulations, you won! 🎉\n\n"
-                + ui.kv(("🎁 Prize", g["prize"]), ("🏠 Server", guild.name), ("🏷️ Giveaway", f"#{g['id']}"))
-                + f"\n\n{ui.DIVIDER}\n{self.claim_text(g, tickets_cfg)}"
-            )
+            role_status = await self.grant_prize_role(guild, member, g)
+            lines = [("🎁 Prize", g["prize"]), ("🏠 Server", guild.name), ("🏷️ Giveaway", f"#{g['id']}")]
+            if role_status == "granted":
+                lines.append(("🎭 Role", f"✅ You got <@&{g['prize_role_id']}>"))
+            elif role_status == "failed":
+                lines.append(("🎭 Role", "❌ Couldn't be given automatically, ask staff"))
+            body = "Congratulations, you won! 🎉\n\n" + ui.kv(*lines) + f"\n\n{ui.DIVIDER}\n{self.claim_text(g, tickets_cfg)}"
             card = ui.card("You won! 🎉", body, color=SUCCESS, thumbnail=guild.icon.url if guild.icon else None, footer=f"{guild.name} · Giveaway #{g['id']}")
             view = discord.ui.View()
             if message is not None:
@@ -272,6 +300,8 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
                 await member.send(embed=card, **({"view": view} if view.children else {}))
             except discord.HTTPException:
                 pass  # DMs closed: the announcement in the channel still pings them
+            if prize_file is not None:
+                await send_file_dm(member, guild, prize_file, title="🎁 Your prize", note=f"From **{g['prize']}** · Giveaway #{g['id']}")
 
     async def end_giveaway(self, guild: discord.Guild, g, by: Optional[discord.abc.User] = None):
         """Draw winners, update the card, announce and DM. Returns the winners, or None if it had already ended."""
@@ -367,7 +397,10 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
         min_account_days="Their Discord account must be at least this many days old",
         min_server_days="They must have been in the server this many days",
         ping="Role to ping when it starts (default: the giveaway ping role)",
+        prize_role="A role to automatically give the winner(s)",
+        prize_file="A file from your library to automatically DM the winner(s)",
     )
+    @app_commands.autocomplete(prize_file=file_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def start(
         self,
@@ -389,8 +422,15 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
         min_account_days: app_commands.Range[int, 0, 3650] = 0,
         min_server_days: app_commands.Range[int, 0, 3650] = 0,
         ping: Optional[discord.Role] = None,
+        prize_role: Optional[discord.Role] = None,
+        prize_file: Optional[str] = None,
     ):
         guild = interaction.guild
+        prize_file_row = None
+        if prize_file:
+            prize_file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (guild.id, prize_file.strip()))
+            if prize_file_row is None:
+                raise UserError(f"I can't find a file called **{prize_file}** in your library. Try `/files list`.")
         if bool(message_channel) != bool(channel_messages):
             raise UserError("To require messages in one channel, set **both** `message_channel` and `channel_messages`.")
         seconds = parse_duration(duration)
@@ -413,12 +453,13 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
         ends = now + timedelta(seconds=seconds)
         await db.execute(
             "INSERT INTO giveaways (guild_id, channel_id, host_id, prize, description, image_url, winners, required_role_id, bonus_role_id, bonus_entries, ends_at, created_at, "
-            "min_invites, min_messages, req_channel_id, req_channel_messages, blocked_role_id, min_account_days, min_server_days, ping_role_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "min_invites, min_messages, req_channel_id, req_channel_messages, blocked_role_id, min_account_days, min_server_days, ping_role_id, prize_role_id, prize_file_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (guild.id, target.id, interaction.user.id, prize.strip(), description, image_url, winners, required_role.id if required_role else None,
              bonus_role.id if bonus_role else None, bonus_entries if bonus_role else 0, ends.isoformat(), now.isoformat(),
              min_invites, min_messages, message_channel.id if message_channel else None, channel_messages, blocked_role.id if blocked_role else None,
-             min_account_days, min_server_days, ping_role.id if ping_role else None),
+             min_account_days, min_server_days, ping_role.id if ping_role else None,
+             prize_role.id if prize_role else None, prize_file_row["id"] if prize_file_row else None),
         )
         g = await db.fetch_one("SELECT * FROM giveaways WHERE guild_id = ? ORDER BY id DESC LIMIT 1", (guild.id,))
         try:
@@ -432,9 +473,15 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
             raise UserError("I couldn't post in that channel. Check my permissions there.") from None
         await db.execute("UPDATE giveaways SET message_id = ? WHERE id = ?", (message.id, g["id"]))
         await emit(guild, "giveaways", "Giveaway started", ui.kv(("Prize", g["prize"]), ("Host", interaction.user.mention), ("Channel", target.mention), ("Ends", discord.utils.format_dt(ends, "R"))), footer=f"#{g['id']}")
+        delivery = []
+        if prize_role:
+            delivery.append(f"🎭 Winners automatically get {prize_role.mention}")
+        if prize_file_row:
+            delivery.append(f"📥 Winners are automatically DMed **{prize_file.strip()}**")
         await interaction.followup.send(
             embed=ui.card("✅ Giveaway started", f"**{g['prize']}** is live in {target.mention}.\n\n[Jump to it]({message.jump_url})"
-                          + (f"\n\n🔔 Pinged {ping_role.mention}." if can_ping else (f"\n\n⚠️ I couldn't ping {ping_role.mention}. Make that role **mentionable** (Server Settings → Roles), or run `/pingroles setup`." if ping_role else "")),
+                          + (f"\n\n🔔 Pinged {ping_role.mention}." if can_ping else (f"\n\n⚠️ I couldn't ping {ping_role.mention}. Make that role **mentionable** (Server Settings → Roles), or run `/pingroles setup`." if ping_role else ""))
+                          + ("\n\n" + "\n".join(delivery) if delivery else ""),
                           color=SUCCESS, guild=guild, footer=f"Giveaway #{g['id']} · ends automatically"),
             ephemeral=True,
         )
@@ -458,12 +505,19 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
         body = ui.kv(("🔔 Ping role", role.mention if role else "None (no automatic ping)"), ("📍 Default channel", f"<#{row['default_channel_id']}>" if row["default_channel_id"] else "The channel you run it in")) + warn
         await interaction.response.send_message(embed=ui.card("🎉 Giveaway settings", body, guild=guild, section="Giveaways"), ephemeral=True)
 
-    @app_commands.command(description="Change a running giveaway: prize, winners, time or description")
-    @app_commands.describe(giveaway_id="Which giveaway", prize="New prize", winners="New number of winners", extend="Add time, e.g. 1h or 1d", description="New description")
-    @app_commands.autocomplete(giveaway_id=giveaway_autocomplete)
+    @app_commands.command(description="Change a running giveaway: prize, winners, time, description, or auto-delivery")
+    @app_commands.describe(
+        giveaway_id="Which giveaway", prize="New prize", winners="New number of winners", extend="Add time, e.g. 1h or 1d",
+        description="New description", prize_role="A role to automatically give the winner(s)",
+        prize_file="A file from your library to automatically DM the winner(s)",
+        clear_prize_role="Remove the auto-given role", clear_prize_file="Remove the auto-delivered file",
+    )
+    @app_commands.autocomplete(giveaway_id=giveaway_autocomplete, prize_file=file_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def edit(self, interaction: discord.Interaction, giveaway_id: int, prize: Optional[app_commands.Range[str, 1, 200]] = None,
-                   winners: Optional[app_commands.Range[int, 1, 20]] = None, extend: Optional[str] = None, description: Optional[app_commands.Range[str, 1, 500]] = None):
+                   winners: Optional[app_commands.Range[int, 1, 20]] = None, extend: Optional[str] = None, description: Optional[app_commands.Range[str, 1, 500]] = None,
+                   prize_role: Optional[discord.Role] = None, prize_file: Optional[str] = None,
+                   clear_prize_role: bool = False, clear_prize_file: bool = False):
         g = await self.get_giveaway(interaction, giveaway_id)
         if g["status"] != "active":
             raise UserError("Only a running giveaway can be changed.")
@@ -474,6 +528,17 @@ class Giveaways(commands.GroupCog, group_name="giveaway", group_description="Run
             updates["winners"] = winners
         if description:
             updates["description"] = description
+        if clear_prize_role:
+            updates["prize_role_id"] = None
+        elif prize_role:
+            updates["prize_role_id"] = prize_role.id
+        if clear_prize_file:
+            updates["prize_file_id"] = None
+        elif prize_file:
+            row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (interaction.guild_id, prize_file.strip()))
+            if row is None:
+                raise UserError(f"I can't find a file called **{prize_file}** in your library. Try `/files list`.")
+            updates["prize_file_id"] = row["id"]
         if extend:
             seconds = parse_duration(extend)
             if seconds is None or seconds < MIN_SECONDS:
