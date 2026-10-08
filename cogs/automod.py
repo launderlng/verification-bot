@@ -184,6 +184,15 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
             await message.channel.send(f"{member.mention} your message was removed: **{RULES[rule]}**.", delete_after=8, allowed_mentions=discord.AllowedMentions(users=[member]))
         except discord.HTTPException:
             pass
+        if s["dm_user"]:
+            try:
+                await member.send(embed=ui.card(
+                    "⚠️ Your message was removed",
+                    ui.kv(("🏠 Server", guild.name), ("📏 Rule", RULES[rule]), ("📍 Channel", f"#{message.channel.name}"), ("⚖️ Action", action_taken))
+                    + "\n\nPlease read the server rules. Repeated breaks can lead to a timeout or ban.",
+                    color=WARN, guild=guild, section="Automod"))
+            except discord.HTTPException:
+                pass  # their DMs are closed
         snippet = (message.content or "")[:900]
         await emit(
             guild, "automod", f"Automod: {RULES[rule]}",
@@ -208,6 +217,7 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
             ("📣 Mentions", limit(s["mention_limit"], " per message")), ("🔠 Capitals", limit(s["caps_percent"], "%")), ("😀 Emojis", limit(s["emoji_limit"], " per message")),
             ("📜 Lines", limit(s["max_lines"], " per message")), ("🚷 Blocked words", f"{len(split_list(s['blocked_words']))} words"),
             ("🛡️ Skips", f"staff, {len(split_list(s['exempt_roles']))} roles, {len(split_list(s['exempt_channels']))} channels"),
+            ("📩 DM the member", on(s["dm_user"])),
             ("⚖️ Punishment", {"delete": "Remove the message", "warn": "Remove + warn", "timeout": f"Remove + warn + timeout {s['timeout_minutes']} min after {s['strikes_before_timeout']} strikes"}[s["action"]]),
         )
         if not self.bot.intents.message_content:
@@ -302,6 +312,13 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
             changes[column] = ",".join(current) or None
         await self.change(interaction.guild_id, **changes)
         await interaction.response.send_message(embed=ui.card("✅ Saved", "Automod will " + ("no longer ignore" if remove else "ignore") + f" {', '.join(t.mention for t in (role, channel) if t)}.", color=SUCCESS), ephemeral=True)
+
+    @app_commands.command(description="DM members when automod removes their message")
+    @app_commands.describe(enabled="True to send a private DM explaining which rule they broke")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def dm(self, interaction: discord.Interaction, enabled: bool):
+        await self.change(interaction.guild_id, dm_user=int(enabled))
+        await interaction.response.send_message(embed=ui.card(f"📩 DM notices {'on' if enabled else 'off'}", "Members get a private DM naming the rule they broke." if enabled else "Members only see the short in-channel notice.", color=SUCCESS), ephemeral=True)
 
     @app_commands.command(description="Choose what happens when someone breaks a rule")
     @app_commands.describe(action="What automod does", strikes="Strikes in 10 minutes before a timeout", minutes="How long the timeout lasts")
