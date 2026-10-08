@@ -80,18 +80,31 @@ def pick(*values):
 
 
 def build_product(guild: discord.Guild, p, shop, rating=None) -> discord.Embed:
-    """A clean product card: description, then Price / Rating / Stock in one tidy row."""
+    """A branded product card: a status banner, a wide price field, and a clean rating line."""
     color_hex = pick(p["color"], shop["color"] if shop else None)
+    color = int(color_hex, 16) if color_hex else ACCENT.value
     average, count = rating or (None, 0)
+
+    in_stock = bool(p["available"])
+    banner = "🟢 **IN STOCK**" if in_stock else "🔴 **SOLD OUT**"
+    perks = []
+    if p["file_id"]:
+        perks.append("📥 Instant delivery by DM")
+    if p["role_id"]:
+        perks.append(f"🎭 Unlocks <@&{p['role_id']}>")
+    banner_line = banner + ("  ·  " + "  ·  ".join(perks) if perks else "")
+
+    description = (p["description"] or "").strip()
+    body = (description + "\n\n" if description else "") + banner_line
+
     embed = ui.card(
-        p["name"], p["description"] or None, color=int(color_hex, 16) if color_hex else ACCENT.value,
-        guild=guild, footer=pick(shop["footer"] if shop else None, DEFAULT_FOOTER),
-        thumbnail=guild.icon.url if guild.icon else None, image=p["image_url"] or None,
+        f"💎 {p['name']}", body, color=color,
+        author=(f"{guild.name.upper()} · SHOP", guild.icon.url if guild.icon else None),
+        footer="🔒 " + pick(shop["footer"] if shop else None, DEFAULT_FOOTER),
+        image=p["image_url"] or None,
     )
-    embed.add_field(name="💰 Price", value=f"**{p['price'] or 'See checkout'}**")
-    embed.add_field(name="⭐ Rating", value=ui.rating_line(average, count))
-    stock = "🟢 In stock" if p["available"] else "🔴 Sold out"
-    embed.add_field(name="📦 Stock", value=stock + ("\n📥 Instant delivery by DM" if p["file_id"] else "") + (f"\n🎭 Gives you <@&{p['role_id']}>" if p["role_id"] else ""))
+    embed.add_field(name="💰 Price", value=f"## {p['price'] or 'See checkout'}", inline=True)
+    embed.add_field(name="⭐ Rating", value=ui.rating_line(average, count), inline=True)
     return embed
 
 
