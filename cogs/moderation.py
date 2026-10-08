@@ -7,7 +7,8 @@ from discord.ext import commands
 
 import db
 import ui
-from common import DANGER, SUCCESS, WARN, UserError, check_target, parse_duration
+from common import DANGER, SUCCESS, WARN, UserError, check_target, parse_color, parse_duration
+from fileutil import blocked_extension
 from logutil import action_log, emit, mark_handled
 
 Reason = Optional[app_commands.Range[str, 1, 400]]
@@ -96,6 +97,59 @@ class Moderation(commands.Cog):
         await action_log(interaction.guild, "moderation", "Member timed out", target=member, actor=interaction.user, reason=reason, color=WARN,
                          lines=(("⏳ Length", duration), ("⏰ Ends", discord.utils.format_dt(until, "R"))))
         await interaction.response.send_message(embed=done("🔇 Member timed out", f"{member.mention} for **{duration}**.\n\n" + ui.kv(("📝 Reason", reason or "None given")), WARN))
+
+    @app_commands.command(description="End a member's timeout early")
+    @app_commands.describe(member="Who", reason="Why")
+    @app_commands.checks.has_permissions(moderate_members=True)
+    @app_commands.checks.bot_has_permissions(moderate_members=True)
+    async def untimeout(self, interaction: discord.Interaction, member: discord.Member, reason: Reason = None):
+        check_target(interaction, member)
+        if not member.is_timed_out():
+            raise UserError(f"{member.mention} isn't timed out.")
+        mark_handled(interaction.guild_id, member.id, "untimeout")
+        await member.timeout(None, reason=audit_reason(interaction, reason or "Timeout removed"))
+        await action_log(interaction.guild, "moderation", "Timeout removed", target=member, actor=interaction.user, reason=reason, color=SUCCESS)
+        await interaction.response.send_message(embed=done("🔊 Timeout removed", f"{member.mention} can talk again."))
+
+    @app_commands.command(description="Send a member a private embedded DM from the bot, with optional files")
+    @app_commands.describe(
+        member="Who to message", message="The message", title="Embed title (optional)", color="Hex colour like #5865F2 (optional)",
+        image="A picture shown big in the embed", file="A file to attach", file2="A second file", file3="A third file",
+        sign="Show your name in the footer",
+    )
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def dm(self, interaction: discord.Interaction, member: discord.Member, message: app_commands.Range[str, 1, 3500],
+                 title: Optional[app_commands.Range[str, 1, 200]] = None, color: Optional[str] = None,
+                 image: Optional[discord.Attachment] = None, file: Optional[discord.Attachment] = None,
+                 file2: Optional[discord.Attachment] = None, file3: Optional[discord.Attachment] = None, sign: bool = True):
+        if member.bot:
+            raise UserError("Bots can't receive DMs from me.")
+        files = [f for f in (file, file2, file3) if f]
+        for f in files:
+            if blocked_extension(f.filename):
+                raise UserError(f"`{f.filename}` is an executable type, so I won't send it.")
+        if image and not (image.content_type or "").startswith("image/"):
+            raise UserError("The `image` option needs a picture. Use `file` for anything else.")
+        await interaction.response.defer(ephemeral=True)
+        embed = ui.card(title or f"📩 A message from {interaction.guild.name}", message,
+                        **({"color": parse_color(color)} if color else {}), guild=interaction.guild, footer=f"Sent by {interaction.user.display_name}" if sign else None)
+        discord_files, names = [], []
+        try:
+            if image:
+                discord_files.append(await image.to_file(filename=f"image_{image.filename}"))
+                embed.set_image(url=f"attachment://{discord_files[0].filename}")
+            for f in files:
+                discord_files.append(await f.to_file())
+                names.append(f.filename)
+            await member.send(embed=embed, files=discord_files)
+        except discord.Forbidden:
+            raise UserError(f"{member.mention} has DMs closed, so I couldn't message them.")
+        except discord.HTTPException as e:
+            raise UserError(f"Discord refused the DM ({e.status}). Files may be too large.")
+        await action_log(interaction.guild, "moderation", "DM sent by staff", target=member, actor=interaction.user,
+                         lines=(("🖼️ Image", "yes" if image else "no"), ("📎 Files", ", ".join(names) or "none")),
+                         fields=(("Message", message[:900]),))
+        await interaction.followup.send(embed=done("📩 DM sent", f"Delivered to {member.mention}."), ephemeral=True)
 
     @app_commands.command(description="Warn a member (saved on their record)")
     @app_commands.describe(member="Who", reason="What they did")
