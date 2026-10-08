@@ -514,6 +514,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         code = await self.create_order(guild_id, user_id, product, session, livemode)
         if code is None:
             return
+        details = session.get("customer_details") or {}
+        email = (details.get("email") or session.get("customer_email") or "").strip()[:254] or None
+        country = ((details.get("address") or {}).get("country") or "").strip()[:2] or None
+        await db.execute("UPDATE orders SET buyer_email = ?, buyer_country = ? WHERE guild_id = ? AND code = ?", (email, country, guild_id, code))
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (guild_id, code))
         shop = await db.get_shop(guild_id)
 
@@ -530,6 +534,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             guild, "shop", "🧪 Test purchase" if not livemode else "💸 New purchase",
             f"<@{user_id}> bought **{order['product_name']}**\n\n"
             + ui.kv(("🕒 Ordered", discord.utils.format_dt(discord.utils.utcnow(), "f")), ("💰 Amount", order["amount"]), ("🧾 Invoice ID", f"`{code}`"), ("🆔 Buyer ID", f"`{user_id}`"),
+                    ("📧 Email", email), ("🌍 Country", country),
                     ("⚙️ Sent", "🤖 Automatically, no staff involved"), ("📬 Receipt DM", "✅ delivered" if delivered else "❌ couldn't DM, they can use /myorders"),
                     ("📥 File", None if file_status is None else ("✅ delivered with the receipt" if file_status == "delivered" else "❌ not delivered, use /shop resend")),
                     ("🎭 Role", None if role_status is None else ("✅ given" if role_status == "granted" else "❌ not given: put my role above it, then use /shop resend"))),
