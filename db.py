@@ -409,6 +409,8 @@ WELCOME_COLUMNS = {
 
 
 MIGRATIONS = [
+    ("giveaways", "prize_role_id", "INTEGER"),
+    ("giveaways", "prize_file_id", "INTEGER"),
     ("orders", "buyer_email", "TEXT"),
     ("orders", "buyer_country", "TEXT"),
     ("automod_settings", "strike_hours", "INTEGER NOT NULL DEFAULT 24"),
