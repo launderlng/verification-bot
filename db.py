@@ -400,6 +400,7 @@ WELCOME_COLUMNS = {
 
 
 MIGRATIONS = [
+    ("automod_settings", "dm_user", "INTEGER NOT NULL DEFAULT 1"),
     ("config", "panel_title", "TEXT"),
     ("config", "panel_color", "TEXT"),
     ("config", "panel_image", "TEXT"),
