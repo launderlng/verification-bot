@@ -100,10 +100,13 @@ async def load_image(row) -> Optional[tuple[str, bytes]]:
 async def render(guild: discord.Guild, row) -> dict:
     """Everything needed to show a page: the embed, its uploaded image (if any) and its link buttons."""
     kind = KINDS[row["kind"]]
-    shown = row["title"] or (row["name"] if row["kind"] in ("installguides", "clothingpreviews") else kind["default"])
+    # Only show a title if staff actually typed one (or, for guides/previews, picked a name).
+    # No more auto-inserted "⭐ Booster perks" / "💎 Premium perks" placeholder title.
+    shown = row["title"] or (row["name"] if row["kind"] in ("installguides", "clothingpreviews") else None)
+    title = f"{kind['icon']}  {shown}" if shown else None
     body = row["body"] or "*Nothing written here yet. Staff can add it with the edit command.*"
     footer = row["footer"] or " · ".join(x for x in (guild.name, row["section"]) if x)
-    embed = ui.card(f"{kind['icon']}  {shown}", body, color=int(row["color"], 16) if row["color"] else COLOR, guild=guild, footer=footer)
+    embed = ui.card(title, body, color=int(row["color"], 16) if row["color"] else COLOR, guild=guild, footer=footer)
     out: dict = {}
     image = await load_image(row)
     if image:
