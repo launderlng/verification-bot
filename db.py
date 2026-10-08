@@ -337,6 +337,15 @@ CREATE TABLE IF NOT EXISTS automod_settings (
     strikes_before_timeout INTEGER NOT NULL DEFAULT 3,
     timeout_minutes INTEGER NOT NULL DEFAULT 10
 );
+CREATE TABLE IF NOT EXISTS automod_strikes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    rule       TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    cleared    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_automod_strikes ON automod_strikes (guild_id, user_id);
 CREATE TABLE IF NOT EXISTS staff_notes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id   INTEGER NOT NULL,
@@ -400,6 +409,7 @@ WELCOME_COLUMNS = {
 
 
 MIGRATIONS = [
+    ("automod_settings", "strike_hours", "INTEGER NOT NULL DEFAULT 24"),
     ("automod_settings", "dm_user", "INTEGER NOT NULL DEFAULT 1"),
     ("config", "panel_title", "TEXT"),
     ("config", "panel_color", "TEXT"),

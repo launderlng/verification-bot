@@ -25,7 +25,16 @@ RULES = {
     "links": "Links", "invites": "Discord invites", "spam": "Spam", "repeat": "Repeated messages", "mentions": "Too many mentions",
     "caps": "Too many capitals", "emojis": "Too many emojis", "lines": "Message too long", "words": "Blocked word",
 }
-STRIKE_WINDOW = 600  # seconds: strikes older than this are forgotten
+
+
+def strike_meter(count: int, limit: int, escalates: bool, minutes: int, hours: int) -> str:
+    shown = min(count, limit)
+    boxes = "🟥" * shown + "⬜" * max(0, limit - shown)
+    if escalates:
+        tail = f"Strike **{count}/{limit}**. At {limit} you get timed out for {minutes} min." if count < limit else f"Strike **{count}/{limit}**. You've been timed out for {minutes} min and your strikes reset."
+    else:
+        tail = f"Strike **{count}**."
+    return f"{boxes}\n{tail}"
 
 
 def split_list(raw: Optional[str]) -> list[str]:
@@ -111,6 +120,21 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
         cols = ", ".join(f"{c} = ?" for c in fields)
         await db.execute(f"UPDATE automod_settings SET {cols} WHERE guild_id = ?", (*fields.values(), guild_id))
 
+    async def add_strike(self, guild_id: int, user_id: int, rule: str, s) -> int:
+        now = time.time()
+        await db.execute("INSERT INTO automod_strikes (guild_id, user_id, rule, created_at) VALUES (?, ?, ?, ?)", (guild_id, user_id, rule, now))
+        return await self.count_strikes(guild_id, user_id, s["strike_hours"])
+
+    async def count_strikes(self, guild_id: int, user_id: int, hours: int) -> int:
+        row = await db.fetch_one(
+            "SELECT COUNT(*) AS n FROM automod_strikes WHERE guild_id = ? AND user_id = ? AND cleared = 0 AND created_at > ?",
+            (guild_id, user_id, time.time() - hours * 3600),
+        )
+        return row["n"] if row else 0
+
+    async def clear_strikes(self, guild_id: int, user_id: int) -> None:
+        await db.execute("UPDATE automod_strikes SET cleared = 1 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+
     # ----------------------------------------------------------- enforcement ----
 
     def is_exempt(self, message: discord.Message, s) -> bool:
@@ -162,10 +186,8 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
             await message.delete()
         except discord.HTTPException:
             deleted = False
-        key = (guild.id, member.id)
-        now = time.monotonic()
-        strikes = [t for t in self.strikes.get(key, []) if now - t < STRIKE_WINDOW] + [now]
-        self.strikes[key] = strikes
+        count = await self.add_strike(guild.id, member.id, rule, s)
+        limit = s["strikes_before_timeout"]
         action_taken = "Message removed" if deleted else "Couldn't remove the message (check my permissions)"
         if s["action"] in ("warn", "timeout"):
             await db.execute(
@@ -173,11 +195,11 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
                 (guild.id, member.id, self.bot.user.id if getattr(self.bot, "user", None) else 0, f"Automod: {RULES[rule]} ({detail})", discord.utils.utcnow().isoformat()),
             )
             action_taken += " + warning added"
-        if s["action"] == "timeout" and len(strikes) >= s["strikes_before_timeout"]:
+        if s["action"] == "timeout" and count >= limit:
             try:
                 await member.timeout(timedelta(minutes=s["timeout_minutes"]), reason=f"Automod: {RULES[rule]}")
-                action_taken += f" + timed out for {s['timeout_minutes']} min after {len(strikes)} strikes"
-                self.strikes[key] = []
+                action_taken += f" + timed out for {s['timeout_minutes']} min after {count} strikes"
+                await self.clear_strikes(guild.id, member.id)
             except discord.HTTPException:
                 action_taken += " (couldn't time them out: check my permissions and role order)"
         try:
@@ -188,8 +210,9 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
             try:
                 await member.send(embed=ui.card(
                     "⚠️ Your message was removed",
-                    ui.kv(("🏠 Server", guild.name), ("📏 Rule", RULES[rule]), ("📍 Channel", f"#{message.channel.name}"), ("⚖️ Action", action_taken))
-                    + "\n\nPlease read the server rules. Repeated breaks can lead to a timeout or ban.",
+                    ui.kv(("🏠 Server", guild.name), ("📏 Rule", RULES[rule]), ("📍 Channel", f"#{message.channel.name}"), ("⚖️ Action", action_taken),
+                          ("⚡ Strikes", strike_meter(count, limit, s["action"] == "timeout", s["timeout_minutes"], s["strike_hours"])))
+                    + "\n\nPlease read the server rules. Strikes fall off on their own after " + f"{s['strike_hours']} hours.",
                     color=WARN, guild=guild, section="Automod"))
             except discord.HTTPException:
                 pass  # their DMs are closed
@@ -197,7 +220,7 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
         await emit(
             guild, "automod", f"Automod: {RULES[rule]}",
             ui.kv(("👤 User", member.mention), ("📏 Rule", RULES[rule]), ("🔎 Detail", detail), ("📍 Channel", message.channel.mention), ("⚖️ Action", action_taken),
-                  ("🆔 IDs", f"user `{member.id}` · message `{message.id}`"), ("⚡ Strikes", f"{len(strikes)} in the last 10 minutes")),
+                  ("🆔 IDs", f"user `{member.id}` · message `{message.id}`"), ("⚡ Strikes", f"{count} in the last {s['strike_hours']}h")),
             fields=(("Message", snippet),) if snippet else (), author=(member.display_name, member.display_avatar.url), subject=member.id,
         )
 
@@ -217,7 +240,7 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
             ("📣 Mentions", limit(s["mention_limit"], " per message")), ("🔠 Capitals", limit(s["caps_percent"], "%")), ("😀 Emojis", limit(s["emoji_limit"], " per message")),
             ("📜 Lines", limit(s["max_lines"], " per message")), ("🚷 Blocked words", f"{len(split_list(s['blocked_words']))} words"),
             ("🛡️ Skips", f"staff, {len(split_list(s['exempt_roles']))} roles, {len(split_list(s['exempt_channels']))} channels"),
-            ("📩 DM the member", on(s["dm_user"])),
+            ("📩 DM the member", on(s["dm_user"])), ("⚡ Strikes expire after", f"{s['strike_hours']} hours"),
             ("⚖️ Punishment", {"delete": "Remove the message", "warn": "Remove + warn", "timeout": f"Remove + warn + timeout {s['timeout_minutes']} min after {s['strikes_before_timeout']} strikes"}[s["action"]]),
         )
         if not self.bot.intents.message_content:
@@ -320,16 +343,35 @@ class Automod(commands.GroupCog, group_name="automod", group_description="Automa
         await self.change(interaction.guild_id, dm_user=int(enabled))
         await interaction.response.send_message(embed=ui.card(f"📩 DM notices {'on' if enabled else 'off'}", "Members get a private DM naming the rule they broke." if enabled else "Members only see the short in-channel notice.", color=SUCCESS), ephemeral=True)
 
+    @app_commands.command(description="See a member's automod strikes, or wipe them")
+    @app_commands.describe(member="Who", clear="True to wipe their strikes")
+    @app_commands.checks.has_permissions(manage_messages=True)
+    async def strikes(self, interaction: discord.Interaction, member: discord.Member, clear: bool = False):
+        s = await self.settings(interaction.guild_id)
+        if clear:
+            await self.clear_strikes(interaction.guild_id, member.id)
+            await emit(interaction.guild, "automod", "Automod strikes cleared", ui.kv(("👤 Member", f"{member.mention} (`{member.id}`)"), ("🛡️ Staff", interaction.user.mention)), subject=member.id)
+            return await interaction.response.send_message(embed=ui.card("✅ Strikes cleared", f"{member.mention} is back to 0.", color=SUCCESS), ephemeral=True)
+        rows = await db.fetch_all(
+            "SELECT rule, created_at FROM automod_strikes WHERE guild_id = ? AND user_id = ? AND cleared = 0 AND created_at > ? ORDER BY created_at DESC LIMIT 15",
+            (interaction.guild_id, member.id, time.time() - s["strike_hours"] * 3600),
+        )
+        lines = "\n".join(f"• {RULES.get(r['rule'], r['rule'])} · <t:{int(r['created_at'])}:R>" for r in rows) or "No active strikes."
+        meter = strike_meter(len(rows), s["strikes_before_timeout"], s["action"] == "timeout", s["timeout_minutes"], s["strike_hours"])
+        await interaction.response.send_message(embed=ui.card(f"⚡ Strikes · {member.display_name}", f"{meter}\n\n{lines}", guild=interaction.guild, section="Automod"), ephemeral=True)
+
     @app_commands.command(description="Choose what happens when someone breaks a rule")
-    @app_commands.describe(action="What automod does", strikes="Strikes in 10 minutes before a timeout", minutes="How long the timeout lasts")
+    @app_commands.describe(action="What automod does", strikes="Strikes in 10 minutes before a timeout", minutes="How long the timeout lasts", hours="How many hours a strike counts before it expires")
     @app_commands.choices(action=[app_commands.Choice(name="Just remove the message", value="delete"), app_commands.Choice(name="Remove it and add a warning", value="warn"), app_commands.Choice(name="Remove, warn, and time out repeat offenders", value="timeout")])
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def punishment(self, interaction: discord.Interaction, action: app_commands.Choice[str], strikes: Optional[app_commands.Range[int, 2, 20]] = None, minutes: Optional[app_commands.Range[int, 1, 10080]] = None):
+    async def punishment(self, interaction: discord.Interaction, action: app_commands.Choice[str], strikes: Optional[app_commands.Range[int, 2, 20]] = None, minutes: Optional[app_commands.Range[int, 1, 10080]] = None, hours: Optional[app_commands.Range[int, 1, 720]] = None):
         changes: dict = {"action": action.value}
         if strikes:
             changes["strikes_before_timeout"] = strikes
         if minutes:
             changes["timeout_minutes"] = minutes
+        if hours:
+            changes["strike_hours"] = hours
         await self.change(interaction.guild_id, **changes)
         await interaction.response.send_message(embed=ui.card("✅ Saved", f"**{action.name}**.", color=SUCCESS), ephemeral=True)
 
