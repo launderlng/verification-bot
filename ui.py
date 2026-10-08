@@ -64,14 +64,27 @@ def card(
     author: Optional[tuple] = None,
     timestamp: bool = False,
 ) -> discord.Embed:
+    """A branded card: when a guild is given and no custom author is set, the server icon
+    and a '<SERVER> · <SECTION>' tag become the author line (shown big, above the title)
+    instead of being buried in small footer text."""
     embed = discord.Embed(title=title, description=description, color=color, timestamp=discord.utils.utcnow() if timestamp else None)
+    auto_branded = False
+    if not author and guild is not None:
+        label = f"{guild.name.upper()} · {section.upper()}" if section else guild.name.upper()
+        author = (label[:256], guild.icon.url if guild.icon else None)
+        auto_branded = True
     if author:
         embed.set_author(name=author[0], icon_url=author[1] if len(author) > 1 else None)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     if image:
         embed.set_image(url=image)
-    text = footer or (" · ".join(x for x in (guild.name if guild else None, section) if x) or None)
+    if footer:
+        text = footer
+    elif auto_branded:
+        text = None  # already shown as the author line above, no need to repeat it below
+    else:
+        text = " · ".join(x for x in (guild.name if guild else None, section) if x) or None
     if text:
         embed.set_footer(text=text, icon_url=guild.icon.url if guild is not None and guild.icon else None)
     return embed
