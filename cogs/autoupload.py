@@ -573,35 +573,28 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         if not rows:
             raise UserError("No drop zones post into this server yet. Add one with `/autoupload add` or `/autoupload bulkadd` first, then run this again.")
 
-        steps = (
-            "**1.** Find the file somewhere else (a DM, another server, wherever it was sent to you).\n"
-            "**2.** Right-click (or long-press on mobile) the message it's attached to → **Forward**.\n"
-            "**3.** Pick the matching channel from the list below and send it there.\n"
-            "**4.** That's it — I'll pull it out and auto-post it into the right channel on the main server within a few seconds, no further steps needed.\n\n"
-            "⚠️ Drop the file in the **wrong** channel from the list and it'll post to the wrong place, so double check before sending."
-        )
-        embed = ui.card("📤 How to Upload Files to the Main Discord (by Forwarding)", steps, guild=interaction.guild, section="Files")
-
-        # One line per drop zone, "forward into this channel" -> "it posts here". Chunked across fields since a
-        # single embed field caps out at 1024 characters and this list grows as more packs get added.
+        # One line per drop zone, "forward into this channel" -> "it posts here".
         lines = []
         for r in rows:
             src = self.bot.get_channel(r["channel_id"])
             src_label = f"{src.mention} ({src.guild.name})" if src and src.guild.id != interaction.guild_id else (src.mention if src else f"`{r['channel_id']}`")
             lines.append(f"**{r['pack_name']}** — forward into {src_label} → posts in <#{r['post_channel_id']}>")
 
-        chunk, chunks, length = [], [], 0
-        for line in lines:
-            if length + len(line) + 1 > 1000:
-                chunks.append(chunk)
-                chunk, length = [], 0
-            chunk.append(line)
-            length += len(line) + 1
-        if chunk:
-            chunks.append(chunk)
-        for i, c in enumerate(chunks):
-            embed.add_field(name="Forward into these channels" if i == 0 else "​", value="\n".join(c), inline=False)
-
+        # "# " / "## " are Discord's big-heading markdown -- only renders large inside the description/content
+        # text, not an embed's title field, so the whole thing (title included) goes in the description to
+        # actually look bigger instead of the usual small embed text.
+        description = (
+            "# 📤 How to Upload Files to the Main Discord\n"
+            "### (by Forwarding)\n\n"
+            "## Steps\n"
+            "**1.** Find the file somewhere else (a DM, another server, wherever it was sent to you).\n"
+            "**2.** Right-click (or long-press on mobile) the message it's attached to → **Forward**.\n"
+            "**3.** Pick the matching channel from the list below and send it there.\n"
+            "**4.** That's it — I'll pull it out and auto-post it into the right channel on the main server within a few seconds, no further steps needed.\n\n"
+            "⚠️ Drop the file in the **wrong** channel from the list and it'll post to the wrong place, so double check before sending.\n\n"
+            "## Forward into these channels\n" + "\n".join(lines)
+        )
+        embed = ui.card(None, description[:4096], guild=interaction.guild, section="Files")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(description="Get an invite link to add me to another server (e.g. your vault/source server)")
