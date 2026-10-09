@@ -103,7 +103,16 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild or not message.attachments:
+        if message.author.bot or not message.guild:
+            return
+        # A forwarded message (Discord's Forward feature) carries its attachments in message_snapshots, not in
+        # message.attachments -- the original message's content is "snapshotted" into the forward rather than
+        # duplicated as regular attachments. Gather both so dropping a file in directly and forwarding one from
+        # elsewhere both work the same way.
+        attachments = list(message.attachments)
+        for snap in getattr(message, "message_snapshots", None) or getattr(message, "snapshots", None) or []:
+            attachments.extend(getattr(snap, "attachments", None) or [])
+        if not attachments:
             return
         row = await db.fetch_one("SELECT * FROM upload_channels WHERE guild_id = ? AND channel_id = ?", (message.guild.id, message.channel.id))
         if row is None:
@@ -121,7 +130,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         store_guild_id = post_channel.guild.id  # the file belongs to the server people actually claim it in
         taken = {r["name"].lower() for r in await db.fetch_all("SELECT name FROM stored_files WHERE guild_id = ?", (store_guild_id,))}
         posted, failed = [], []
-        for att in message.attachments:
+        for att in attachments:
             try:
                 await self.ingest(message, att, row, post_channel, required_role, taken, store_guild_id)
                 posted.append(att.filename)
