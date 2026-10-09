@@ -133,17 +133,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         store_guild_id = post_channel.guild.id  # the file belongs to the server people actually claim it in
         taken = {r["name"].lower() for r in await db.fetch_all("SELECT name FROM stored_files WHERE guild_id = ?", (store_guild_id,))}
         posted, failed = [], []
-        seen_in_message = set()
-        for att in attachments:
-            # Discord's own upload picker/drag-drop occasionally attaches the exact same file to a message twice
-            # (same name + size) -- that's not two different uploads, it's one file counted twice, so only the
-            # first copy gets posted. A second attachment with a different name or size is treated as a real,
-            # separate file and still gets its own post.
-            dup_key = (att.filename, att.size)
-            if dup_key in seen_in_message:
-                log.info("autoupload: message %s attachment %s (%s, %d bytes) duplicates another attachment already on this message -- skipping", message.id, att.id, att.filename, att.size)
-                continue
-            seen_in_message.add(dup_key)
+        # A drop message is one file, one post -- only the FIRST attachment on the message is ever used, no
+        # matter how many Discord says are on it (its own upload picker/drag-drop has repeatedly attached the
+        # same file to a message twice with different names/sizes, which broke matching on filename+size).
+        # Dropping two different files on purpose should be two separate messages.
+        if len(attachments) > 1:
+            log.info("autoupload: message %s has %d attachments -- only using the first (%s), ignoring the rest", message.id, len(attachments), attachments[0].filename)
+        for att in attachments[:1]:
             # Atomic check-and-claim: if this exact (message, attachment) pair has already been processed --
             # whether from a duplicate gateway event or two bot instances briefly overlapping during a deploy --
             # this INSERT is ignored and we skip it, instead of posting the same upload twice.
@@ -228,9 +224,15 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         # post, just the pack name, the preview, and the Get-file button. gif_url is an optional per-channel
         # branding GIF configured with /autoupload add (or the gif_url option on the bulk commands), shown as its
         # own embed under the main one, same as a manual /post with a GIF attached.
-        draft = Draft(post_channel, row["pack_name"], None, None, None,
+        # Discord always renders a raw video/audio attachment ABOVE any embeds, no matter what order they're
+        # sent in -- putting the title in the embed (like the image case does) made it look stuck below the
+        # video. So for a video/audio post, the title goes in the message content instead (always renders at the
+        # very top) and the embed is left titleless, giving one clean flow: title, video, GIF, button.
+        title = None if file_attach else row["pack_name"]
+        content = f"**{row['pack_name']}**" if file_attach else None
+        draft = Draft(post_channel, title, None, None, None,
                        photo=photo, file=file_attach, gif_url=row["gif_url"],
-                       deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False)
+                       deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
         log_fields = [("👤 By", message.author.mention), ("📦 Stored as", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention)]
         if too_large_for_preview:
