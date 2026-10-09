@@ -344,21 +344,36 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                                color=SUCCESS, guild=interaction.guild, section="Files"),
                 ephemeral=True,
             )
-        # Can't see them. Without Administrator there's no way for me to fix this myself -- the categories are
-        # simply invisible to a bot that isn't explicitly let in, no matter what other permissions it has.
+        # Can't see any category matching the expected names. Show exactly what server and what categories I DO see,
+        # so a wrong vault_guild_id (easy to mix up with the main server's ID) is obvious instead of guessed at.
+        all_cats = [cat.name for cat in vault.categories]
         body = (
-            f"I can't see any category matching {', '.join(FIX_PERM_CATEGORIES)} on that server at all — not even its name — "
-            "which means it's genuinely hidden from me, not just a naming mismatch.\n\n"
+            f"Checking **{vault.name}** (`{vault.id}`) — "
+            f"I don't see any category matching {', '.join(FIX_PERM_CATEGORIES)} there.\n\n"
         )
-        if me and me.guild_permissions.administrator:
-            body += "That's odd since I do have Administrator there — try kicking and re-inviting me with `/autoupload inviteinfo`'s link, Discord can be slow to apply a fresh invite's permissions."
+        if all_cats:
+            body += "Categories I *can* see on this server:\n" + "\n".join(f"📁 {n}" for n in all_cats[:25])
+            body += (
+                "\n\nIf none of those look like your vault's FIVEM/RZ/Boosters categories, double-check `vault_guild_id` — "
+                "it needs to be the **vault server's** ID, not this bot's main server. Right-click the vault server's icon "
+                "(not a channel) → **Copy Server ID**.\n\nIf one of them *is* meant to be FIVEM/RZ/Boosters but is named "
+                "differently (emojis, abbreviations), tell me the exact name and I can match on that instead."
+            )
         else:
             body += (
-                "**Two ways to fix it:**\n"
-                "**1.** Re-invite me with `/autoupload inviteinfo` (now asks for Administrator, which bypasses this).\n"
-                "**2.** Or, without changing my permissions: right-click each of FIVEM/RZ/Boosters on that server → **Edit Category** → "
-                "**Permissions** → add my role → allow **View Channel** (and ideally Send Messages, Read Message History, Add Reactions)."
+                "In fact I can't see **any** categories on this server at all, which points at `vault_guild_id` being wrong "
+                "rather than a permissions issue — if this really is the vault, right-click its icon (not a channel) → "
+                "**Copy Server ID** and double check against what you pasted.\n\n"
             )
+            if me and me.guild_permissions.administrator:
+                body += "That's despite me having Administrator here, so this genuinely looks like the wrong server ID rather than a permission problem."
+            else:
+                body += (
+                    "**Two ways to fix it if this is the right server and it's a permissions issue:**\n"
+                    "**1.** Re-invite me with `/autoupload inviteinfo` (now asks for Administrator, which bypasses hidden-channel limits).\n"
+                    "**2.** Or, without changing my permissions: right-click each category on that server → **Edit Category** → "
+                    "**Permissions** → add my role → allow **View Channel** (and ideally Send Messages, Read Message History, Add Reactions)."
+                )
         raise UserError(body)
 
 
