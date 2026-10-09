@@ -132,6 +132,15 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         taken = {r["name"].lower() for r in await db.fetch_all("SELECT name FROM stored_files WHERE guild_id = ?", (store_guild_id,))}
         posted, failed = [], []
         for att in attachments:
+            # Atomic check-and-claim: if this exact (message, attachment) pair has already been processed --
+            # whether from a duplicate gateway event or two bot instances briefly overlapping during a deploy --
+            # this INSERT is ignored and we skip it, instead of posting the same upload twice.
+            claimed = await db.execute(
+                "INSERT OR IGNORE INTO processed_uploads (message_id, attachment_id, created_at) VALUES (?, ?, ?)",
+                (message.id, att.id, discord.utils.utcnow().isoformat()),
+            )
+            if not claimed:
+                continue
             try:
                 await self.ingest(message, att, row, post_channel, required_role, taken, store_guild_id)
                 posted.append(att.filename)
@@ -180,18 +189,28 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         ctype = (att.content_type or "").lower()
         ext = Path(att.filename).suffix.lower()
         clean_attach_name = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file") + ext
+        # Use the destination server's REAL upload limit (boost-tier aware), not just our static guess -- a file
+        # that fits our guess but not this server's actual cap would otherwise fail the whole send with an
+        # HTTPException, or (if our guess were too high) silently never get attempted.
+        inline_limit = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
         photo = file_attach = None
-        if len(data) <= ATTACH_LIMIT:
+        too_large_for_preview = False
+        if len(data) <= inline_limit:
             if ctype.startswith("image/"):
                 photo = (clean_attach_name, data, len(data))
             elif ctype.startswith("video/") or ctype.startswith("audio/"):
                 file_attach = (clean_attach_name, data, len(data))
+        elif ctype.startswith(("image/", "video/", "audio/")):
+            too_large_for_preview = True
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
         # like "V1" or "Cielo_15") -- no filename shown anywhere in the post itself. gif_url is an optional
         # per-channel branding GIF configured with /autoupload add (or the gif_url option on the bulk commands),
         # shown as its own embed under the main one, same as a manual /post with a GIF attached.
-        draft = Draft(post_channel, row["pack_name"], None, f"Uploaded in #{message.channel.name}", None,
+        footer = f"Uploaded in #{message.channel.name}"
+        if too_large_for_preview:
+            footer += f" · {human_size(len(data))}, too large to preview inline here ({human_size(inline_limit)} limit)"
+        draft = Draft(post_channel, row["pack_name"], None, footer, None,
                        photo=photo, file=file_attach, gif_url=row["gif_url"],
                        deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False)
         await publish_draft(post_channel.guild, message.author, draft)
