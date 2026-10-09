@@ -172,21 +172,19 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
 
-        # Show an inline preview when the file is small enough to attach directly: images go in the embed itself
-        # (the big photo), video/audio get attached to the message so Discord renders its native player. Either
-        # way the Get-file button is always there too, as the permanent, trackable way to claim a copy.
+        # Image previews go straight in the embed (the big photo) when small enough to attach directly. Video/audio
+        # don't get this -- the only way to preview those inline is attaching the raw file to the message, which
+        # necessarily shows its filename in Discord's UI, and the point here is a clean post with no filename
+        # anywhere: just the pack name and a button. The Get-file button is always there either way.
         ctype = (att.content_type or "").lower()
-        photo = file_attach = None
-        if len(data) <= ATTACH_LIMIT:
-            if ctype.startswith("image/"):
-                photo = (att.filename, data, len(data))
-            elif ctype.startswith("video/") or ctype.startswith("audio/"):
-                file_attach = (att.filename, data, len(data))
+        photo = None
+        if len(data) <= ATTACH_LIMIT and ctype.startswith("image/"):
+            photo = (att.filename, data, len(data))
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
-        # like "V1" or "Cielo_15") -- the filename is still shown as the footer and the stored file's own name.
-        draft = Draft(post_channel, row["pack_name"], clean_title(att.filename), f"Uploaded in #{message.channel.name}", None,
-                       photo=photo, file=file_attach, deliver=(file_row["id"], name), pack=row["pack_name"])
+        # like "V1" or "Cielo_15") -- no filename shown anywhere in the post itself.
+        draft = Draft(post_channel, row["pack_name"], None, f"Uploaded in #{message.channel.name}", None,
+                       photo=photo, deliver=(file_row["id"], name), pack=row["pack_name"])
         await publish_draft(post_channel.guild, message.author, draft)
         await emit(
             post_channel.guild, "files", "File auto-uploaded",
