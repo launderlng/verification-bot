@@ -42,20 +42,27 @@ def label_parts(category: str) -> tuple[str, str]:
 
 # ----------------------------------------------------------------- setup UI ----
 
+CATEGORY_KEYS = list(CATEGORIES)
+# Discord caps a select menu at 25 options, and we have more categories than that now,
+# so the picker is split into two menus that together cover every category.
+CATEGORY_PAGES = [CATEGORY_KEYS[:len(CATEGORY_KEYS) // 2], CATEGORY_KEYS[len(CATEGORY_KEYS) // 2:]]
+
+
 class CategorySelect(discord.ui.Select):
-    def __init__(self, cog: "Logs", enabled: set):
+    def __init__(self, cog: "Logs", enabled: set, keys: list, row: int, placeholder: str):
+        self.keys = keys
         options = [
             discord.SelectOption(label=label_parts(key)[1], value=key, emoji=label_parts(key)[0], description=CATEGORIES[key][:100], default=key in enabled)
-            for key in CATEGORIES
+            for key in keys
         ]
-        super().__init__(placeholder="Choose what to log…", options=options, min_values=0, max_values=len(options), row=0)
+        super().__init__(placeholder=placeholder, options=options, min_values=0, max_values=len(options), row=row)
         self.cog = cog
 
     async def callback(self, interaction: discord.Interaction):
         if not await self.cog.guard(interaction):
             return
         chosen = set(self.values)
-        for key in CATEGORIES:
+        for key in self.keys:
             await self.cog.set_enabled(interaction.guild_id, key, key in chosen)
         await self.cog.refresh_dashboard(interaction)
 
@@ -64,7 +71,8 @@ class LogsDashboard(discord.ui.View):
     def __init__(self, cog: "Logs", enabled: set):
         super().__init__(timeout=600)
         self.cog = cog
-        self.add_item(CategorySelect(cog, enabled))
+        self.add_item(CategorySelect(cog, enabled, CATEGORY_PAGES[0], row=0, placeholder="Choose what to log… (1/2)"))
+        self.add_item(CategorySelect(cog, enabled, CATEGORY_PAGES[1], row=2, placeholder="Choose what to log… (2/2)"))
 
     @discord.ui.button(label="Set up everything", emoji="⚡", style=discord.ButtonStyle.success, row=1)
     async def setup_all(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -233,7 +241,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
                     "ON CONFLICT(guild_id, category) DO UPDATE SET channel_id = excluded.channel_id",  # keeps whatever is switched on/off
                     (guild.id, cat, made[key].id),
                 )
-        await db.upsert_config(guild.id, log_channel_id=made["moderation"].id)
+        await db.upsert_config(guild.id, log_channel_id=made["ban"].id)
         return made
 
     async def run_full_setup(self, guild: discord.Guild, invoker: discord.Member, only: Optional[set] = None) -> tuple:
@@ -387,7 +395,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
     async def on_member_join(self, member: discord.Member):
         age = (discord.utils.utcnow() - member.created_at).days
         await emit(
-            member.guild, "members", "Member joined",
+            member.guild, "join", "Member joined",
             ui.kv(("👤 Member", member.mention), ("📅 Account created", discord.utils.format_dt(member.created_at, "R")),
                   ("👥 Member count", f"{member.guild.member_count:,}"), ("🏷️ Type", "🤖 Bot" if member.bot else None),
                   ("🚩 Warning", f"New account, only {age} day(s) old" if age < 7 and not member.bot else None)),
@@ -405,7 +413,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         kick = await find_audit_entry(guild, discord.AuditLogAction.kick, member.id)
         if kick:
             await emit(
-                guild, "moderation", "Member kicked",
+                guild, "kick", "Member kicked",
                 ui.kv(("👤 Member", member.mention), ("🛡️ By", kick.user.mention if kick.user else "Unknown"), ("📝 Reason", kick.reason or "None given")),
                 WARN, author=self.who(member), footer=f"ID {member.id}", subject=member.id,
             )
@@ -413,7 +421,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         roles = ", ".join(r.mention for r in reversed(member.roles) if not r.is_default()) or "None"
         stayed = ui.duration((discord.utils.utcnow() - member.joined_at).total_seconds()) if member.joined_at else None
         await emit(
-            guild, "members", "Member left",
+            guild, "leave", "Member left",
             ui.kv(("👤 Member", member.mention), ("📥 Joined", discord.utils.format_dt(member.joined_at, "R") if member.joined_at else None),
                   ("⏱️ Stayed", stayed), ("🎭 Roles", clip(roles, 800)), ("👥 Member count", f"{guild.member_count:,}")),
             DANGER, author=self.who(member), footer=f"ID {member.id}", subject=member.id,
@@ -426,7 +434,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         await asyncio.sleep(1.5)
         entry = await find_audit_entry(guild, discord.AuditLogAction.ban, user.id)
         await emit(
-            guild, "moderation", "Member banned",
+            guild, "ban", "Member banned",
             ui.kv(("👤 Member", user.mention), ("🛡️ By", entry.user.mention if entry and entry.user else "Unknown"), ("📝 Reason", (entry.reason if entry else None) or "None given")),
             DANGER, author=self.who(user), footer=f"ID {user.id}", subject=user.id,
         )
@@ -438,7 +446,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         await asyncio.sleep(1.5)
         entry = await find_audit_entry(guild, discord.AuditLogAction.unban, user.id)
         await emit(
-            guild, "moderation", "Member unbanned", ui.kv(("👤 Member", user.mention), ("🛡️ By", entry.user.mention if entry and entry.user else "Unknown")),
+            guild, "ban", "Member unbanned", ui.kv(("👤 Member", user.mention), ("🛡️ By", entry.user.mention if entry and entry.user else "Unknown")),
             SUCCESS, author=self.who(user), footer=f"ID {user.id}", subject=user.id,
         )
 
@@ -451,7 +459,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
             entry = await find_audit_entry(guild, discord.AuditLogAction.member_role_update, after.id, within=10)
             risky = sorted({p for r in added for p in dangerous_perms(r.permissions)})
             await emit(
-                guild, "roles", "Roles updated",
+                guild, "role_update", "Roles updated",
                 ui.kv(("👤 Member", after.mention), ("➕ Added", ", ".join(r.mention for r in added) if added else None),
                       ("➖ Removed", ", ".join(r.mention for r in removed) if removed else None), ("🛡️ By", entry.user.mention if entry and entry.user else None),
                       ("⚠️ Dangerous", "Now has " + ", ".join(risky) if risky else None)),
@@ -469,9 +477,9 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
             entry = await find_audit_entry(guild, discord.AuditLogAction.member_update, after.id, within=10)
             details = (("🛡️ By", entry.user.mention if entry and entry.user else None), ("📝 Reason", entry.reason if entry and entry.reason else None))
             if after.timed_out_until:
-                await emit(guild, "moderation", "Member timed out", ui.kv(("👤 Member", after.mention), ("⏳ Until", discord.utils.format_dt(after.timed_out_until, "f")), *details), WARN, author=self.who(after), footer=f"ID {after.id}", subject=after.id)
+                await emit(guild, "timeout", "Member timed out", ui.kv(("👤 Member", after.mention), ("⏳ Until", discord.utils.format_dt(after.timed_out_until, "f")), *details), WARN, author=self.who(after), footer=f"ID {after.id}", subject=after.id)
             else:
-                await emit(guild, "moderation", "Timeout removed", ui.kv(("👤 Member", after.mention), details[0]), SUCCESS, author=self.who(after), footer=f"ID {after.id}", subject=after.id)
+                await emit(guild, "timeout", "Timeout removed", ui.kv(("👤 Member", after.mention), details[0]), SUCCESS, author=self.who(after), footer=f"ID {after.id}", subject=after.id)
 
     @commands.Cog.listener()
     async def on_user_update(self, before: discord.User, after: discord.User):
@@ -497,7 +505,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
             fields.append(("Attachments", "\n".join(f"{a.filename}" for a in message.attachments)))
         reply = getattr(getattr(message, "reference", None), "message_id", None)
         await emit(
-            message.guild, "messages", "Message deleted",
+            message.guild, "message_delete", "Message deleted",
             ui.kv(("✍️ Author", message.author.mention), ("💬 Channel", message.channel.mention),
                   ("↩️ Replying to", f"[a message](https://discord.com/channels/{message.guild.id}/{message.channel.id}/{reply})" if reply else None),
                   ("📅 Sent", discord.utils.format_dt(message.created_at, "R") if getattr(message, "created_at", None) else None)),
@@ -509,7 +517,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         if not messages or not messages[0].guild:
             return
         await emit(
-            messages[0].guild, "messages", "Messages bulk deleted",
+            messages[0].guild, "message_delete", "Messages bulk deleted",
             ui.kv(("💬 Channel", messages[0].channel.mention), ("🗑️ Deleted", ui.plural(len(messages), "message"))), DANGER,
         )
 
@@ -518,7 +526,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         if not after.guild or after.author.bot or not self.content_enabled or before.content == after.content:
             return
         await emit(
-            after.guild, "messages", "Message edited",
+            after.guild, "message_edit", "Message edited",
             ui.kv(("✍️ Author", after.author.mention), ("💬 Channel", after.channel.mention), ("🔗 Link", f"[Jump to message]({after.jump_url})")),
             WARN, fields=(("⬅️ Before", before.content), ("➡️ After", after.content)), author=self.who(after.author), footer=f"Author ID {after.author.id}", subject=after.author.id,
         )
@@ -528,12 +536,12 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
         by = await self.by(channel.guild, "channel_create", channel.id)
-        await emit(channel.guild, "channels", "Channel created", ui.kv(("💬 Channel", channel.mention), ("🏷️ Type", str(channel.type).title()), ("🛡️ By", by)), SUCCESS)
+        await emit(channel.guild, "channel_create", "Channel created", ui.kv(("💬 Channel", channel.mention), ("🏷️ Type", str(channel.type).title()), ("🛡️ By", by)), SUCCESS)
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         by = await self.by(channel.guild, "channel_delete", channel.id)
-        await emit(channel.guild, "channels", "Channel deleted", ui.kv(("💬 Channel", f"**#{channel.name}**"), ("🏷️ Type", str(channel.type).title()), ("🛡️ By", by)), DANGER)
+        await emit(channel.guild, "channel_delete", "Channel deleted", ui.kv(("💬 Channel", f"**#{channel.name}**"), ("🏷️ Type", str(channel.type).title()), ("🛡️ By", by)), DANGER)
 
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
@@ -550,15 +558,15 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
             changes.append(("🔑 Permissions", "Channel permissions were changed"))
         if changes:
             by = await self.by(after.guild, "channel_update", after.id)
-            await emit(after.guild, "channels", "Channel updated", ui.kv(("💬 Channel", after.mention), *changes, ("🛡️ By", by)))
+            await emit(after.guild, "channel_update", "Channel updated", ui.kv(("💬 Channel", after.mention), *changes, ("🛡️ By", by)))
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread: discord.Thread):
-        await emit(thread.guild, "channels", "Thread created", ui.kv(("🧵 Thread", thread.mention), ("💬 In", thread.parent.mention if thread.parent else None), ("👤 By", f"<@{thread.owner_id}>" if thread.owner_id else None)), SUCCESS)
+        await emit(thread.guild, "channel_create", "Thread created", ui.kv(("🧵 Thread", thread.mention), ("💬 In", thread.parent.mention if thread.parent else None), ("👤 By", f"<@{thread.owner_id}>" if thread.owner_id else None)), SUCCESS)
 
     @commands.Cog.listener()
     async def on_thread_delete(self, thread: discord.Thread):
-        await emit(thread.guild, "channels", "Thread deleted", ui.kv(("🧵 Thread", f"**{thread.name}**"), ("💬 In", thread.parent.mention if thread.parent else None)), DANGER)
+        await emit(thread.guild, "channel_delete", "Thread deleted", ui.kv(("🧵 Thread", f"**{thread.name}**"), ("💬 In", thread.parent.mention if thread.parent else None)), DANGER)
 
     @commands.Cog.listener()
     async def on_webhooks_update(self, channel: discord.abc.GuildChannel):
@@ -569,12 +577,12 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role):
         by = await self.by(role.guild, "role_create", role.id)
-        await emit(role.guild, "roles", "Role created", ui.kv(("🎭 Role", role.mention), ("🛡️ By", by)), SUCCESS)
+        await emit(role.guild, "role_create", "Role created", ui.kv(("🎭 Role", role.mention), ("🛡️ By", by)), SUCCESS)
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
         by = await self.by(role.guild, "role_delete", role.id)
-        await emit(role.guild, "roles", "Role deleted", ui.kv(("🎭 Role", f"**{role.name}**"), ("🛡️ By", by)), DANGER)
+        await emit(role.guild, "role_delete", "Role deleted", ui.kv(("🎭 Role", f"**{role.name}**"), ("🛡️ By", by)), DANGER)
 
     @commands.Cog.listener()
     async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
@@ -590,7 +598,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
             changes.append(("🔑 Permissions", "\n" + diff))
         if changes:
             by = await self.by(after.guild, "role_update", after.id)
-            await emit(after.guild, "roles", "Role updated", ui.kv(("🎭 Role", after.mention), *changes, ("🛡️ By", by)), WARN if risky or before.permissions != after.permissions else None)
+            await emit(after.guild, "role_update", "Role updated", ui.kv(("🎭 Role", after.mention), *changes, ("🛡️ By", by)), WARN if risky or before.permissions != after.permissions else None)
 
     @commands.Cog.listener()
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild):

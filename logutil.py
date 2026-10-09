@@ -9,11 +9,20 @@ from common import ACCENT, COLOR, DANGER, INFO, SUCCESS, WARN
 
 CATEGORIES = {
     "verification": "Verification events",
-    "members": "Joins and leaves",
-    "messages": "Message edits and deletes",
-    "roles": "Role changes",
-    "moderation": "Bans, kicks, timeouts, warnings",
-    "channels": "Channel changes",
+    "join": "Members joining",
+    "leave": "Members leaving",
+    "message_edit": "Edited messages",
+    "message_delete": "Deleted messages",
+    "role_create": "Roles created",
+    "role_delete": "Roles deleted",
+    "role_update": "Roles edited or given/taken from a member",
+    "ban": "Bans and unbans",
+    "kick": "Kicks",
+    "timeout": "Timeouts",
+    "warn": "Warnings",
+    "channel_create": "Channels created",
+    "channel_delete": "Channels deleted",
+    "channel_update": "Channels edited, locked or slowed",
     "nicknames": "Nickname and username changes",
     "voice": "Voice channel activity",
     "server": "Server settings changes",
@@ -33,11 +42,20 @@ CATEGORIES = {
 # Layout used by "Create log channels": one private channel per category, fully separated.
 LOG_CHANNELS = {
     "verification": ("✅・verify-logs", "Verification attempts, passes and lockdown", ["verification"]),
-    "members": ("👋・join-logs", "Joins and leaves", ["members"]),
-    "messages": ("💬・message-logs", "Edited and deleted messages", ["messages"]),
-    "roles": ("🎭・role-logs", "Roles created, deleted and changed", ["roles"]),
-    "moderation": ("🛡️・mod-logs", "Bans, kicks, timeouts and warnings", ["moderation"]),
-    "channels": ("📁・channel-logs", "Channels created, deleted and changed", ["channels"]),
+    "join": ("👋・join-logs", "Members joining", ["join"]),
+    "leave": ("🚪・leave-logs", "Members leaving", ["leave"]),
+    "message_edit": ("✏️・edit-logs", "Edited messages", ["message_edit"]),
+    "message_delete": ("🗑️・delete-logs", "Deleted messages", ["message_delete"]),
+    "role_create": ("🎭・role-created-logs", "Roles created", ["role_create"]),
+    "role_delete": ("🎭・role-deleted-logs", "Roles deleted", ["role_delete"]),
+    "role_update": ("🎭・role-updated-logs", "Roles edited, or given to / taken from a member", ["role_update"]),
+    "ban": ("🔨・ban-logs", "Bans and unbans", ["ban"]),
+    "kick": ("👢・kick-logs", "Kicks", ["kick"]),
+    "timeout": ("⏳・timeout-logs", "Timeouts", ["timeout"]),
+    "warn": ("⚠️・warn-logs", "Warnings", ["warn"]),
+    "channel_create": ("📁・channel-created-logs", "Channels created", ["channel_create"]),
+    "channel_delete": ("📁・channel-deleted-logs", "Channels deleted", ["channel_delete"]),
+    "channel_update": ("📁・channel-updated-logs", "Channels edited, locked or slowed", ["channel_update"]),
     "nicknames": ("✏️・name-logs", "Nickname and username changes", ["nicknames"]),
     "voice": ("🔊・voice-logs", "Voice channel activity", ["voice"]),
     "server": ("⚙️・server-logs", "Server settings and emoji changes", ["server"]),
@@ -52,7 +70,7 @@ LOG_CHANNELS = {
     "commands": ("⌨️・command-logs", "Every slash command anyone runs", ["commands"]),
     "events": ("🗓️・event-logs", "Scheduled server events", ["events"]),
 }
-ESSENTIALS = {"members", "messages", "moderation", "verification", "tickets", "roles"}
+ESSENTIALS = {"join", "leave", "message_edit", "message_delete", "ban", "kick", "timeout", "warn", "verification", "tickets", "role_create", "role_delete", "role_update"}
 HISTORY_DAYS = 30
 
 
@@ -85,8 +103,11 @@ async def send_log(guild: discord.Guild, category: str, embed: discord.Embed) ->
 
 
 CATEGORY_STYLE = {
-    "verification": ("✅ Verification", SUCCESS), "members": ("👥 Members", INFO), "messages": ("💬 Messages", WARN),
-    "roles": ("🎭 Roles", ACCENT), "moderation": ("🛡️ Moderation", DANGER), "channels": ("📁 Channels", INFO),
+    "verification": ("✅ Verification", SUCCESS), "join": ("👋 Joins", SUCCESS), "leave": ("🚪 Leaves", DANGER),
+    "message_edit": ("✏️ Edits", WARN), "message_delete": ("🗑️ Deletes", WARN),
+    "role_create": ("🎭 Role created", SUCCESS), "role_delete": ("🎭 Role deleted", DANGER), "role_update": ("🎭 Role updated", ACCENT),
+    "ban": ("🔨 Bans", DANGER), "kick": ("👢 Kicks", WARN), "timeout": ("⏳ Timeouts", WARN), "warn": ("⚠️ Warnings", WARN),
+    "channel_create": ("📁 Channel created", SUCCESS), "channel_delete": ("📁 Channel deleted", DANGER), "channel_update": ("📁 Channel updated", INFO),
     "nicknames": ("✏️ Names", INFO), "voice": ("🔊 Voice", ACCENT), "server": ("⚙️ Server", WARN),
     "shop": ("🛒 Shop", SUCCESS), "tickets": ("🎫 Tickets", ACCENT), "giveaways": ("🎉 Giveaways", ACCENT), "invites": ("🔗 Invites", INFO), "files": ("📥 Files", INFO), "automod": ("🤖 Automod", WARN), "posts": ("📢 Posts", INFO), "staff": ("🛠️ Staff", INFO),
     "commands": ("⌨️ Commands", INFO), "events": ("🗓️ Events", ACCENT),
