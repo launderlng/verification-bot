@@ -330,18 +330,30 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         if vault is None:
             raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
         me = vault.me
-        found = [cat.name for cat in vault.categories if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
-        if me and me.guild_permissions.administrator and found:
+        found_cats = [cat for cat in vault.categories if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
+        if found_cats:
+            # Show not just the category names but what's actually inside each one, by channel type -- this is what
+            # actually matters for pairing, since a category can be fully visible while its channels still aren't
+            # plain text channels (e.g. forum/announcement channels, which /autoupload preset can't pair).
+            lines = []
+            for cat in found_cats:
+                kinds = {}
+                for ch in cat.channels:
+                    kinds[type(ch).__name__] = kinds.get(type(ch).__name__, 0) + 1
+                breakdown = ", ".join(f"{n} {k}" for k, n in kinds.items()) if kinds else "no channels visible inside"
+                lines.append(f"📁 {cat.name} — {breakdown}")
+            admin_note = "I'm an Administrator there.\n\n" if me and me.guild_permissions.administrator else ""
+            text_total = sum(len(cat.text_channels) for cat in found_cats)
+            if text_total:
+                tail = "\n\nRun `/autoupload preset` — it should find channels now."
+            else:
+                tail = (
+                    "\n\n⚠️ None of those are plain **TextChannel**s, which is what `/autoupload preset`/`bulkadd` pair against. "
+                    "If they're forum or announcement channels, tell me and I can add support for those instead."
+                )
             return await interaction.response.send_message(
-                embed=ui.card("✅ All good", "I'm an Administrator there and can see:\n" + "\n".join(f"📁 {n}" for n in found)
-                                             + "\n\nRun `/autoupload preset` — it should find channels now.", color=SUCCESS, guild=interaction.guild, section="Files"),
-                ephemeral=True,
-            )
-        if found:
-            # Not an admin, but can already see the categories (they weren't locked down after all) -- nothing to fix.
-            return await interaction.response.send_message(
-                embed=ui.card("✅ I can already see them", "Found:\n" + "\n".join(f"📁 {n}" for n in found) + "\n\nRun `/autoupload preset` — it should find channels now.",
-                               color=SUCCESS, guild=interaction.guild, section="Files"),
+                embed=ui.card("✅ Categories found", admin_note + "\n".join(lines) + tail,
+                               color=SUCCESS if text_total else WARN, guild=interaction.guild, section="Files"),
                 ephemeral=True,
             )
         # Can't see any category matching the expected names. Show exactly what server and what categories I DO see,
