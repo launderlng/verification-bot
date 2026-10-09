@@ -133,7 +133,17 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         store_guild_id = post_channel.guild.id  # the file belongs to the server people actually claim it in
         taken = {r["name"].lower() for r in await db.fetch_all("SELECT name FROM stored_files WHERE guild_id = ?", (store_guild_id,))}
         posted, failed = [], []
+        seen_in_message = set()
         for att in attachments:
+            # Discord's own upload picker/drag-drop occasionally attaches the exact same file to a message twice
+            # (same name + size) -- that's not two different uploads, it's one file counted twice, so only the
+            # first copy gets posted. A second attachment with a different name or size is treated as a real,
+            # separate file and still gets its own post.
+            dup_key = (att.filename, att.size)
+            if dup_key in seen_in_message:
+                log.info("autoupload: message %s attachment %s (%s, %d bytes) duplicates another attachment already on this message -- skipping", message.id, att.id, att.filename, att.size)
+                continue
+            seen_in_message.add(dup_key)
             # Atomic check-and-claim: if this exact (message, attachment) pair has already been processed --
             # whether from a duplicate gateway event or two bot instances briefly overlapping during a deploy --
             # this INSERT is ignored and we skip it, instead of posting the same upload twice.
@@ -208,6 +218,10 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 file_attach = (clean_attach_name, data, len(data))
         elif ctype.startswith(("image/", "video/", "audio/")):
             too_large_for_preview = True
+        log.info(
+            "autoupload: ingest %s -- raw content_type=%r resolved ctype=%r size=%d inline_limit=%d -> photo=%s file_attach=%s too_large=%s",
+            att.filename, att.content_type, ctype, len(data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
+        )
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
         # like "V1" or "Cielo_15") -- no filename and no "Uploaded in #..." text shown anywhere in the public
