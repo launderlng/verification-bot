@@ -414,16 +414,28 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             if text_total:
                 tail = "\n\nRun `/autoupload preset` — it should find channels now."
             else:
-                # Raw dump to find the actual mismatch instead of guessing again: total text channels seen
-                # anywhere in the server, the category IDs we're matching against, and a sample of what a few
-                # real channels report as their own category_id.
-                sample = "\n".join(f"`{ch.name}` → category_id `{ch.category_id}`" for ch in vault_texts[:8]) or "(none at all)"
-                tail = (
-                    f"\n\n⚠️ No plain **TextChannel**s found in there via the API either.\n\n"
-                    f"Debug: {len(vault_texts)} total text channel(s) visible anywhere in this server. "
-                    f"Matched category IDs: {', '.join(str(i) for i in found_cat_ids) or '(none)'}.\n"
-                    f"Sample of channels seen:\n{sample}"
-                )
+                # Zero TextChannels anywhere in the server (not just these categories) despite the user seeing
+                # plenty in their own client -- bypass discord.py's parsing entirely and look at Discord's raw
+                # JSON for this guild's channels, which shows the real numeric `type` for every channel regardless
+                # of how (or whether) this library version's object model classifies it.
+                try:
+                    raw = await self.bot.http.get_all_guild_channels(vault.id)
+                except Exception as e:
+                    raw = None
+                    raw_err = str(e)
+                if raw is not None:
+                    type_counts: dict = {}
+                    for ch in raw:
+                        type_counts[ch.get("type")] = type_counts.get(ch.get("type"), 0) + 1
+                    sample = "\n".join(f"`{ch.get('name')}` — type `{ch.get('type')}`, parent_id `{ch.get('parent_id')}`" for ch in raw[:10]) or "(none at all)"
+                    tail = (
+                        f"\n\n⚠️ No plain TextChannels parsed from the API.\n\n"
+                        f"Raw debug: Discord reports {len(raw)} channel(s) total in this server, by type: "
+                        f"{type_counts}.\nMatched category IDs: {', '.join(str(i) for i in found_cat_ids) or '(none)'}.\n"
+                        f"Sample (raw, unfiltered):\n{sample}"
+                    )
+                else:
+                    tail = f"\n\n⚠️ Couldn't even fetch the raw channel list (Discord said: {raw_err})."
             return await interaction.response.send_message(
                 embed=ui.card("✅ Categories found", admin_note + "\n".join(lines) + tail,
                                color=SUCCESS if text_total else WARN, guild=interaction.guild, section="Files"),
