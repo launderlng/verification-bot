@@ -414,9 +414,15 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             if text_total:
                 tail = "\n\nRun `/autoupload preset` — it should find channels now."
             else:
+                # Raw dump to find the actual mismatch instead of guessing again: total text channels seen
+                # anywhere in the server, the category IDs we're matching against, and a sample of what a few
+                # real channels report as their own category_id.
+                sample = "\n".join(f"`{ch.name}` → category_id `{ch.category_id}`" for ch in vault_texts[:8]) or "(none at all)"
                 tail = (
-                    "\n\n⚠️ No plain **TextChannel**s found in there via the API either. If they're forum or announcement "
-                    "channels, tell me and I can add support for those instead."
+                    f"\n\n⚠️ No plain **TextChannel**s found in there via the API either.\n\n"
+                    f"Debug: {len(vault_texts)} total text channel(s) visible anywhere in this server. "
+                    f"Matched category IDs: {', '.join(str(i) for i in found_cat_ids) or '(none)'}.\n"
+                    f"Sample of channels seen:\n{sample}"
                 )
             return await interaction.response.send_message(
                 embed=ui.card("✅ Categories found", admin_note + "\n".join(lines) + tail,
