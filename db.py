@@ -405,6 +405,17 @@ CREATE TABLE IF NOT EXISTS upload_channels (
     created_at       TEXT NOT NULL,
     UNIQUE (guild_id, channel_id)
 );
+
+-- Guards against the same attachment being auto-uploaded twice -- e.g. if a Discord event is ever delivered more
+-- than once (gateway resume, or two bot instances briefly overlapping during a deploy). A row here means that
+-- attachment has already been processed; INSERT OR IGNORE against the primary key is how callers check-and-claim
+-- atomically without a separate read-then-write race.
+CREATE TABLE IF NOT EXISTS processed_uploads (
+    message_id    INTEGER NOT NULL,
+    attachment_id INTEGER NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (message_id, attachment_id)
+);
 """
 
 CONFIG_COLUMNS = {
