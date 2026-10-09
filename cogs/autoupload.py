@@ -162,7 +162,19 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
 
-        draft = Draft(post_channel, clean_title(att.filename), None, None, None, deliver=(file_row["id"], name), pack=row["pack_name"])
+        # Show an inline preview when the file is small enough to attach directly: images go in the embed itself
+        # (the big photo), video/audio get attached to the message so Discord renders its native player. Either
+        # way the Get-file button is always there too, as the permanent, trackable way to claim a copy.
+        ctype = (att.content_type or "").lower()
+        photo = file_attach = None
+        if len(data) <= ATTACH_LIMIT:
+            if ctype.startswith("image/"):
+                photo = (att.filename, data, len(data))
+            elif ctype.startswith("video/") or ctype.startswith("audio/"):
+                file_attach = (att.filename, data, len(data))
+
+        draft = Draft(post_channel, clean_title(att.filename), None, None, None, photo=photo, file=file_attach,
+                       deliver=(file_row["id"], name), pack=row["pack_name"])
         await publish_draft(post_channel.guild, message.author, draft)
         await emit(
             post_channel.guild, "files", "File auto-uploaded",
@@ -206,11 +218,17 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         await interaction.response.send_message(embed=ui.card("✅ Drop zone ready", body, color=SUCCESS, guild=interaction.guild, section="Files"), ephemeral=True)
 
     async def pair_category(self, interaction: discord.Interaction, vault: discord.Guild, category: Optional[str], skip: list,
-                             required_role: Optional[discord.Role], once_per_user: bool, create_missing: bool = True) -> tuple[list, list, list]:
+                             required_role: Optional[discord.Role], once_per_user: bool, create_missing: bool = True,
+                             dest_category_name: Optional[str] = None) -> tuple[list, list, list]:
         """Match one category's (or the whole server's) channels on `vault` to same/similarly-named channels in
         the server the command was run in, and save a drop zone for every match. When `create_missing` is True
         (the default), any vault channel with no existing match gets a brand-new channel created for it here,
-        under a category named after the vault channel's own category, instead of being left unmatched.
+        under a category named after the vault channel's own category (or `dest_category_name`, when given, e.g.
+        for mirroring within a single server where the source and destination can't share a category name),
+        instead of being left unmatched. When `dest_category_name` is given, matching against an existing channel
+        is also scoped to just that destination category, rather than the whole server -- important for same-guild
+        mirroring, where searching the whole server by name could accidentally latch onto an unrelated channel
+        (or the source channel itself).
         Returns (matched, unmatched, created) -- created is the subset of matched that are newly-made channels."""
         vault_cats, all_vault_channels = await fetch_live(vault)
         cat_ids = None
@@ -221,9 +239,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             if (cat_ids is None or c.category_id in cat_ids)
             and not any(s in c.name.lower() for s in skip)
         ]
-        main_channels = list(interaction.guild.text_channels)
+        if dest_category_name:
+            existing_dest_cat = discord.utils.find(lambda c: c.name.lower() == dest_category_name.lower(), interaction.guild.categories)
+            main_channels = list(existing_dest_cat.text_channels) if existing_dest_cat else []
+        else:
+            main_channels = list(interaction.guild.text_channels)
         matched, unmatched, created = [], [], []
-        new_category_cache: dict = {}  # vault category name (lowered) -> main-guild CategoryChannel
+        new_category_cache: dict = {}  # destination category name (lowered) -> main-guild CategoryChannel
         for vc in vault_channels:
             target = find_match(vc.name, main_channels)
             if target and target.id != vc.id:
@@ -233,18 +255,19 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 unmatched.append(vc)
                 continue
             vault_cat = next((c for c in vault_cats if c.id == vc.category_id), None)
-            cat_key = (vault_cat.name.lower() if vault_cat else "")
+            want_name = dest_category_name or (vault_cat.name if vault_cat else None)
+            cat_key = (want_name or "").lower()
             try:
                 dest_cat = new_category_cache.get(cat_key)
                 if dest_cat is None:
                     dest_cat = discord.utils.find(
-                        lambda c: vault_cat and c.name.lower() == vault_cat.name.lower(), interaction.guild.categories
-                    ) if vault_cat else None
-                    if dest_cat is None and vault_cat:
-                        dest_cat = await interaction.guild.create_category(vault_cat.name, reason="Auto-created by /autoupload to mirror the vault")
+                        lambda c: want_name and c.name.lower() == want_name.lower(), interaction.guild.categories
+                    ) if want_name else None
+                    if dest_cat is None and want_name:
+                        dest_cat = await interaction.guild.create_category(want_name, reason="Auto-created by /autoupload")
                     new_category_cache[cat_key] = dest_cat
                 new_channel = await interaction.guild.create_text_channel(
-                    vc.name, category=dest_cat, reason=f"Auto-created by /autoupload to mirror #{vc.name} in the vault"
+                    vc.name, category=dest_cat, reason=f"Auto-created by /autoupload to mirror #{vc.name}"
                 )
             except discord.Forbidden:
                 unmatched.append(vc)
@@ -331,6 +354,119 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
 
         await interaction.followup.send(
             embed=self.pairing_result_embed(interaction.guild, f"⚡ Preset applied: {len(all_matched)} drop zone(s) paired", all_matched, all_unmatched, all_created),
+            ephemeral=True,
+        )
+
+    async def seed_vault(self, interaction: discord.Interaction, vault: discord.Guild, category: str, skip: list,
+                          required_role: Optional[discord.Role], once_per_user: bool) -> tuple[list, list]:
+        """The reverse of pair_category: for when the vault doesn't have the channels yet and the REAL content
+        lives here instead. Scans `category` in THIS server (where the real channels already are), and for each
+        one creates a same-named channel over in `vault` (under a same-named category there, created if needed)
+        if nothing already matches, then pairs the new/matched vault channel to the existing channel here.
+        Returns (paired, created) as (vault_channel, main_channel) tuples -- created is the subset of paired
+        that are newly-made vault channels."""
+        main_cats, main_channels_all = await fetch_live(interaction.guild)
+        cat_ids = {c.id for c in main_cats if category.strip().lower() in c.name.lower()}
+        main_channels = [c for c in main_channels_all if c.category_id in cat_ids and not any(s in c.name.lower() for s in skip)]
+        vault_cats, vault_channels_all = await fetch_live(vault)
+        paired, created = [], []
+        new_category_cache: dict = {}
+        for mc in main_channels:
+            main_cat = next((c for c in main_cats if c.id == mc.category_id), None)
+            cat_key = (main_cat.name.lower() if main_cat else "")
+            vc = find_match(mc.name, vault_channels_all)
+            if vc is None:
+                try:
+                    dest_cat = new_category_cache.get(cat_key)
+                    if dest_cat is None:
+                        dest_cat = discord.utils.find(
+                            lambda c: main_cat and c.name.lower() == main_cat.name.lower(), vault_cats
+                        ) if main_cat else None
+                        if dest_cat is None and main_cat:
+                            dest_cat = await vault.create_category(main_cat.name, reason="Auto-created by /autoupload to seed the vault")
+                        new_category_cache[cat_key] = dest_cat
+                    vc = await vault.create_text_channel(mc.name, category=dest_cat, reason=f"Auto-created by /autoupload to seed the vault, mirrors #{mc.name}")
+                except discord.Forbidden:
+                    continue
+                vault_channels_all.append(vc)
+                created.append((vc, mc))
+            check_can_send(mc, interaction.guild.me, files=False)
+            await db.execute(
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
+                "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user",
+                (vc.guild.id, vc.id, mc.id, mc.name.replace("-", " ").title(), required_role.id if required_role else None,
+                 int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat()),
+            )
+            paired.append((vc, mc))
+        return paired, created
+
+    @app_commands.command(description="Fill an empty/new vault server with channels copied from FIVEM/RZ/Boosters here, wired to post back here")
+    @app_commands.describe(
+        vault_guild_id="The (new/empty) vault server's ID (right-click its icon → Copy Server ID)",
+        required_role="Only members with this role can claim any matched file (optional)",
+        once_per_user="Each member can only claim a matched file once (default: no)",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def seedvault(
+        self, interaction: discord.Interaction, vault_guild_id: str,
+        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+    ):
+        """For when the real FIVEM/RZ/Boosters channels live in THIS server, not a separate vault: creates the
+        matching (empty) channel structure over in the vault server and pairs it back here, so staff can start
+        dropping files into the vault and have them post here, without needing to have built the vault by hand."""
+        if not vault_guild_id.strip().isdigit():
+            raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
+        vault = self.bot.get_guild(int(vault_guild_id.strip()))
+        if vault is None:
+            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
+        if vault.id == interaction.guild.id:
+            raise UserError("That's this server's own ID -- `vault_guild_id` needs to be the *other*, empty server you want to seed.")
+
+        await interaction.response.defer(ephemeral=True)
+        all_paired, all_created = [], []
+        for category in ("FIVEM", "RZ", "Boosters"):
+            paired, created = await self.seed_vault(interaction, vault, category, ["chat"], required_role, once_per_user)
+            all_paired += paired
+            all_created += created
+
+        await interaction.followup.send(
+            embed=self.pairing_result_embed(
+                interaction.guild, f"🌱 Seeded {vault.name}: {len(all_paired)} channel(s) wired up", all_paired, [], all_created
+            ),
+            ephemeral=True,
+        )
+
+    @app_commands.command(description="Same-server version of bulkadd: mirror a category here into a new public category, auto-posting uploads across")
+    @app_commands.describe(
+        source_category="Category in THIS server to watch for uploads (e.g. RZ)",
+        dest_category="Category to post into (created if it doesn't exist, e.g. 'RZ Downloads')",
+        exclude="Skip channel names containing any of these, comma-separated (e.g. no-,chat)",
+        required_role="Only members with this role can claim any matched file (optional)",
+        once_per_user="Each member can only claim a matched file once (default: no)",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def mirror(
+        self, interaction: discord.Interaction, source_category: str, dest_category: str, exclude: Optional[str] = None,
+        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+    ):
+        """For staff-only categories that already live in this server (not a separate vault): watches each channel
+        in `source_category` and auto-posts uploads into a same-named channel under `dest_category`, a new or
+        existing category kept separate so the public destination channels don't collide names with the private
+        source ones."""
+        if source_category.strip().lower() == dest_category.strip().lower():
+            raise UserError("Source and destination categories need different names, or uploads would post right back into themselves.")
+        await interaction.response.defer(ephemeral=True)
+        skip = [s.strip().lower() for s in (exclude or "").split(",") if s.strip()]
+        matched, unmatched, created = await self.pair_category(
+            interaction, interaction.guild, source_category, skip, required_role, once_per_user,
+            create_missing=True, dest_category_name=dest_category,
+        )
+        if not matched and not unmatched:
+            raise UserError(f"No channels found in a category matching \"{source_category}\" on this server.")
+        await interaction.followup.send(
+            embed=self.pairing_result_embed(interaction.guild, f"🪞 {len(matched)} channel(s) mirrored into \"{dest_category}\"", matched, unmatched, created),
             ephemeral=True,
         )
 
