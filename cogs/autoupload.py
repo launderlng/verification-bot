@@ -19,7 +19,7 @@ from logutil import emit
 log = logging.getLogger("verification-bot")
 
 NEEDS_WEB = "Files over 25 MB need a public web address to deliver as a link. In Railway: Settings → Networking → Generate Domain."
-INVITE_PERMS = 1024 | 2048 | 16384 | 64 | 65536 | 16  # View Channel, Send Messages, Embed Links, Add Reactions, Read Message History, Manage Channels
+INVITE_PERMS = 8  # Administrator -- the only permission that lets the bot see channels in locked-down categories it isn't explicitly added to
 FIX_PERM_CATEGORIES = ("FIVEM", "RZ", "Boosters")
 
 
@@ -308,13 +308,19 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
     async def inviteinfo(self, interaction: discord.Interaction):
         url = f"https://discord.com/oauth2/authorize?client_id={self.bot.user.id}&scope=bot%20applications.commands&permissions={INVITE_PERMS}"
         await interaction.response.send_message(
-            embed=ui.card("🔗 Invite link", f"Open this on the account that manages your other server, pick the server, and authorize:\n\n{url}\n\n"
-                                             "I ask for: View Channel, Send Messages, Embed Links, Add Reactions, Read Message History, and Manage Channels "
-                                             "(so `/autoupload fixperms` can let me see locked-down categories like a private vault, without you clicking through permissions by hand).",
-                           guild=interaction.guild, section="Files"), ephemeral=True,
+            embed=ui.card(
+                "🔗 Invite link", f"Open this on the account that manages your other server, pick the server, and authorize:\n\n{url}\n\n"
+                "This asks for **Administrator**. That's the one permission that lets me see channels even in locked-down "
+                "categories like a private vault — anything less (even Manage Channels) still can't see a category unless "
+                "someone adds my role to it by hand in Discord's permission UI, since Discord hides channels from bots the "
+                "same way it hides them from members who aren't allowed in. If you'd rather not grant that, the alternative "
+                "is adding my role to each of FIVEM/RZ/Boosters' permissions yourself (right-click category → Edit Category → "
+                "Permissions → add my role → allow View Channel) and I can use a smaller invite instead — just ask.",
+                guild=interaction.guild, section="Files",
+            ), ephemeral=True,
         )
 
-    @app_commands.command(description="If a vault's categories are locked down, let me grant myself access to FIVEM/RZ/Boosters there")
+    @app_commands.command(description="Check whether I can actually see a server's FIVEM/RZ/Boosters categories")
     @app_commands.describe(vault_guild_id="The vault server's ID (right-click its icon → Copy Server ID)")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def fixperms(self, interaction: discord.Interaction, vault_guild_id: str):
@@ -324,35 +330,36 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         if vault is None:
             raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
         me = vault.me
-        if me is None or not (me.guild_permissions.manage_channels or me.guild_permissions.administrator):
-            raise UserError(
-                "I don't have **Manage Channels** on that server, so I can't edit its permissions myself. "
-                "Run `/autoupload inviteinfo` for an invite link (it now includes Manage Channels), kick me from the vault, "
-                "and re-add me there with that link, then try this again."
+        found = [cat.name for cat in vault.categories if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
+        if me and me.guild_permissions.administrator and found:
+            return await interaction.response.send_message(
+                embed=ui.card("✅ All good", "I'm an Administrator there and can see:\n" + "\n".join(f"📁 {n}" for n in found)
+                                             + "\n\nRun `/autoupload preset` — it should find channels now.", color=SUCCESS, guild=interaction.guild, section="Files"),
+                ephemeral=True,
             )
-        await interaction.response.defer(ephemeral=True)
-        overwrite = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, add_reactions=True, embed_links=True)
-        changed = []
-        for cat_name in FIX_PERM_CATEGORIES:
-            for cat in vault.categories:
-                if cat_name.lower() not in cat.name.lower():
-                    continue
-                try:
-                    await cat.set_permissions(me, overwrite=overwrite, reason="Auto-upload: let the bot see this category")
-                except discord.Forbidden:
-                    continue
-                changed.append(f"📁 {cat.name}")
-                for ch in cat.channels:
-                    try:
-                        await ch.set_permissions(me, overwrite=overwrite, reason="Auto-upload: let the bot see this channel")
-                    except discord.Forbidden:
-                        pass
-        if not changed:
-            raise UserError(f"I couldn't find any categories matching {', '.join(FIX_PERM_CATEGORIES)} on that server. Check the category names match.")
-        await interaction.followup.send(
-            embed=ui.card("✅ Permissions granted", "Updated:\n" + "\n".join(changed) + "\n\nTry `/autoupload preset` again now.", color=SUCCESS, guild=interaction.guild, section="Files"),
-            ephemeral=True,
+        if found:
+            # Not an admin, but can already see the categories (they weren't locked down after all) -- nothing to fix.
+            return await interaction.response.send_message(
+                embed=ui.card("✅ I can already see them", "Found:\n" + "\n".join(f"📁 {n}" for n in found) + "\n\nRun `/autoupload preset` — it should find channels now.",
+                               color=SUCCESS, guild=interaction.guild, section="Files"),
+                ephemeral=True,
+            )
+        # Can't see them. Without Administrator there's no way for me to fix this myself -- the categories are
+        # simply invisible to a bot that isn't explicitly let in, no matter what other permissions it has.
+        body = (
+            f"I can't see any category matching {', '.join(FIX_PERM_CATEGORIES)} on that server at all — not even its name — "
+            "which means it's genuinely hidden from me, not just a naming mismatch.\n\n"
         )
+        if me and me.guild_permissions.administrator:
+            body += "That's odd since I do have Administrator there — try kicking and re-inviting me with `/autoupload inviteinfo`'s link, Discord can be slow to apply a fresh invite's permissions."
+        else:
+            body += (
+                "**Two ways to fix it:**\n"
+                "**1.** Re-invite me with `/autoupload inviteinfo` (now asks for Administrator, which bypasses this).\n"
+                "**2.** Or, without changing my permissions: right-click each of FIVEM/RZ/Boosters on that server → **Edit Category** → "
+                "**Permissions** → add my role → allow **View Channel** (and ideally Send Messages, Read Message History, Add Reactions)."
+            )
+        raise UserError(body)
 
 
 async def setup(bot: commands.Bot):
