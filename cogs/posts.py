@@ -47,13 +47,16 @@ class Draft:
 
     def __init__(self, channel, title: str, description: Optional[str], footer: Optional[str], color: Optional[int], photo=None, photo_url=None,
                  gif=None, gif_url=None, file=None, button=None, deliver=None, ping=None, pack: Optional[str] = None, mention_all: Optional[str] = None,
-                 show_file_field: bool = True):
+                 show_file_field: bool = True, content: Optional[str] = None):
         self.channel, self.title, self.description, self.footer, self.color = channel, title, description, footer, color
         self.photo, self.photo_url, self.gif, self.gif_url, self.file, self.button = photo, photo_url, gif, gif_url, file, button
         self.deliver = deliver  # (stored file id, name): a 📥 Get file button that DMs the file
         self.ping, self.pack = ping, pack  # a role to ping, and what pack this is (for the log)
         self.mention_all = mention_all  # 'everyone' or 'here'
         self.show_file_field = show_file_field  # False hides the "📎 File <name>" field even when self.file is set
+        self.content = content  # plain message text shown above everything -- Discord always renders this (and
+        # raw file attachments) above any embeds, regardless of API call order, so this is the only way to put a
+        # title-like line ahead of a raw video/audio attachment instead of it looking stuck below one
 
     # photo / gif / file are (name, bytes-or-None, size)
     def files(self) -> list[discord.File]:
@@ -61,13 +64,16 @@ class Draft:
 
     def embeds(self) -> list[discord.Embed]:
         color = self.color if self.color is not None else COLOR
-        main = ui.card(self.title, self.description, color=color, footer=self.footer)
         main_image = f"attachment://{self.photo[0]}" if self.photo else self.photo_url
-        if main_image:
-            main.set_image(url=main_image)  # the big photo
-        if self.file and self.show_file_field:
-            main.add_field(name="📎 File", value=f"`{self.file[0]}` · {human_size(self.file[2])}\nAttached to this post ⬇️", inline=False)
-        embeds = [main]
+        has_file_field = bool(self.file and self.show_file_field)
+        embeds = []
+        if self.title or self.description or self.footer or main_image or has_file_field:
+            main = ui.card(self.title, self.description, color=color, footer=self.footer)
+            if main_image:
+                main.set_image(url=main_image)  # the big photo
+            if has_file_field:
+                main.add_field(name="📎 File", value=f"`{self.file[0]}` · {human_size(self.file[2])}\nAttached to this post ⬇️", inline=False)
+            embeds.append(main)
         gif_image = f"attachment://{self.gif[0]}" if self.gif else self.gif_url
         if gif_image:
             embeds.append(ui.card(None, None, color=color, image=gif_image))  # the GIF gets its own spot under the card
@@ -89,7 +95,8 @@ class Draft:
         else:
             mentions = discord.AllowedMentions.none()
         kw = {"embeds": self.embeds(), "allowed_mentions": mentions}
-        content = " ".join(x for x in ({"everyone": "@everyone", "here": "@here"}.get(self.mention_all), self.ping.mention if self.ping else None) if x)
+        mention_text = " ".join(x for x in ({"everyone": "@everyone", "here": "@here"}.get(self.mention_all), self.ping.mention if self.ping else None) if x)
+        content = " ".join(x for x in (self.content, mention_text) if x)
         if content:
             kw["content"] = content
         files = self.files()
@@ -108,6 +115,7 @@ class Draft:
             "gif": [self.gif[0], self.gif[2]] if self.gif else None, "gif_url": self.gif_url,
             "file": [self.file[0], self.file[2]] if self.file else None, "button": list(self.button) if self.button else None,
             "deliver": list(self.deliver) if self.deliver else None, "ping": self.ping.id if self.ping else None, "pack": self.pack, "mention_all": self.mention_all,
+            "content": self.content,
         })
 
     @classmethod
@@ -116,6 +124,7 @@ class Draft:
         ping = guild.get_role(d["ping"]) if d.get("ping") else None
         return cls(channel, d["title"], d["description"], d["footer"], d["color"], photo=(d["photo"][0], None, d["photo"][1]) if d["photo"] else None, photo_url=d["photo_url"],
                    gif=(d["gif"][0], None, d["gif"][1]) if d["gif"] else None, gif_url=d["gif_url"], file=(d["file"][0], None, d["file"][1]) if d["file"] else None,
+                   content=d.get("content"),
                    button=tuple(d["button"]) if d["button"] else None, deliver=tuple(d["deliver"]) if d["deliver"] else None, ping=ping, pack=d.get("pack"), mention_all=d.get("mention_all"))
 
 
