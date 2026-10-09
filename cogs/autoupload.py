@@ -67,13 +67,14 @@ async def fetch_live(guild: discord.Guild) -> tuple[list, list]:
 
 
 def find_match(name: str, candidates: list) -> Optional[discord.TextChannel]:
+    """Exact (normalized) name match only. A loose substring fallback used to live here, but it's actively
+    dangerous for this use: "reshades" is a substring of "vault-reshades", so a channel named "reshades" would
+    silently match an unrelated "vault-reshades" channel and get wired to the wrong destination -- exactly what
+    happened in practice. Since every caller here can fall back to creating a brand-new channel when nothing
+    matches, there's no need to guess; a wrong match that overwrites a correct pairing is worse than no match."""
     norm = normalize(name)
     for c in candidates:
         if normalize(c.name) == norm:
-            return c
-    for c in candidates:
-        cn = normalize(c.name)
-        if norm in cn or cn in norm:
             return c
     return None
 
@@ -182,8 +183,10 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             elif ctype.startswith("video/") or ctype.startswith("audio/"):
                 file_attach = (att.filename, data, len(data))
 
-        draft = Draft(post_channel, clean_title(att.filename), None, None, None, photo=photo, file=file_attach,
-                       deliver=(file_row["id"], name), pack=row["pack_name"])
+        # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
+        # like "V1" or "Cielo_15") -- the filename is still shown as the footer and the stored file's own name.
+        draft = Draft(post_channel, row["pack_name"], clean_title(att.filename), f"Uploaded in #{message.channel.name}", None,
+                       photo=photo, file=file_attach, deliver=(file_row["id"], name), pack=row["pack_name"])
         await publish_draft(post_channel.guild, message.author, draft)
         await emit(
             post_channel.guild, "files", "File auto-uploaded",
