@@ -162,7 +162,19 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
 
-        draft = Draft(post_channel, clean_title(att.filename), None, None, None, deliver=(file_row["id"], name), pack=row["pack_name"])
+        # Show an inline preview when the file is small enough to attach directly: images go in the embed itself
+        # (the big photo), video/audio get attached to the message so Discord renders its native player. Either
+        # way the Get-file button is always there too, as the permanent, trackable way to claim a copy.
+        ctype = (att.content_type or "").lower()
+        photo = file_attach = None
+        if len(data) <= ATTACH_LIMIT:
+            if ctype.startswith("image/"):
+                photo = (att.filename, data, len(data))
+            elif ctype.startswith("video/") or ctype.startswith("audio/"):
+                file_attach = (att.filename, data, len(data))
+
+        draft = Draft(post_channel, clean_title(att.filename), None, None, None, photo=photo, file=file_attach,
+                       deliver=(file_row["id"], name), pack=row["pack_name"])
         await publish_draft(post_channel.guild, message.author, draft)
         await emit(
             post_channel.guild, "files", "File auto-uploaded",
@@ -342,6 +354,87 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
 
         await interaction.followup.send(
             embed=self.pairing_result_embed(interaction.guild, f"⚡ Preset applied: {len(all_matched)} drop zone(s) paired", all_matched, all_unmatched, all_created),
+            ephemeral=True,
+        )
+
+    async def seed_vault(self, interaction: discord.Interaction, vault: discord.Guild, category: str, skip: list,
+                          required_role: Optional[discord.Role], once_per_user: bool) -> tuple[list, list]:
+        """The reverse of pair_category: for when the vault doesn't have the channels yet and the REAL content
+        lives here instead. Scans `category` in THIS server (where the real channels already are), and for each
+        one creates a same-named channel over in `vault` (under a same-named category there, created if needed)
+        if nothing already matches, then pairs the new/matched vault channel to the existing channel here.
+        Returns (paired, created) as (vault_channel, main_channel) tuples -- created is the subset of paired
+        that are newly-made vault channels."""
+        main_cats, main_channels_all = await fetch_live(interaction.guild)
+        cat_ids = {c.id for c in main_cats if category.strip().lower() in c.name.lower()}
+        main_channels = [c for c in main_channels_all if c.category_id in cat_ids and not any(s in c.name.lower() for s in skip)]
+        vault_cats, vault_channels_all = await fetch_live(vault)
+        paired, created = [], []
+        new_category_cache: dict = {}
+        for mc in main_channels:
+            main_cat = next((c for c in main_cats if c.id == mc.category_id), None)
+            cat_key = (main_cat.name.lower() if main_cat else "")
+            vc = find_match(mc.name, vault_channels_all)
+            if vc is None:
+                try:
+                    dest_cat = new_category_cache.get(cat_key)
+                    if dest_cat is None:
+                        dest_cat = discord.utils.find(
+                            lambda c: main_cat and c.name.lower() == main_cat.name.lower(), vault_cats
+                        ) if main_cat else None
+                        if dest_cat is None and main_cat:
+                            dest_cat = await vault.create_category(main_cat.name, reason="Auto-created by /autoupload to seed the vault")
+                        new_category_cache[cat_key] = dest_cat
+                    vc = await vault.create_text_channel(mc.name, category=dest_cat, reason=f"Auto-created by /autoupload to seed the vault, mirrors #{mc.name}")
+                except discord.Forbidden:
+                    continue
+                vault_channels_all.append(vc)
+                created.append((vc, mc))
+            check_can_send(mc, interaction.guild.me, files=False)
+            await db.execute(
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
+                "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user",
+                (vc.guild.id, vc.id, mc.id, mc.name.replace("-", " ").title(), required_role.id if required_role else None,
+                 int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat()),
+            )
+            paired.append((vc, mc))
+        return paired, created
+
+    @app_commands.command(description="Fill an empty/new vault server with channels copied from FIVEM/RZ/Boosters here, wired to post back here")
+    @app_commands.describe(
+        vault_guild_id="The (new/empty) vault server's ID (right-click its icon → Copy Server ID)",
+        required_role="Only members with this role can claim any matched file (optional)",
+        once_per_user="Each member can only claim a matched file once (default: no)",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def seedvault(
+        self, interaction: discord.Interaction, vault_guild_id: str,
+        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+    ):
+        """For when the real FIVEM/RZ/Boosters channels live in THIS server, not a separate vault: creates the
+        matching (empty) channel structure over in the vault server and pairs it back here, so staff can start
+        dropping files into the vault and have them post here, without needing to have built the vault by hand."""
+        if not vault_guild_id.strip().isdigit():
+            raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
+        vault = self.bot.get_guild(int(vault_guild_id.strip()))
+        if vault is None:
+            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
+        if vault.id == interaction.guild.id:
+            raise UserError("That's this server's own ID -- `vault_guild_id` needs to be the *other*, empty server you want to seed.")
+
+        await interaction.response.defer(ephemeral=True)
+        all_paired, all_created = [], []
+        for category in ("FIVEM", "RZ", "Boosters"):
+            paired, created = await self.seed_vault(interaction, vault, category, ["chat"], required_role, once_per_user)
+            all_paired += paired
+            all_created += created
+
+        await interaction.followup.send(
+            embed=self.pairing_result_embed(
+                interaction.guild, f"🌱 Seeded {vault.name}: {len(all_paired)} channel(s) wired up", all_paired, [], all_created
+            ),
             ephemeral=True,
         )
 
