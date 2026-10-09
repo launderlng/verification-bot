@@ -47,6 +47,18 @@ def normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
+async def fresh_text_channels(guild: discord.Guild) -> list:
+    """Fetch a guild's channels straight from the API instead of trusting the gateway cache. The cache can be
+    missing channels entirely right after the bot is re-invited with new permissions or added to a category by
+    hand -- Discord doesn't always push the backfill events for that, so guild.channels/category.channels can
+    silently stay empty even though the channels are really there and really visible."""
+    try:
+        channels = await guild.fetch_channels()
+    except discord.HTTPException:
+        return list(guild.text_channels)  # fall back to cache if the API call itself fails
+    return [c for c in channels if isinstance(c, discord.TextChannel)]
+
+
 def find_match(name: str, candidates: list) -> Optional[discord.TextChannel]:
     norm = normalize(name)
     for c in candidates:
@@ -190,8 +202,9 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                              required_role: Optional[discord.Role], once_per_user: bool) -> tuple[list, list]:
         """Match one category's (or the whole server's) channels on `vault` to same/similarly-named channels in
         the server the command was run in, and save a drop zone for every match. Returns (matched, unmatched)."""
+        all_vault_channels = await fresh_text_channels(vault)
         vault_channels = [
-            c for c in vault.text_channels
+            c for c in all_vault_channels
             if (not category or (c.category and category.strip().lower() in c.category.name.lower()))
             and not any(s in c.name.lower() for s in skip)
         ]
@@ -332,24 +345,31 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         me = vault.me
         found_cats = [cat for cat in vault.categories if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
         if found_cats:
-            # Show not just the category names but what's actually inside each one, by channel type -- this is what
-            # actually matters for pairing, since a category can be fully visible while its channels still aren't
-            # plain text channels (e.g. forum/announcement channels, which /autoupload preset can't pair).
+            # Fetch channels straight from the API rather than the gateway cache -- the cache can stay empty for a
+            # category's channels even when the category itself shows up and the channels are genuinely visible,
+            # typically right after the bot was re-invited with new permissions or manually added to a category.
+            try:
+                all_channels = await vault.fetch_channels()
+            except discord.HTTPException as e:
+                raise UserError(f"Found the categories but couldn't list their channels (Discord said: {e}). Try again in a moment.")
+            by_cat: dict = {}
+            for ch in all_channels:
+                by_cat.setdefault(getattr(ch, "category_id", None), []).append(ch)
             lines = []
             for cat in found_cats:
                 kinds = {}
-                for ch in cat.channels:
+                for ch in by_cat.get(cat.id, []):
                     kinds[type(ch).__name__] = kinds.get(type(ch).__name__, 0) + 1
-                breakdown = ", ".join(f"{n} {k}" for k, n in kinds.items()) if kinds else "no channels visible inside"
+                breakdown = ", ".join(f"{n} {k}" for k, n in kinds.items()) if kinds else "no channels inside"
                 lines.append(f"📁 {cat.name} — {breakdown}")
             admin_note = "I'm an Administrator there.\n\n" if me and me.guild_permissions.administrator else ""
-            text_total = sum(len(cat.text_channels) for cat in found_cats)
+            text_total = sum(1 for ch in all_channels if isinstance(ch, discord.TextChannel) and ch.category_id in {c.id for c in found_cats})
             if text_total:
                 tail = "\n\nRun `/autoupload preset` — it should find channels now."
             else:
                 tail = (
-                    "\n\n⚠️ None of those are plain **TextChannel**s, which is what `/autoupload preset`/`bulkadd` pair against. "
-                    "If they're forum or announcement channels, tell me and I can add support for those instead."
+                    "\n\n⚠️ No plain **TextChannel**s found in there via the API either. If they're forum or announcement "
+                    "channels, tell me and I can add support for those instead."
                 )
             return await interaction.response.send_message(
                 embed=ui.card("✅ Categories found", admin_note + "\n".join(lines) + tail,
