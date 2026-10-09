@@ -1,16 +1,20 @@
+import html as html_escape_mod
 import io
 import json
 import logging
+import re
 import uuid
 from typing import Optional
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 
 import db
 import ui
 from common import COLOR, SUCCESS, WARN, UserError, parse_color
+from fileutil import public_base_url
 from logutil import emit
 
 log = logging.getLogger("verification-bot")
@@ -51,13 +55,21 @@ def links_text(row) -> str:
     return "\n".join(f"{label} | {url}" for label, url in json.loads(row["links"] or "[]"))
 
 
+def page_url(row) -> Optional[str]:
+    base = public_base_url()
+    return f"{base}/page/{row['id']}" if base else None
+
+
 def links_view(row) -> Optional[discord.ui.View]:
     links = json.loads(row["links"] or "[]")
-    if not links:
+    url = page_url(row)
+    if not links and not url:
         return None
     view = discord.ui.View(timeout=None)
-    for label, url in links:
-        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=label, url=url))
+    for label, link in links:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=label, url=link))
+    if url:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Full page", emoji="🌐", url=url))
     return view
 
 
@@ -216,7 +228,9 @@ class PageModal(discord.ui.Modal):
         self.footer_in = discord.ui.TextInput(label="Footer (small text at the bottom)", max_length=200, required=False, default=(row["footer"] if row else None) or None)
         self.links_in = discord.ui.TextInput(label="Link buttons, one per line (up to 5)", style=discord.TextStyle.paragraph, max_length=500, required=False,
                                              default=links_text(row) if row else None, placeholder="Download | https://example.com/file")
-        for item in (self.title_in, self.body_in, self.footer_in, self.links_in):
+        self.video_in = discord.ui.TextInput(label="Video (YouTube link or direct .mp4, optional)", max_length=300, required=False,
+                                             default=(row["video_url"] if row else None) or None, placeholder="https://youtube.com/watch?v=…")
+        for item in (self.title_in, self.body_in, self.footer_in, self.links_in, self.video_in):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -225,8 +239,12 @@ class PageModal(discord.ui.Modal):
             await interaction.response.defer(ephemeral=True)
             guild = interaction.guild
             changes = await self.media.apply(guild.id, interaction.user.id, self.row)
+            video = (self.video_in.value or "").strip()
+            if video and not video.startswith("https://"):
+                raise UserError("The video link must start with `https://`.")
             changes.update({"title": (self.title_in.value or "").strip() or None, "body": (self.body_in.value or "").strip() or None,
-                            "footer": (self.footer_in.value or "").strip() or None, "links": json.dumps(links) if links else None})
+                            "footer": (self.footer_in.value or "").strip() or None, "links": json.dumps(links) if links else None,
+                            "video_url": video or None})
             if self.color:
                 changes["color"] = self.color
             row = await save_page(guild.id, interaction.user.id, self.kind, self.name, changes, self.section)
@@ -245,7 +263,8 @@ async def after_edit(interaction: discord.Interaction, row) -> None:
     updated = await refresh(interaction.guild, row)
     kind = KINDS[row["kind"]]
     where = f"\nThe posted message in <#{row['channel_id']}> was updated." if updated else "\nIt isn't posted anywhere yet. Use the **post** command to put it in a channel."
-    await interaction.followup.send(embed=ui.card(f"✅ {kind['label']} saved", f"**{row['title'] or row['name']}** is stored in the database.{where}", color=SUCCESS), ephemeral=True)
+    web_note = "" if public_base_url() else "\n\n⚠️ No public web address is set up, so there's no styled 'Full page' link yet. In Railway: **Settings → Networking → Generate Domain**."
+    await interaction.followup.send(embed=ui.card(f"✅ {kind['label']} saved", f"**{row['title'] or row['name']}** is stored in the database.{where}{web_note}", color=SUCCESS), ephemeral=True)
     await emit(interaction.guild, "posts", f"{kind['label']} edited", ui.kv(("📄 Page", row["title"] or row["name"]), ("🛡️ By", interaction.user.mention), ("📍 Posted in", f"<#{row['channel_id']}>" if row["channel_id"] else None)), subject=interaction.user.id)
 
 
@@ -550,6 +569,160 @@ class ClothingPreviews(ManyPagesBase, commands.GroupCog, group_name="clothingpre
         await self.post_pages(interaction, rows, channel)
 
 
+# ------------------------------------------------------- styled web page ----
+# A real, styled webpage version of a page (/rules, /boosterperks, …), served
+# by the bot's shared web server. Discord embeds can't do gradient text, an
+# inline video player or fully custom layout, so for people who want that
+# look, the "Full page" button on the embed opens this instead.
+
+YOUTUBE_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtube\.com/embed/|youtu\.be/)([A-Za-z0-9_-]{6,20})")
+BULLET_RE = re.compile(r"^\s*[-*•]\s+(.*)$")
+
+
+def esc(s: Optional[str]) -> str:
+    return html_escape_mod.escape(s or "", quote=True)
+
+
+def inline_md(escaped: str) -> str:
+    """Very small markdown-ish formatting, applied AFTER escaping (so **/`_` never let raw HTML through)."""
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<em>\1</em>", escaped)
+    escaped = re.sub(r"`(.+?)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def body_html(body: Optional[str]) -> str:
+    """Turns the page's text into either a bullet 'tree' (when staff writes `- Title` lines, like the
+    rules/perks screenshots) or plain paragraphs, matching whichever style the text is already written in."""
+    lines = (body or "").splitlines()
+    groups: list[list[str]] = []
+    for line in lines:
+        m = BULLET_RE.match(line)
+        if m:
+            groups.append([m.group(1)])
+        elif line.strip():
+            if groups:
+                groups[-1].append(line.strip())
+            else:
+                groups.append([None, line.strip()])  # plain paragraph line before any bullet
+        else:
+            groups.append([])  # blank line = paragraph break marker
+    groups = [g for g in groups if g]
+
+    has_bullets = any(g[0] is not None for g in groups)
+    out = []
+    if has_bullets:
+        for g in groups:
+            if g[0] is None:
+                out.append(f'<p class="lead">{inline_md(esc(g[1]))}</p>')
+                continue
+            title = inline_md(esc(g[0]))
+            sub = "".join(f'<div class="tree-line"><span class="tree-glyph">└</span>{inline_md(esc(s))}</div>' for s in g[1:])
+            out.append(f'<div class="bullet"><div class="bullet-dot"></div><div class="bullet-body"><div class="bullet-title">{title}</div>{sub}</div></div>')
+    else:
+        paras = [p.strip() for p in (body or "").split("\n\n") if p.strip()]
+        for p in paras:
+            out.append(f'<p>{inline_md(esc(p)).replace(chr(10), "<br>")}</p>')
+    return "\n".join(out) or '<p class="lead">Nothing written here yet.</p>'
+
+
+def video_embed_html(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    m = YOUTUBE_RE.search(url)
+    if m:
+        return (
+            '<div class="video"><iframe src="https://www.youtube.com/embed/' + m.group(1)
+            + '" title="Video" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>'
+        )
+    if url.lower().split("?")[0].endswith((".mp4", ".webm", ".ogg")):
+        return f'<div class="video"><video controls src="{esc(url)}"></video></div>'
+    return ""
+
+
+PAGE_CSS = """
+:root { --a: #8b5cf6; --b: #22d3ee; --bg: #0b0b10; --card: #15151c; --line: #2a2a35; --text: #e6e6ec; --muted: #9a9aa8; }
+* { box-sizing: border-box; }
+body { margin: 0; background: radial-gradient(circle at 50% -10%, #1b1430 0%, var(--bg) 55%); color: var(--text);
+       font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; padding: 32px 16px 64px; }
+.wrap { width: 100%; max-width: 760px; }
+.banner { display: flex; align-items: center; gap: 18px; margin-bottom: 28px; }
+.banner img { width: 64px; height: 64px; border-radius: 50%; }
+.banner .name { font-size: 15px; letter-spacing: 2px; color: var(--muted); font-weight: 700; text-transform: uppercase; }
+.banner .title { font-size: 32px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;
+                  background: linear-gradient(90deg, var(--a), var(--b)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.card { background: var(--card); border: 1px solid var(--line); border-left: 5px solid; border-image: linear-gradient(var(--a), var(--b)) 1;
+        border-radius: 14px; padding: 28px 30px; }
+.heading { display: flex; align-items: center; gap: 10px; font-size: 22px; font-weight: 800; margin: 0 0 10px; }
+.intro { color: var(--muted); font-size: 15px; line-height: 1.6; margin: 0 0 18px; }
+.divider { height: 2px; background: linear-gradient(90deg, var(--a), var(--b)); border-radius: 2px; opacity: .6; margin: 0 0 22px; }
+.video { position: relative; width: 100%; aspect-ratio: 16/9; margin-bottom: 22px; border-radius: 10px; overflow: hidden; background: #000; }
+.video iframe, .video video { width: 100%; height: 100%; border: 0; }
+.bullet { display: flex; gap: 12px; margin-bottom: 18px; }
+.bullet-dot { width: 9px; height: 9px; border-radius: 50%; background: linear-gradient(135deg, var(--a), var(--b)); margin-top: 7px; flex: none; }
+.bullet-title { font-weight: 700; font-size: 16px; }
+.tree-line { color: var(--muted); font-size: 14.5px; line-height: 1.6; margin-top: 2px; }
+.tree-glyph { color: var(--b); margin-right: 8px; }
+.lead, p { color: var(--muted); font-size: 15px; line-height: 1.7; margin: 0 0 14px; }
+.links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+.links a { color: var(--text); background: #1f1f29; border: 1px solid var(--line); padding: 9px 16px; border-radius: 999px;
+           text-decoration: none; font-size: 14px; font-weight: 600; }
+.links a:hover { border-color: var(--b); }
+.pagefooter { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 22px; }
+img.pageimg { width: 100%; border-radius: 10px; margin-bottom: 22px; display: block; }
+code { background: #000; padding: 1px 6px; border-radius: 5px; font-size: 90%; }
+"""
+
+
+def render_html(guild, row) -> str:
+    kind = KINDS[row["kind"]]
+    title = row["title"] or row["name"] or kind["label"]
+    guild_name = guild.name if guild else "Server"
+    icon = guild.icon.url if guild and guild.icon else None
+    links = json.loads(row["links"] or "[]")
+    links_html = "".join(f'<a href="{esc(url)}" target="_blank" rel="noopener">{esc(label)}</a>' for label, url in links)
+    image_url = row["image_url"] or None  # uploaded (database) images aren't served over HTTP, only direct links work here
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)} · {esc(guild_name)}</title>
+<style>{PAGE_CSS}</style></head>
+<body><div class="wrap">
+<div class="banner">
+  {f'<img src="{esc(icon)}">' if icon else ""}
+  <div><div class="name">{esc(guild_name)}</div><div class="title">{esc(title)}</div></div>
+</div>
+<div class="card">
+  <div class="heading">{kind["icon"]} {esc(title)}</div>
+  <div class="divider"></div>
+  {f'<img class="pageimg" src="{esc(image_url)}">' if image_url else ""}
+  {video_embed_html(row["video_url"])}
+  {body_html(row["body"])}
+  {f'<div class="links">{links_html}</div>' if links_html else ""}
+</div>
+<div class="pagefooter">{esc(row["footer"] or guild_name)}</div>
+</div></body></html>"""
+
+
+async def handle_page_request(request: web.Request) -> web.Response:
+    try:
+        page_id = int(request.match_info.get("id", ""))
+    except ValueError:
+        return web.Response(status=404, text="Not found.")
+    row = await db.fetch_one("SELECT * FROM pages WHERE id = ?", (page_id,))
+    if row is None or not (row["body"] or row["title"]):
+        return web.Response(status=404, text="This page isn't available any more.")
+    guild = _bot_ref.get_guild(row["guild_id"]) if _bot_ref is not None else None
+    return web.Response(text=render_html(guild, row), content_type="text/html")
+
+
+_bot_ref: Optional[commands.Bot] = None
+
+
 async def setup(bot: commands.Bot):
+    global _bot_ref
+    _bot_ref = bot
     for cog in (Rules, BoosterPerks, PremiumPerks, Links, InstallGuides, ClothingPreviews):
         await bot.add_cog(cog(bot))
+    app = getattr(bot, "web_app", None)
+    if app is not None:
+        app.router.add_get("/page/{id}", handle_page_request)
