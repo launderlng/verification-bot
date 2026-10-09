@@ -409,6 +409,7 @@ WELCOME_COLUMNS = {
 
 
 MIGRATIONS = [
+    ("pages", "video_url", "TEXT"),
     ("giveaways", "prize_role_id", "INTEGER"),
     ("giveaways", "prize_file_id", "INTEGER"),
     ("orders", "buyer_email", "TEXT"),
