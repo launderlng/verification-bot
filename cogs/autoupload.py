@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import mimetypes
 import re
 from pathlib import Path
 from typing import Optional
@@ -118,6 +119,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         row = await db.fetch_one("SELECT * FROM upload_channels WHERE guild_id = ? AND channel_id = ?", (message.guild.id, message.channel.id))
         if row is None:
             return
+        log.info("autoupload: on_message fired for message %s in #%s (%d attachment(s))", message.id, message.channel.name, len(attachments))
         perms = message.author.guild_permissions
         if not (perms.manage_guild or perms.manage_messages):
             return  # the drop zone only triggers for staff; anyone else's message there is left alone
@@ -139,6 +141,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 "INSERT OR IGNORE INTO processed_uploads (message_id, attachment_id, created_at) VALUES (?, ?, ?)",
                 (message.id, att.id, discord.utils.utcnow().isoformat()),
             )
+            log.info("autoupload: claim attempt message %s attachment %s -> %s", message.id, att.id, "claimed" if claimed else "already processed, skipping")
             if not claimed:
                 continue
             try:
@@ -186,8 +189,11 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         # attachment is given a clean generic name (not the messy original filename), and show_file_field=False
         # hides the "📎 File <name>" text Draft.embeds() would otherwise add -- the point is a clean post with no
         # filename text visible anywhere, just the pack name, the preview, and the Get-file button.
-        ctype = (att.content_type or "").lower()
         ext = Path(att.filename).suffix.lower()
+        # Discord doesn't always send a content_type for every attachment (some video containers come through
+        # with none at all) -- fall back to guessing from the file extension so a real video isn't silently
+        # treated as "unknown" and skipped.
+        ctype = (att.content_type or mimetypes.guess_type(att.filename)[0] or "").lower()
         clean_attach_name = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file") + ext
         # Use the destination server's REAL upload limit (boost-tier aware), not just our static guess -- a file
         # that fits our guess but not this server's actual cap would otherwise fail the whole send with an
