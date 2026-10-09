@@ -233,7 +233,7 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
                     "ON CONFLICT(guild_id, category) DO UPDATE SET channel_id = excluded.channel_id",  # keeps whatever is switched on/off
                     (guild.id, cat, made[key].id),
                 )
-        await db.upsert_config(guild.id, log_channel_id=made["mod-logs"].id)
+        await db.upsert_config(guild.id, log_channel_id=made["moderation"].id)
         return made
 
     async def run_full_setup(self, guild: discord.Guild, invoker: discord.Member, only: Optional[set] = None) -> tuple:
@@ -660,6 +660,55 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
             await emit(member.guild, "voice", "Voice moderation", ui.kv(("👤 Member", member.mention), ("💬 Channel", after.channel.mention if after.channel else None), ("🛡️ Action", " · ".join(parts))), WARN, author=self.who(member), subject=member.id)
         elif before.self_stream != after.self_stream:
             await emit(member.guild, "voice", "Started streaming" if after.self_stream else "Stopped streaming", ui.kv(("👤 Member", member.mention), ("💬 Channel", after.channel.mention if after.channel else None)), None, author=self.who(member), subject=member.id)
+
+    # ------------------------------------------------------- commands ----
+
+    @commands.Cog.listener()
+    async def on_app_command_completion(self, interaction: discord.Interaction, command) -> None:
+        """A full audit trail of every slash command run, in its own channel, separate from the specific
+        action logs (so a staff member's /ban still shows in #mod-logs AND in this command history)."""
+        if interaction.guild is None:
+            return
+        options = []
+        try:
+            for name, value in interaction.namespace:
+                options.append(f"`{name}`: {clip(str(value), 80)}")
+        except Exception:
+            pass
+        await emit(
+            interaction.guild, "commands", f"/{command.qualified_name}",
+            ui.kv(("👤 Used by", interaction.user.mention), ("📍 Channel", interaction.channel.mention if interaction.channel else None),
+                  ("⚙️ Options", ", ".join(options) if options else "None")),
+            author=self.who(interaction.user), subject=interaction.user.id,
+        )
+
+    # ------------------------------------------------- scheduled events ----
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_create(self, event: discord.ScheduledEvent) -> None:
+        await emit(
+            event.guild, "events", "Event created",
+            ui.kv(("📅 Event", event.name), ("🕒 Starts", discord.utils.format_dt(event.start_time, "f") if event.start_time else None),
+                  ("📍 Location", getattr(event, "location", None) or (event.channel.mention if event.channel else None)),
+                  ("👤 By", event.creator.mention if event.creator else None)),
+            SUCCESS,
+        )
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_delete(self, event: discord.ScheduledEvent) -> None:
+        await emit(event.guild, "events", "Event cancelled", ui.kv(("📅 Event", event.name)), DANGER)
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_update(self, before: discord.ScheduledEvent, after: discord.ScheduledEvent) -> None:
+        changes = []
+        if before.name != after.name:
+            changes.append(("✏️ Name", f"{before.name} → {after.name}"))
+        if before.start_time != after.start_time:
+            changes.append(("🕒 Starts", discord.utils.format_dt(after.start_time, "f") if after.start_time else None))
+        if before.status != after.status:
+            changes.append(("📊 Status", f"{before.status} → {after.status}"))
+        if changes:
+            await emit(after.guild, "events", "Event updated", ui.kv(("📅 Event", after.name), *changes))
 
 
 async def setup(bot: commands.Bot):
