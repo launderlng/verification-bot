@@ -206,9 +206,12 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         await interaction.response.send_message(embed=ui.card("✅ Drop zone ready", body, color=SUCCESS, guild=interaction.guild, section="Files"), ephemeral=True)
 
     async def pair_category(self, interaction: discord.Interaction, vault: discord.Guild, category: Optional[str], skip: list,
-                             required_role: Optional[discord.Role], once_per_user: bool) -> tuple[list, list]:
+                             required_role: Optional[discord.Role], once_per_user: bool, create_missing: bool = True) -> tuple[list, list, list]:
         """Match one category's (or the whole server's) channels on `vault` to same/similarly-named channels in
-        the server the command was run in, and save a drop zone for every match. Returns (matched, unmatched)."""
+        the server the command was run in, and save a drop zone for every match. When `create_missing` is True
+        (the default), any vault channel with no existing match gets a brand-new channel created for it here,
+        under a category named after the vault channel's own category, instead of being left unmatched.
+        Returns (matched, unmatched, created) -- created is the subset of matched that are newly-made channels."""
         vault_cats, all_vault_channels = await fetch_live(vault)
         cat_ids = None
         if category:
@@ -218,14 +221,37 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             if (cat_ids is None or c.category_id in cat_ids)
             and not any(s in c.name.lower() for s in skip)
         ]
-        main_channels = interaction.guild.text_channels
-        matched, unmatched = [], []
+        main_channels = list(interaction.guild.text_channels)
+        matched, unmatched, created = [], [], []
+        new_category_cache: dict = {}  # vault category name (lowered) -> main-guild CategoryChannel
         for vc in vault_channels:
             target = find_match(vc.name, main_channels)
             if target and target.id != vc.id:
                 matched.append((vc, target))
-            else:
+                continue
+            if not create_missing:
                 unmatched.append(vc)
+                continue
+            vault_cat = next((c for c in vault_cats if c.id == vc.category_id), None)
+            cat_key = (vault_cat.name.lower() if vault_cat else "")
+            try:
+                dest_cat = new_category_cache.get(cat_key)
+                if dest_cat is None:
+                    dest_cat = discord.utils.find(
+                        lambda c: vault_cat and c.name.lower() == vault_cat.name.lower(), interaction.guild.categories
+                    ) if vault_cat else None
+                    if dest_cat is None and vault_cat:
+                        dest_cat = await interaction.guild.create_category(vault_cat.name, reason="Auto-created by /autoupload to mirror the vault")
+                    new_category_cache[cat_key] = dest_cat
+                new_channel = await interaction.guild.create_text_channel(
+                    vc.name, category=dest_cat, reason=f"Auto-created by /autoupload to mirror #{vc.name} in the vault"
+                )
+            except discord.Forbidden:
+                unmatched.append(vc)
+                continue
+            main_channels.append(new_channel)
+            matched.append((vc, new_channel))
+            created.append((vc, new_channel))
         for vc, target in matched:
             check_can_send(target, interaction.guild.me, files=False)
             await db.execute(
@@ -236,12 +262,15 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 (vc.guild.id, vc.id, target.id, vc.name.replace("-", " ").title(), required_role.id if required_role else None,
                  int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat()),
             )
-        return matched, unmatched
+        return matched, unmatched, created
 
-    def pairing_result_embed(self, guild: discord.Guild, title: str, matched: list, unmatched: list) -> discord.Embed:
+    def pairing_result_embed(self, guild: discord.Guild, title: str, matched: list, unmatched: list, created: Optional[list] = None) -> discord.Embed:
+        created_ids = {vc.id for vc, _ in (created or [])}
         body = ""
         if matched:
-            body += "**✅ Paired**\n" + "\n".join(f"#{vc.name} → {t.mention}" for vc, t in matched) + "\n\n"
+            body += "**✅ Paired**\n" + "\n".join(
+                f"#{vc.name} → {t.mention}" + (" 🆕 (new channel)" if vc.id in created_ids else "") for vc, t in matched
+            ) + "\n\n"
         if unmatched:
             body += "**⚠️ No match found on this server** (add these by hand with `/autoupload add`)\n" + "\n".join(f"#{vc.name} (`{vc.id}`)" for vc in unmatched)
         return ui.card(title, body or "Nothing matched.", color=SUCCESS if matched else WARN, guild=guild, section="Files")
@@ -253,11 +282,12 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         exclude="Skip channel names containing any of these, comma-separated (e.g. no-,chat)",
         required_role="Only members with this role can claim any matched file (optional)",
         once_per_user="Each member can only claim a matched file once (default: no)",
+        create_missing="Create a new channel here for any vault channel with no match yet (default: yes)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def bulkadd(
         self, interaction: discord.Interaction, vault_guild_id: str, category: Optional[str] = None, exclude: Optional[str] = None,
-        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+        required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
     ):
         if not vault_guild_id.strip().isdigit():
             raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
@@ -265,21 +295,23 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         if vault is None:
             raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
         skip = [s.strip().lower() for s in (exclude or "").split(",") if s.strip()]
-        matched, unmatched = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user)
+        await interaction.response.defer(ephemeral=True)
+        matched, unmatched, created = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user, create_missing)
         if not matched and not unmatched:
-            raise UserError("No matching text channels found over there. Check the category name, or leave it blank to scan every channel.")
-        await interaction.response.send_message(embed=self.pairing_result_embed(interaction.guild, f"📥 {len(matched)} drop zone(s) paired", matched, unmatched), ephemeral=True)
+            raise UserError("No text channels found over there. Check the category name, or leave it blank to scan every channel.")
+        await interaction.followup.send(embed=self.pairing_result_embed(interaction.guild, f"📥 {len(matched)} drop zone(s) paired", matched, unmatched, created), ephemeral=True)
 
     @app_commands.command(description="One-click setup for your FIVEM/RZ/Boosters vault: pairs everything except NO PROPS and chat channels")
     @app_commands.describe(
         vault_guild_id="The vault server's ID (right-click its icon → Copy Server ID)",
         required_role="Only members with this role can claim any matched file (optional)",
         once_per_user="Each member can only claim a matched file once (default: no)",
+        create_missing="Create a new channel here for any vault channel with no match yet (default: yes)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def preset(
         self, interaction: discord.Interaction, vault_guild_id: str,
-        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+        required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
     ):
         """Pairs the FIVEM, RZ and Boosters categories in one go. Skips NO PROPS entirely (those are toggle/removal
         settings, not files to post) and skips any channel with "chat" in its name (e.g. booster-chat)."""
@@ -289,13 +321,18 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         if vault is None:
             raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
 
-        all_matched, all_unmatched = [], []
+        await interaction.response.defer(ephemeral=True)
+        all_matched, all_unmatched, all_created = [], [], []
         for category in ("FIVEM", "RZ", "Boosters"):
-            matched, unmatched = await self.pair_category(interaction, vault, category, ["chat"], required_role, once_per_user)
+            matched, unmatched, created = await self.pair_category(interaction, vault, category, ["chat"], required_role, once_per_user, create_missing)
             all_matched += matched
             all_unmatched += unmatched
+            all_created += created
 
-        await interaction.response.send_message(embed=self.pairing_result_embed(interaction.guild, f"⚡ Preset applied: {len(all_matched)} drop zone(s) paired", all_matched, all_unmatched), ephemeral=True)
+        await interaction.followup.send(
+            embed=self.pairing_result_embed(interaction.guild, f"⚡ Preset applied: {len(all_matched)} drop zone(s) paired", all_matched, all_unmatched, all_created),
+            ephemeral=True,
+        )
 
     @app_commands.command(description="Stop a channel being a drop zone")
     @app_commands.describe(upload_channel_id="The upload channel's ID (right-click it → Copy Channel ID)")
