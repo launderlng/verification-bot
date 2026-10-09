@@ -380,6 +380,27 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             ), ephemeral=True,
         )
 
+    @app_commands.command(description="List every server I'm in with real channel counts, to spot a wrong/duplicate vault ID")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def servers(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lines = []
+        for g in self.bot.guilds:
+            try:
+                raw = await self.bot.http.get_all_guild_channels(g.id)
+                count = sum(1 for ch in raw if ch.get("type") in (0, 5))  # 0 = text, 5 = announcement
+            except Exception:
+                count = "?"
+            me = g.me
+            admin = " 👑" if me and me.guild_permissions.administrator else ""
+            lines.append(f"**{g.name}**{admin} — `{g.id}` — {count} text channel(s)")
+        body = "\n".join(lines) or "I'm not in any servers."
+        body += (
+            "\n\n👑 = I have Administrator there. If two servers share a name, compare channel counts and IDs here "
+            "against the real one in Discord (right-click its icon → **Copy Server ID**) to find the right `vault_guild_id`."
+        )
+        await interaction.followup.send(embed=ui.card("🌐 My servers", body, guild=interaction.guild, section="Files"), ephemeral=True)
+
     @app_commands.command(description="Check whether I can actually see a server's FIVEM/RZ/Boosters categories")
     @app_commands.describe(vault_guild_id="The vault server's ID (right-click its icon → Copy Server ID)")
     @app_commands.checks.has_permissions(manage_guild=True)
