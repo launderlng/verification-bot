@@ -46,12 +46,14 @@ class Draft:
     """Everything a post is made of. New media is kept as bytes; media already on a posted message is kept by name only."""
 
     def __init__(self, channel, title: str, description: Optional[str], footer: Optional[str], color: Optional[int], photo=None, photo_url=None,
-                 gif=None, gif_url=None, file=None, button=None, deliver=None, ping=None, pack: Optional[str] = None, mention_all: Optional[str] = None):
+                 gif=None, gif_url=None, file=None, button=None, deliver=None, ping=None, pack: Optional[str] = None, mention_all: Optional[str] = None,
+                 show_file_field: bool = True):
         self.channel, self.title, self.description, self.footer, self.color = channel, title, description, footer, color
         self.photo, self.photo_url, self.gif, self.gif_url, self.file, self.button = photo, photo_url, gif, gif_url, file, button
         self.deliver = deliver  # (stored file id, name): a 📥 Get file button that DMs the file
         self.ping, self.pack = ping, pack  # a role to ping, and what pack this is (for the log)
         self.mention_all = mention_all  # 'everyone' or 'here'
+        self.show_file_field = show_file_field  # False hides the "📎 File <name>" field even when self.file is set
 
     # photo / gif / file are (name, bytes-or-None, size)
     def files(self) -> list[discord.File]:
@@ -63,7 +65,7 @@ class Draft:
         main_image = f"attachment://{self.photo[0]}" if self.photo else self.photo_url
         if main_image:
             main.set_image(url=main_image)  # the big photo
-        if self.file:
+        if self.file and self.show_file_field:
             main.add_field(name="📎 File", value=f"`{self.file[0]}` · {human_size(self.file[2])}\nAttached to this post ⬇️", inline=False)
         embeds = [main]
         gif_image = f"attachment://{self.gif[0]}" if self.gif else self.gif_url

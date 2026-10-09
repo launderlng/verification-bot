@@ -172,19 +172,28 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
 
-        # Image previews go straight in the embed (the big photo) when small enough to attach directly. Video/audio
-        # don't get this -- the only way to preview those inline is attaching the raw file to the message, which
-        # necessarily shows its filename in Discord's UI, and the point here is a clean post with no filename
-        # anywhere: just the pack name and a button. The Get-file button is always there either way.
+        # Image/video/audio previews go inline when small enough to attach directly -- images as the embed's big
+        # photo, video/audio attached to the message so Discord renders its native player. Either way the
+        # attachment is given a clean generic name (not the messy original filename), and show_file_field=False
+        # hides the "📎 File <name>" text Draft.embeds() would otherwise add -- the point is a clean post with no
+        # filename text visible anywhere, just the pack name, the preview, and the Get-file button.
         ctype = (att.content_type or "").lower()
-        photo = None
-        if len(data) <= ATTACH_LIMIT and ctype.startswith("image/"):
-            photo = (att.filename, data, len(data))
+        ext = Path(att.filename).suffix.lower()
+        clean_attach_name = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file") + ext
+        photo = file_attach = None
+        if len(data) <= ATTACH_LIMIT:
+            if ctype.startswith("image/"):
+                photo = (clean_attach_name, data, len(data))
+            elif ctype.startswith("video/") or ctype.startswith("audio/"):
+                file_attach = (clean_attach_name, data, len(data))
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
-        # like "V1" or "Cielo_15") -- no filename shown anywhere in the post itself.
+        # like "V1" or "Cielo_15") -- no filename shown anywhere in the post itself. gif_url is an optional
+        # per-channel branding GIF configured with /autoupload add (or the gif_url option on the bulk commands),
+        # shown as its own embed under the main one, same as a manual /post with a GIF attached.
         draft = Draft(post_channel, row["pack_name"], None, f"Uploaded in #{message.channel.name}", None,
-                       photo=photo, deliver=(file_row["id"], name), pack=row["pack_name"])
+                       photo=photo, file=file_attach, gif_url=row["gif_url"],
+                       deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False)
         await publish_draft(post_channel.guild, message.author, draft)
         await emit(
             post_channel.guild, "files", "File auto-uploaded",
@@ -201,11 +210,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         pack="What to call this pack/category, e.g. ReShade",
         required_role="Only members with this role can claim the file (optional)",
         once_per_user="Each member can only claim it once (default: no)",
+        gif_url="A branding GIF to show under every auto-post from this channel (optional, must end in .gif)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def add(
         self, interaction: discord.Interaction, upload_channel_id: str, post_channel: discord.TextChannel,
         pack: app_commands.Range[str, 1, 60], required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+        gif_url: Optional[str] = None,
     ):
         channel = self.bot.get_channel(resolve_channel_id(upload_channel_id))
         if channel is None:
@@ -214,12 +225,12 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             raise UserError("That needs to be a text channel.")
         check_can_send(post_channel, interaction.guild.me, files=False)
         await db.execute(
-            "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
-            "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user",
+            "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
             (channel.guild.id, channel.id, post_channel.id, pack.strip(), required_role.id if required_role else None,
-             int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat()),
+             int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat(), gif_url.strip() if gif_url else None),
         )
         where = f"**#{channel.name}** on **{channel.guild.name}**" if channel.guild.id != interaction.guild_id else channel.mention
         body = (f"Any file a staff member drops in {where} now gets stored in the file library and auto-posted in {post_channel.mention} "
@@ -229,7 +240,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
 
     async def pair_category(self, interaction: discord.Interaction, vault: discord.Guild, category: Optional[str], skip: list,
                              required_role: Optional[discord.Role], once_per_user: bool, create_missing: bool = True,
-                             dest_category_name: Optional[str] = None) -> tuple[list, list, list]:
+                             dest_category_name: Optional[str] = None, gif_url: Optional[str] = None) -> tuple[list, list, list]:
         """Match one category's (or the whole server's) channels on `vault` to same/similarly-named channels in
         the server the command was run in, and save a drop zone for every match. When `create_missing` is True
         (the default), any vault channel with no existing match gets a brand-new channel created for it here,
@@ -288,12 +299,12 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         for vc, target in matched:
             check_can_send(target, interaction.guild.me, files=False)
             await db.execute(
-                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
-                "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user",
+                "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
                 (vc.guild.id, vc.id, target.id, vc.name.replace("-", " ").title(), required_role.id if required_role else None,
-                 int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat()),
+                 int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat(), gif_url),
             )
         return matched, unmatched, created
 
@@ -316,11 +327,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         required_role="Only members with this role can claim any matched file (optional)",
         once_per_user="Each member can only claim a matched file once (default: no)",
         create_missing="Create a new channel here for any vault channel with no match yet (default: yes)",
+        gif_url="A branding GIF to show under every post from these channels (optional, must end in .gif)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def bulkadd(
         self, interaction: discord.Interaction, vault_guild_id: str, category: Optional[str] = None, exclude: Optional[str] = None,
         required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
+        gif_url: Optional[str] = None,
     ):
         if not vault_guild_id.strip().isdigit():
             raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
@@ -329,7 +342,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
         skip = [s.strip().lower() for s in (exclude or "").split(",") if s.strip()]
         await interaction.response.defer(ephemeral=True)
-        matched, unmatched, created = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user, create_missing)
+        matched, unmatched, created = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user, create_missing, gif_url=gif_url)
         if not matched and not unmatched:
             raise UserError("No text channels found over there. Check the category name, or leave it blank to scan every channel.")
         await interaction.followup.send(embed=self.pairing_result_embed(interaction.guild, f"📥 {len(matched)} drop zone(s) paired", matched, unmatched, created), ephemeral=True)
@@ -340,11 +353,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         required_role="Only members with this role can claim any matched file (optional)",
         once_per_user="Each member can only claim a matched file once (default: no)",
         create_missing="Create a new channel here for any vault channel with no match yet (default: yes)",
+        gif_url="A branding GIF to show under every auto-post (optional, must end in .gif)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def preset(
         self, interaction: discord.Interaction, vault_guild_id: str,
         required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
+        gif_url: Optional[str] = None,
     ):
         """Pairs the FIVEM, RZ and Boosters categories in one go. Skips NO PROPS entirely (those are toggle/removal
         settings, not files to post) and skips any channel with "chat" in its name (e.g. booster-chat)."""
@@ -357,7 +372,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         await interaction.response.defer(ephemeral=True)
         all_matched, all_unmatched, all_created = [], [], []
         for category in ("FIVEM", "RZ", "Boosters"):
-            matched, unmatched, created = await self.pair_category(interaction, vault, category, ["chat"], required_role, once_per_user, create_missing)
+            matched, unmatched, created = await self.pair_category(interaction, vault, category, ["chat"], required_role, once_per_user, create_missing, gif_url=gif_url)
             all_matched += matched
             all_unmatched += unmatched
             all_created += created
@@ -368,7 +383,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         )
 
     async def seed_vault(self, interaction: discord.Interaction, vault: discord.Guild, category: str, skip: list,
-                          required_role: Optional[discord.Role], once_per_user: bool) -> tuple[list, list]:
+                          required_role: Optional[discord.Role], once_per_user: bool, gif_url: Optional[str] = None) -> tuple[list, list]:
         """The reverse of pair_category: for when the vault doesn't have the channels yet and the REAL content
         lives here instead. Scans `category` in THIS server (where the real channels already are), and for each
         one creates a same-named channel over in `vault` (under a same-named category there, created if needed)
@@ -402,12 +417,12 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 created.append((vc, mc))
             check_can_send(mc, interaction.guild.me, files=False)
             await db.execute(
-                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
-                "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user",
+                "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
                 (vc.guild.id, vc.id, mc.id, mc.name.replace("-", " ").title(), required_role.id if required_role else None,
-                 int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat()),
+                 int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat(), gif_url),
             )
             paired.append((vc, mc))
         return paired, created
@@ -417,11 +432,12 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         vault_guild_id="The (new/empty) vault server's ID (right-click its icon → Copy Server ID)",
         required_role="Only members with this role can claim any matched file (optional)",
         once_per_user="Each member can only claim a matched file once (default: no)",
+        gif_url="A branding GIF to show under every auto-post (optional, must end in .gif)",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def seedvault(
         self, interaction: discord.Interaction, vault_guild_id: str,
-        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+        required_role: Optional[discord.Role] = None, once_per_user: bool = False, gif_url: Optional[str] = None,
     ):
         """For when the real FIVEM/RZ/Boosters channels live in THIS server, not a separate vault: creates the
         matching (empty) channel structure over in the vault server and pairs it back here, so staff can start
@@ -437,7 +453,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         await interaction.response.defer(ephemeral=True)
         all_paired, all_created = [], []
         for category in ("FIVEM", "RZ", "Boosters"):
-            paired, created = await self.seed_vault(interaction, vault, category, ["chat"], required_role, once_per_user)
+            paired, created = await self.seed_vault(interaction, vault, category, ["chat"], required_role, once_per_user, gif_url=gif_url)
             all_paired += paired
             all_created += created
 
