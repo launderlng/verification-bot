@@ -47,16 +47,23 @@ def normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-async def fresh_text_channels(guild: discord.Guild) -> list:
-    """Fetch a guild's channels straight from the API instead of trusting the gateway cache. The cache can be
-    missing channels entirely right after the bot is re-invited with new permissions or added to a category by
-    hand -- Discord doesn't always push the backfill events for that, so guild.channels/category.channels can
-    silently stay empty even though the channels are really there and really visible."""
+async def fetch_live(guild: discord.Guild) -> tuple[list, list]:
+    """Fetch a guild's channels straight from the API instead of trusting the gateway cache, and return
+    (categories, text_channels) -- both from this SAME fetch, never mixed with cached objects.
+
+    Mixing matters: a TextChannel's `.category` property looks its category up in the gateway cache by ID
+    (`guild.get_channel(category_id)`), not from wherever the channel itself came from. If the cache's copy of a
+    category is stale/wrong (e.g. a leftover category object with a different ID than the real current one -- the
+    kind of gap that shows up right after the bot is re-invited with new permissions or added to a category by
+    hand), `.category` silently returns None or the wrong category, and anything keyed off it comes back empty.
+    Matching categories and channels from one live list sidesteps that entirely."""
     try:
         channels = await guild.fetch_channels()
     except discord.HTTPException:
-        return list(guild.text_channels)  # fall back to cache if the API call itself fails
-    return [c for c in channels if isinstance(c, discord.TextChannel)]
+        return list(guild.categories), list(guild.text_channels)  # fall back to cache if the API call itself fails
+    cats = [c for c in channels if isinstance(c, discord.CategoryChannel)]
+    texts = [c for c in channels if isinstance(c, discord.TextChannel)]
+    return cats, texts
 
 
 def find_match(name: str, candidates: list) -> Optional[discord.TextChannel]:
@@ -202,10 +209,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                              required_role: Optional[discord.Role], once_per_user: bool) -> tuple[list, list]:
         """Match one category's (or the whole server's) channels on `vault` to same/similarly-named channels in
         the server the command was run in, and save a drop zone for every match. Returns (matched, unmatched)."""
-        all_vault_channels = await fresh_text_channels(vault)
+        vault_cats, all_vault_channels = await fetch_live(vault)
+        cat_ids = None
+        if category:
+            cat_ids = {c.id for c in vault_cats if category.strip().lower() in c.name.lower()}
         vault_channels = [
             c for c in all_vault_channels
-            if (not category or (c.category and category.strip().lower() in c.category.name.lower()))
+            if (cat_ids is None or c.category_id in cat_ids)
             and not any(s in c.name.lower() for s in skip)
         ]
         main_channels = interaction.guild.text_channels
@@ -343,18 +353,17 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         if vault is None:
             raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
         me = vault.me
-        found_cats = [cat for cat in vault.categories if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
+        try:
+            vault_cats, vault_texts = await fetch_live(vault)
+        except discord.HTTPException as e:
+            raise UserError(f"Couldn't list that server's channels (Discord said: {e}). Try again in a moment.")
+        found_cats = [cat for cat in vault_cats if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
         if found_cats:
-            # Fetch channels straight from the API rather than the gateway cache -- the cache can stay empty for a
-            # category's channels even when the category itself shows up and the channels are genuinely visible,
-            # typically right after the bot was re-invited with new permissions or manually added to a category.
-            try:
-                all_channels = await vault.fetch_channels()
-            except discord.HTTPException as e:
-                raise UserError(f"Found the categories but couldn't list their channels (Discord said: {e}). Try again in a moment.")
+            # Categories and their channels come from the SAME live fetch above, so this can't suffer the
+            # cache-mismatch bug that made every category look empty before.
             by_cat: dict = {}
-            for ch in all_channels:
-                by_cat.setdefault(getattr(ch, "category_id", None), []).append(ch)
+            for ch in vault_texts:
+                by_cat.setdefault(ch.category_id, []).append(ch)
             lines = []
             for cat in found_cats:
                 kinds = {}
@@ -363,7 +372,8 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 breakdown = ", ".join(f"{n} {k}" for k, n in kinds.items()) if kinds else "no channels inside"
                 lines.append(f"📁 {cat.name} — {breakdown}")
             admin_note = "I'm an Administrator there.\n\n" if me and me.guild_permissions.administrator else ""
-            text_total = sum(1 for ch in all_channels if isinstance(ch, discord.TextChannel) and ch.category_id in {c.id for c in found_cats})
+            found_cat_ids = {c.id for c in found_cats}
+            text_total = sum(1 for ch in vault_texts if ch.category_id in found_cat_ids)
             if text_total:
                 tail = "\n\nRun `/autoupload preset` — it should find channels now."
             else:
@@ -378,7 +388,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             )
         # Can't see any category matching the expected names. Show exactly what server and what categories I DO see,
         # so a wrong vault_guild_id (easy to mix up with the main server's ID) is obvious instead of guessed at.
-        all_cats = [cat.name for cat in vault.categories]
+        all_cats = [cat.name for cat in vault_cats]
         body = (
             f"Checking **{vault.name}** (`{vault.id}`) — "
             f"I don't see any category matching {', '.join(FIX_PERM_CATEGORIES)} there.\n\n"
