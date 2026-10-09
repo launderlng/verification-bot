@@ -441,6 +441,7 @@ MIGRATIONS = [
     ("shop_settings", "ticket_channel_id", "INTEGER"),
     ("shop_settings", "receipt_note", "TEXT"),
     ("reviews", "kind", "TEXT NOT NULL DEFAULT 'product'"),
+    ("upload_channels", "gif_url", "TEXT"),
     ("reviews", "staff_id", "INTEGER"),
     ("reviews", "ticket_id", "INTEGER"),
     ("products", "file_id", "INTEGER"),
