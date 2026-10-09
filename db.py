@@ -393,6 +393,18 @@ CREATE TABLE IF NOT EXISTS giveaway_entries (
     joined_at   TEXT NOT NULL,
     PRIMARY KEY (giveaway_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS upload_channels (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id         INTEGER NOT NULL,
+    channel_id       INTEGER NOT NULL,
+    post_channel_id  INTEGER NOT NULL,
+    pack_name        TEXT NOT NULL,
+    required_role_id INTEGER,
+    once_per_user    INTEGER NOT NULL DEFAULT 0,
+    created_by       INTEGER NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE (guild_id, channel_id)
+);
 """
 
 CONFIG_COLUMNS = {
