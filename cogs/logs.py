@@ -13,7 +13,12 @@ from common import COLOR, DANGER, INFO, SUCCESS, WARN, UserError, check_can_send
 from logutil import (CATEGORIES, CATEGORY_STYLE, ESSENTIALS, HISTORY_DAYS, LOG_CHANNELS, clip, emit, find_audit_entry,
                      prune_history, was_handled)
 
-CATEGORY_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in CATEGORIES.items()]
+async def category_autocomplete(interaction: discord.Interaction, current: str) -> list:
+    """Discord caps a fixed choice list at 25 options, and we have more categories than that now, so
+    the category parameter is autocomplete (search-as-you-type) instead of a static dropdown."""
+    current = (current or "").strip().lower()
+    matches = [(key, label) for key, label in CATEGORIES.items() if current in key.lower() or current in label.lower()]
+    return [app_commands.Choice(name=label, value=key) for key, label in matches[:25]]
 DANGEROUS = ("administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks", "ban_members", "kick_members", "mention_everyone")
 LOG_CATEGORY_NAME = "📋 Logs"
 
@@ -315,23 +320,29 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(description="Turn a log category on or off")
-    @app_commands.choices(category=CATEGORY_CHOICES)
+    @app_commands.describe(category="Start typing to search")
+    @app_commands.autocomplete(category=category_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def toggle(self, interaction: discord.Interaction, category: app_commands.Choice[str], enabled: bool):
-        await self.set_enabled(interaction.guild_id, category.value, enabled)
-        await interaction.response.send_message(f"{'✅' if enabled else '❌'} **{category.name}** logging is now {'on' if enabled else 'off'}.", ephemeral=True)
+    async def toggle(self, interaction: discord.Interaction, category: str, enabled: bool):
+        if category not in CATEGORIES:
+            raise UserError("I don't know that category. Start typing and pick one from the list.")
+        await self.set_enabled(interaction.guild_id, category, enabled)
+        await interaction.response.send_message(f"{'✅' if enabled else '❌'} **{CATEGORIES[category]}** logging is now {'on' if enabled else 'off'}.", ephemeral=True)
 
     @app_commands.command(description="Send one category to its own channel (leave channel blank to reset)")
-    @app_commands.choices(category=CATEGORY_CHOICES)
+    @app_commands.describe(category="Start typing to search")
+    @app_commands.autocomplete(category=category_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def route(self, interaction: discord.Interaction, category: app_commands.Choice[str], channel: Optional[discord.TextChannel] = None):
+    async def route(self, interaction: discord.Interaction, category: str, channel: Optional[discord.TextChannel] = None):
+        if category not in CATEGORIES:
+            raise UserError("I don't know that category. Start typing and pick one from the list.")
         if channel:
             check_can_send(channel, interaction.guild.me)
         await db.execute(
             "INSERT INTO log_routes (guild_id, category, channel_id) VALUES (?, ?, ?) ON CONFLICT(guild_id, category) DO UPDATE SET channel_id = excluded.channel_id",
-            (interaction.guild_id, category.value, channel.id if channel else None),
+            (interaction.guild_id, category, channel.id if channel else None),
         )
-        await interaction.response.send_message(f"✅ **{category.name}** now goes to {channel.mention if channel else 'the default log channel'}.", ephemeral=True)
+        await interaction.response.send_message(f"✅ **{CATEGORIES[category]}** now goes to {channel.mention if channel else 'the default log channel'}.", ephemeral=True)
 
     @app_commands.command(description="Show what's being logged and where")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -348,17 +359,19 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         await interaction.response.send_message(f"🧪 Sent a test message to {sent} channel(s).", ephemeral=True)
 
     @app_commands.command(description="Search recent log entries, for one member or one category")
-    @app_commands.describe(member="Only entries about this member", category="Only this category")
-    @app_commands.choices(category=CATEGORY_CHOICES)
+    @app_commands.describe(member="Only entries about this member", category="Only this category (start typing to search)")
+    @app_commands.autocomplete(category=category_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def history(self, interaction: discord.Interaction, member: Optional[discord.User] = None, category: Optional[app_commands.Choice[str]] = None):
+    async def history(self, interaction: discord.Interaction, member: Optional[discord.User] = None, category: Optional[str] = None):
+        if category and category not in CATEGORIES:
+            raise UserError("I don't know that category. Start typing and pick one from the list.")
         sql, params = "SELECT * FROM log_history WHERE guild_id = ?", [interaction.guild_id]
         if member:
             sql += " AND subject_id = ?"
             params.append(member.id)
         if category:
             sql += " AND category = ?"
-            params.append(category.value)
+            params.append(category)
         rows = await db.fetch_all(sql + " ORDER BY id DESC LIMIT 15", tuple(params))
         if not rows:
             raise UserError("Nothing found. History keeps the last %d days of events that were logged." % HISTORY_DAYS)
