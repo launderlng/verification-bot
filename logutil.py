@@ -25,17 +25,32 @@ CATEGORIES = {
     "automod": "Automod actions",
     "posts": "Posts and packs",
     "staff": "Staff actions",
+    "commands": "Every slash command anyone runs",
+    "events": "Scheduled server events",
 }
 
 
-# Layout used by "Create log channels": channel -> (name, topic, categories sent there)
+# Layout used by "Create log channels": one private channel per category, fully separated.
 LOG_CHANNELS = {
-    "member-logs": ("👥・member-logs", "Joins, leaves, invites and name changes", ["members", "nicknames", "invites"]),
-    "message-logs": ("💬・message-logs", "Edited and deleted messages", ["messages"]),
-    "mod-logs": ("🛡️・mod-logs", "Bans, kicks, timeouts, automod and staff actions", ["moderation", "verification", "automod", "staff"]),
-    "server-logs": ("⚙️・server-logs", "Roles, channels, voice, posts and server changes", ["roles", "channels", "server", "voice", "posts"]),
-    "ticket-logs": ("🎫・ticket-logs", "Tickets and giveaways", ["tickets", "giveaways"]),
-    "shop-logs": ("🛒・shop-logs", "Shop purchases and file downloads", ["shop", "files"]),
+    "verification": ("✅・verify-logs", "Verification attempts, passes and lockdown", ["verification"]),
+    "members": ("👋・join-logs", "Joins and leaves", ["members"]),
+    "messages": ("💬・message-logs", "Edited and deleted messages", ["messages"]),
+    "roles": ("🎭・role-logs", "Roles created, deleted and changed", ["roles"]),
+    "moderation": ("🛡️・mod-logs", "Bans, kicks, timeouts and warnings", ["moderation"]),
+    "channels": ("📁・channel-logs", "Channels created, deleted and changed", ["channels"]),
+    "nicknames": ("✏️・name-logs", "Nickname and username changes", ["nicknames"]),
+    "voice": ("🔊・voice-logs", "Voice channel activity", ["voice"]),
+    "server": ("⚙️・server-logs", "Server settings and emoji changes", ["server"]),
+    "shop": ("🛒・shop-logs", "Shop purchases", ["shop"]),
+    "tickets": ("🎫・ticket-logs", "Support tickets", ["tickets"]),
+    "giveaways": ("🎉・giveaway-logs", "Giveaways", ["giveaways"]),
+    "invites": ("📨・invite-logs", "Invites created, deleted and used", ["invites"]),
+    "files": ("📥・file-logs", "File downloads", ["files"]),
+    "automod": ("🤖・automod-logs", "Automod actions", ["automod"]),
+    "posts": ("📢・post-logs", "Posts and packs", ["posts"]),
+    "staff": ("🛠️・staff-logs", "Staff actions", ["staff"]),
+    "commands": ("⌨️・command-logs", "Every slash command anyone runs", ["commands"]),
+    "events": ("🗓️・event-logs", "Scheduled server events", ["events"]),
 }
 ESSENTIALS = {"members", "messages", "moderation", "verification", "tickets", "roles"}
 HISTORY_DAYS = 30
@@ -74,6 +89,7 @@ CATEGORY_STYLE = {
     "roles": ("🎭 Roles", ACCENT), "moderation": ("🛡️ Moderation", DANGER), "channels": ("📁 Channels", INFO),
     "nicknames": ("✏️ Names", INFO), "voice": ("🔊 Voice", ACCENT), "server": ("⚙️ Server", WARN),
     "shop": ("🛒 Shop", SUCCESS), "tickets": ("🎫 Tickets", ACCENT), "giveaways": ("🎉 Giveaways", ACCENT), "invites": ("🔗 Invites", INFO), "files": ("📥 Files", INFO), "automod": ("🤖 Automod", WARN), "posts": ("📢 Posts", INFO), "staff": ("🛠️ Staff", INFO),
+    "commands": ("⌨️ Commands", INFO), "events": ("🗓️ Events", ACCENT),
 }
 
 
