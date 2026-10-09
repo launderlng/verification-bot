@@ -204,21 +204,19 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             too_large_for_preview = True
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
-        # like "V1" or "Cielo_15") -- no filename shown anywhere in the post itself. gif_url is an optional
-        # per-channel branding GIF configured with /autoupload add (or the gif_url option on the bulk commands),
-        # shown as its own embed under the main one, same as a manual /post with a GIF attached.
-        footer = f"Uploaded in #{message.channel.name}"
-        if too_large_for_preview:
-            footer += f" · {human_size(len(data))}, too large to preview inline here ({human_size(inline_limit)} limit)"
-        draft = Draft(post_channel, row["pack_name"], None, footer, None,
+        # like "V1" or "Cielo_15") -- no filename and no "Uploaded in #..." text shown anywhere in the public
+        # post, just the pack name, the preview, and the Get-file button. gif_url is an optional per-channel
+        # branding GIF configured with /autoupload add (or the gif_url option on the bulk commands), shown as its
+        # own embed under the main one, same as a manual /post with a GIF attached.
+        draft = Draft(post_channel, row["pack_name"], None, None, None,
                        photo=photo, file=file_attach, gif_url=row["gif_url"],
                        deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False)
         await publish_draft(post_channel.guild, message.author, draft)
-        await emit(
-            post_channel.guild, "files", "File auto-uploaded",
-            ui.kv(("👤 By", message.author.mention), ("📦 Stored as", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention)),
-            subject=message.author.id,
-        )
+        log_fields = [("👤 By", message.author.mention), ("📦 Stored as", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention)]
+        if too_large_for_preview:
+            # Not shown on the public post -- staff can see why a video/image had no inline preview here instead.
+            log_fields.append(("⚠️ No preview", f"{human_size(len(data))} is over the {human_size(inline_limit)} inline limit"))
+        await emit(post_channel.guild, "files", "File auto-uploaded", ui.kv(*log_fields), subject=message.author.id)
 
     # ----------------------------------------------------------- commands ----
 
