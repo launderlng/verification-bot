@@ -19,7 +19,8 @@ from logutil import emit
 log = logging.getLogger("verification-bot")
 
 NEEDS_WEB = "Files over 25 MB need a public web address to deliver as a link. In Railway: Settings → Networking → Generate Domain."
-INVITE_PERMS = 1024 | 2048 | 16384 | 64 | 65536  # View Channel, Send Messages, Embed Links, Add Reactions, Read Message History
+INVITE_PERMS = 1024 | 2048 | 16384 | 64 | 65536 | 16  # View Channel, Send Messages, Embed Links, Add Reactions, Read Message History, Manage Channels
+FIX_PERM_CATEGORIES = ("FIVEM", "RZ", "Boosters")
 
 
 def clean_name(filename: str, taken: set) -> str:
@@ -308,8 +309,49 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         url = f"https://discord.com/oauth2/authorize?client_id={self.bot.user.id}&scope=bot%20applications.commands&permissions={INVITE_PERMS}"
         await interaction.response.send_message(
             embed=ui.card("🔗 Invite link", f"Open this on the account that manages your other server, pick the server, and authorize:\n\n{url}\n\n"
-                                             "I only ask for the minimum needed to watch for uploads: View Channel, Send Messages, Embed Links, Add Reactions, Read Message History.",
+                                             "I ask for: View Channel, Send Messages, Embed Links, Add Reactions, Read Message History, and Manage Channels "
+                                             "(so `/autoupload fixperms` can let me see locked-down categories like a private vault, without you clicking through permissions by hand).",
                            guild=interaction.guild, section="Files"), ephemeral=True,
+        )
+
+    @app_commands.command(description="If a vault's categories are locked down, let me grant myself access to FIVEM/RZ/Boosters there")
+    @app_commands.describe(vault_guild_id="The vault server's ID (right-click its icon → Copy Server ID)")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def fixperms(self, interaction: discord.Interaction, vault_guild_id: str):
+        if not vault_guild_id.strip().isdigit():
+            raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
+        vault = self.bot.get_guild(int(vault_guild_id.strip()))
+        if vault is None:
+            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
+        me = vault.me
+        if me is None or not (me.guild_permissions.manage_channels or me.guild_permissions.administrator):
+            raise UserError(
+                "I don't have **Manage Channels** on that server, so I can't edit its permissions myself. "
+                "Run `/autoupload inviteinfo` for an invite link (it now includes Manage Channels), kick me from the vault, "
+                "and re-add me there with that link, then try this again."
+            )
+        await interaction.response.defer(ephemeral=True)
+        overwrite = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, add_reactions=True, embed_links=True)
+        changed = []
+        for cat_name in FIX_PERM_CATEGORIES:
+            for cat in vault.categories:
+                if cat_name.lower() not in cat.name.lower():
+                    continue
+                try:
+                    await cat.set_permissions(me, overwrite=overwrite, reason="Auto-upload: let the bot see this category")
+                except discord.Forbidden:
+                    continue
+                changed.append(f"📁 {cat.name}")
+                for ch in cat.channels:
+                    try:
+                        await ch.set_permissions(me, overwrite=overwrite, reason="Auto-upload: let the bot see this channel")
+                    except discord.Forbidden:
+                        pass
+        if not changed:
+            raise UserError(f"I couldn't find any categories matching {', '.join(FIX_PERM_CATEGORIES)} on that server. Check the category names match.")
+        await interaction.followup.send(
+            embed=ui.card("✅ Permissions granted", "Updated:\n" + "\n".join(changed) + "\n\nTry `/autoupload preset` again now.", color=SUCCESS, guild=interaction.guild, section="Files"),
+            ephemeral=True,
         )
 
 
