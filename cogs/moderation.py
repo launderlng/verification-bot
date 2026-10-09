@@ -42,7 +42,7 @@ class Moderation(commands.Cog):
         await notify(member, interaction.guild, "👢 You were kicked", reason, "kicked from")
         mark_handled(interaction.guild_id, member.id, "kick")
         await member.kick(reason=audit_reason(interaction, reason))
-        await action_log(interaction.guild, "moderation", "Member kicked", target=member, actor=interaction.user, reason=reason, color=WARN)
+        await action_log(interaction.guild, "kick", "Member kicked", target=member, actor=interaction.user, reason=reason, color=WARN)
         await interaction.response.send_message(embed=done("👢 Member kicked", f"**{member}** was kicked.\n\n" + ui.kv(("📝 Reason", reason or "None given")), WARN))
 
     @app_commands.command(description="Ban a member (or someone who already left)")
@@ -56,7 +56,7 @@ class Moderation(commands.Cog):
             await notify(member, interaction.guild, "🔨 You were banned", reason, "banned from", DANGER)
         mark_handled(interaction.guild_id, user.id, "ban")
         await interaction.guild.ban(user, reason=audit_reason(interaction, reason), delete_message_seconds=delete_days * 86400)
-        await action_log(interaction.guild, "moderation", "Member banned", target=user, actor=interaction.user, reason=reason, color=DANGER,
+        await action_log(interaction.guild, "ban", "Member banned", target=user, actor=interaction.user, reason=reason, color=DANGER,
                          lines=(("🗑️ Messages deleted", f"{delete_days} day(s)" if delete_days else None),))
         await interaction.response.send_message(embed=done("🔨 Member banned", f"**{user}** was banned.\n\n" + ui.kv(("📝 Reason", reason or "None given")), DANGER))
 
@@ -73,7 +73,7 @@ class Moderation(commands.Cog):
             await interaction.guild.unban(target, reason=audit_reason(interaction, reason))
         except discord.NotFound:
             raise UserError("That user isn't banned.") from None
-        await action_log(interaction.guild, "moderation", "Member unbanned", target=target, actor=interaction.user, reason=reason, color=SUCCESS)
+        await action_log(interaction.guild, "ban", "Member unbanned", target=target, actor=interaction.user, reason=reason, color=SUCCESS)
         await interaction.response.send_message(embed=done("♻️ Member unbanned", f"<@{user_id}> (`{user_id}`) can join again."))
 
     @app_commands.command(description="Time a member out, or end their timeout early")
@@ -85,7 +85,7 @@ class Moderation(commands.Cog):
         if duration.strip().lower() in ("off", "0", "remove", "end", "none"):
             mark_handled(interaction.guild_id, member.id, "untimeout")
             await member.timeout(None, reason=audit_reason(interaction, reason or "Timeout removed"))
-            await action_log(interaction.guild, "moderation", "Timeout removed", target=member, actor=interaction.user, reason=reason, color=SUCCESS)
+            await action_log(interaction.guild, "timeout", "Timeout removed", target=member, actor=interaction.user, reason=reason, color=SUCCESS)
             return await interaction.response.send_message(embed=done("🔊 Timeout removed", f"{member.mention} can talk again."))
         seconds = parse_duration(duration)
         if seconds is None or seconds < 1 or seconds > 28 * 86400:
@@ -94,7 +94,7 @@ class Moderation(commands.Cog):
         until = discord.utils.utcnow() + timedelta(seconds=seconds)
         await member.timeout(timedelta(seconds=seconds), reason=audit_reason(interaction, reason))
         await notify(member, interaction.guild, "🔇 You were timed out", reason, f"timed out for {duration} in")
-        await action_log(interaction.guild, "moderation", "Member timed out", target=member, actor=interaction.user, reason=reason, color=WARN,
+        await action_log(interaction.guild, "timeout", "Member timed out", target=member, actor=interaction.user, reason=reason, color=WARN,
                          lines=(("⏳ Length", duration), ("⏰ Ends", discord.utils.format_dt(until, "R"))))
         await interaction.response.send_message(embed=done("🔇 Member timed out", f"{member.mention} for **{duration}**.\n\n" + ui.kv(("📝 Reason", reason or "None given")), WARN))
 
@@ -108,7 +108,7 @@ class Moderation(commands.Cog):
             raise UserError(f"{member.mention} isn't timed out.")
         mark_handled(interaction.guild_id, member.id, "untimeout")
         await member.timeout(None, reason=audit_reason(interaction, reason or "Timeout removed"))
-        await action_log(interaction.guild, "moderation", "Timeout removed", target=member, actor=interaction.user, reason=reason, color=SUCCESS)
+        await action_log(interaction.guild, "timeout", "Timeout removed", target=member, actor=interaction.user, reason=reason, color=SUCCESS)
         await interaction.response.send_message(embed=done("🔊 Timeout removed", f"{member.mention} can talk again."))
 
     @app_commands.command(description="Send a member a private embedded DM from the bot, with optional files")
@@ -146,7 +146,7 @@ class Moderation(commands.Cog):
             raise UserError(f"{member.mention} has DMs closed, so I couldn't message them.")
         except discord.HTTPException as e:
             raise UserError(f"Discord refused the DM ({e.status}). Files may be too large.")
-        await action_log(interaction.guild, "moderation", "DM sent by staff", target=member, actor=interaction.user,
+        await action_log(interaction.guild, "staff", "DM sent by staff", target=member, actor=interaction.user,
                          lines=(("🖼️ Image", "yes" if image else "no"), ("📎 Files", ", ".join(names) or "none")),
                          fields=(("Message", message[:900]),))
         await interaction.followup.send(embed=done("📩 DM sent", f"Delivered to {member.mention}."), ephemeral=True)
@@ -163,7 +163,7 @@ class Moderation(commands.Cog):
         warning_id = (await db.fetch_one("SELECT id FROM warnings WHERE guild_id = ? ORDER BY id DESC LIMIT 1", (interaction.guild_id,)))["id"]
         total = (await db.fetch_one("SELECT COUNT(*) AS c FROM warnings WHERE guild_id = ? AND user_id = ?", (interaction.guild_id, member.id)))["c"]
         await notify(member, interaction.guild, "⚠️ You were warned", reason, "warned in")
-        await action_log(interaction.guild, "moderation", "Member warned", target=member, actor=interaction.user, reason=reason, color=WARN,
+        await action_log(interaction.guild, "warn", "Member warned", target=member, actor=interaction.user, reason=reason, color=WARN,
                          lines=(("⚖️ Warning", f"`#{warning_id}` (total {total})"),), ids=(("warning", warning_id),))
         await interaction.response.send_message(embed=done("⚠️ Member warned", f"{member.mention} now has **{total}** warning(s).\n\n" + ui.kv(("⚖️ Warning", f"`#{warning_id}`"), ("📝 Reason", reason)), WARN))
 
@@ -177,12 +177,12 @@ class Moderation(commands.Cog):
             if not row:
                 raise UserError("I can't find that warning on this member. Check the number with `/warnings`.")
             await db.execute("DELETE FROM warnings WHERE id = ?", (delete_id,))
-            await action_log(interaction.guild, "moderation", "Warning deleted", target=member, actor=interaction.user, reason=row["reason"], color=SUCCESS,
+            await action_log(interaction.guild, "warn", "Warning deleted", target=member, actor=interaction.user, reason=row["reason"], color=SUCCESS,
                              lines=(("⚖️ Warning", f"`#{delete_id}` (was given by <@{row['moderator_id']}>)"),), ids=(("warning", delete_id),))
             return await interaction.response.send_message(embed=done("🗑️ Warning deleted", f"Warning `#{delete_id}` was removed from {member.mention}."), ephemeral=True)
         if clear:
             count = await db.execute("DELETE FROM warnings WHERE guild_id = ? AND user_id = ?", (gid, member.id))
-            await action_log(interaction.guild, "moderation", "Warnings cleared", target=member, actor=interaction.user, reason=f"{count} warning(s) removed", color=SUCCESS)
+            await action_log(interaction.guild, "warn", "Warnings cleared", target=member, actor=interaction.user, reason=f"{count} warning(s) removed", color=SUCCESS)
             return await interaction.response.send_message(embed=done("🧹 Warnings cleared", f"Removed **{count}** warning(s) from {member.mention}."), ephemeral=True)
         rows = await db.fetch_all("SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT 15", (gid, member.id))
         if not rows:
@@ -222,7 +222,7 @@ class Moderation(commands.Cog):
         if to_delete:
             await channel.delete_messages(to_delete, reason=audit_reason(interaction, "Purge"))
             await emit(
-                interaction.guild, "moderation", "Messages purged",
+                interaction.guild, "message_delete", "Messages purged",
                 ui.kv(("📍 Channel", channel.mention), ("🗑️ Deleted", f"{len(to_delete)} message(s)"), ("👤 Only from", f"{member.mention} (`{member.id}`)" if member else None)),
                 WARN, actor=interaction.user, subject=member.id if member else None, ids=(("channel", channel.id),),
             )
@@ -239,7 +239,7 @@ class Moderation(commands.Cog):
     @app_commands.checks.bot_has_permissions(manage_channels=True)
     async def slowmode(self, interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 21600]):
         await interaction.channel.edit(slowmode_delay=seconds, reason=audit_reason(interaction, "Slowmode"))
-        await emit(interaction.guild, "moderation", "Slowmode changed", ui.kv(("📍 Channel", interaction.channel.mention), ("🐌 Slowmode", f"{seconds}s" if seconds else "Off")), WARN, actor=interaction.user, ids=(("channel", interaction.channel.id),))
+        await emit(interaction.guild, "channel_update", "Slowmode changed", ui.kv(("📍 Channel", interaction.channel.mention), ("🐌 Slowmode", f"{seconds}s" if seconds else "Off")), WARN, actor=interaction.user, ids=(("channel", interaction.channel.id),))
         await interaction.response.send_message(embed=done("🐌 Slowmode", "Slowmode is **off**." if seconds == 0 else f"Slowmode is **{seconds}s**."))
 
     @app_commands.command(description="Lock a channel so nobody can send messages (or unlock it again)")
@@ -251,7 +251,7 @@ class Moderation(commands.Cog):
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = None if unlock else False
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=audit_reason(interaction, "Unlock" if unlock else "Lock"))
-        await emit(interaction.guild, "moderation", "Channel unlocked" if unlock else "Channel locked", ui.kv(("📍 Channel", channel.mention)), SUCCESS if unlock else WARN, actor=interaction.user, ids=(("channel", channel.id),))
+        await emit(interaction.guild, "channel_update", "Channel unlocked" if unlock else "Channel locked", ui.kv(("📍 Channel", channel.mention)), SUCCESS if unlock else WARN, actor=interaction.user, ids=(("channel", channel.id),))
         await interaction.response.send_message(embed=done("🔓 Channel unlocked" if unlock else "🔒 Channel locked", f"{channel.mention} is {'open again' if unlock else 'locked'}.", SUCCESS if unlock else WARN))
 
 
