@@ -408,7 +408,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                     kinds[type(ch).__name__] = kinds.get(type(ch).__name__, 0) + 1
                 breakdown = ", ".join(f"{n} {k}" for k, n in kinds.items()) if kinds else "no channels inside"
                 lines.append(f"📁 {cat.name} — {breakdown}")
-            admin_note = "I'm an Administrator there.\n\n" if me and me.guild_permissions.administrator else ""
+            admin_note = f"Checking **{vault.name}** (`{vault.id}`). " + ("I'm an Administrator there.\n\n" if me and me.guild_permissions.administrator else "\n\n")
             found_cat_ids = {c.id for c in found_cats}
             text_total = sum(1 for ch in vault_texts if ch.category_id in found_cat_ids)
             if text_total:
