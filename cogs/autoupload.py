@@ -402,7 +402,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             paired.append((vc, mc))
         return paired, created
 
-    @app_commands.command(description="Fill an empty/new vault server with channels copied from FIVEM/RZ/Boosters here, wired to post back here")
+    @app_commands.command(description="Fill an empty vault with channels copied from FIVEM/RZ/Boosters here, wired to post back here")
     @app_commands.describe(
         vault_guild_id="The (new/empty) vault server's ID (right-click its icon → Copy Server ID)",
         required_role="Only members with this role can claim any matched file (optional)",
@@ -438,7 +438,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(description="Same-server version of bulkadd: mirror a category here into a new public category, auto-posting uploads across")
+    @app_commands.command(description="Same-server bulkadd: mirror a category here into a new public category, auto-posting across")
     @app_commands.describe(
         source_category="Category in THIS server to watch for uploads (e.g. RZ)",
         dest_category="Category to post into (created if it doesn't exist, e.g. 'RZ Downloads')",
