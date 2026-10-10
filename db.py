@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS ticket_config (
     panel_image           TEXT,
     staff_roles           TEXT,
     transcript_channel_id INTEGER,
-    max_open              INTEGER NOT NULL DEFAULT 1,
+    max_open              INTEGER NOT NULL DEFAULT 3,
     auto_close_hours      INTEGER NOT NULL DEFAULT 0,
     ping_staff            INTEGER NOT NULL DEFAULT 1,
     dm_transcript         INTEGER NOT NULL DEFAULT 1,
@@ -535,6 +535,11 @@ MIGRATIONS = [
     ("ticket_types", "questions", "TEXT"),
     ("ticket_types", "accept_role_id", "INTEGER"),
     ("tickets", "app_status", "TEXT"),
+    ("ticket_types", "is_app", "INTEGER NOT NULL DEFAULT 0"),
+    ("ticket_config", "after_hours", "INTEGER NOT NULL DEFAULT 1"),
+    ("ticket_config", "hours_start", "INTEGER NOT NULL DEFAULT 8"),
+    ("ticket_config", "hours_end", "INTEGER NOT NULL DEFAULT 18"),
+    ("ticket_config", "hours_tz", "TEXT"),
 ]
 
 
@@ -543,11 +548,19 @@ async def init() -> None:
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.executescript(SCHEMA)
         # Add columns that older databases don't have yet (safe to run every start)
+        added = set()
         for table, column, decl in MIGRATIONS:
             async with conn.execute(f"PRAGMA table_info({table})") as cur:
                 existing = {row[1] for row in await cur.fetchall()}
             if column not in existing:
                 await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                added.add((table, column))
+        if ("ticket_config", "hours_start") in added:
+            # one-time, alongside the support-hours update: the old limit of 1 open ticket per member is raised to 3
+            # (servers that already chose 2+ keep their number; change it any time with /ticket settings max_open)
+            await conn.execute("UPDATE ticket_config SET max_open = 3 WHERE max_open < 3")
+        if ("ticket_types", "is_app") in added:
+            await conn.execute("UPDATE ticket_types SET is_app = 1 WHERE questions IS NOT NULL AND (name LIKE '%application%' OR name LIKE 'partner%')")
         await conn.commit()
 
 
@@ -631,6 +644,7 @@ async def update_product(product_id: int, **fields) -> None:
 TICKET_COLUMNS = {
     "category_id", "panel_channel_id", "panel_message_id", "panel_title", "panel_text", "panel_color", "panel_image",
     "staff_roles", "transcript_channel_id", "max_open", "auto_close_hours", "ping_staff", "dm_transcript", "ask_rating",
+    "after_hours", "hours_start", "hours_end", "hours_tz",
 }
 
 

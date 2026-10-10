@@ -4,3 +4,4 @@ aiosqlite>=0.20
 Pillow>=10.1
 aiohttp>=3.9
 imageio-ffmpeg>=0.4.9
+tzdata>=2024.1
