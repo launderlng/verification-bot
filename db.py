@@ -427,6 +427,14 @@ CREATE TABLE IF NOT EXISTS licenses (
     note        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_licenses_user ON licenses (user_id);
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id         TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    user_id    INTEGER,
+    username   TEXT,
+    linked_at  TEXT,
+    error      TEXT
+);
 CREATE TABLE IF NOT EXISTS license_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     license_id INTEGER,
