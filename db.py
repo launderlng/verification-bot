@@ -410,6 +410,19 @@ CREATE TABLE IF NOT EXISTS upload_channels (
 -- than once (gateway resume, or two bot instances briefly overlapping during a deploy). A row here means that
 -- attachment has already been processed; INSERT OR IGNORE against the primary key is how callers check-and-claim
 -- atomically without a separate read-then-write race.
+-- Payment options for one product (e.g. 1 Day / 1 Week / Lifetime), each with its own Stripe link
+CREATE TABLE IF NOT EXISTS product_options (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    product_id   INTEGER NOT NULL,
+    label        TEXT NOT NULL COLLATE NOCASE,
+    price        TEXT,
+    buy_url      TEXT NOT NULL,
+    license_days INTEGER,
+    position     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (product_id, label)
+);
+
 -- Macro license keys (checked by the macro at POST /api/activate, see cogs/licenses.py)
 CREATE TABLE IF NOT EXISTS licenses (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -518,6 +531,7 @@ MIGRATIONS = [
     ("products", "license_days", "INTEGER"),
     ("orders", "license_code", "TEXT"),
     ("licenses", "duration_days", "INTEGER"),
+    ("orders", "option_id", "INTEGER"),
 ]
 
 

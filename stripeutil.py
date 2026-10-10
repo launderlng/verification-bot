@@ -41,26 +41,34 @@ def verify_signature(payload: bytes, header: str, secrets: list[str], tolerance:
     return False
 
 
-# ---- signed client_reference_id: "<guild>-<user>-<product>-<signature>" -----------------
+# ---- signed client_reference_id: "<guild>-<user>-<product>[_<option>]-<signature>" -------
+# The optional _<option> says which payment option (e.g. 1 Week) the buyer picked. Stripe only
+# allows letters, digits, dashes and underscores here, hence the underscore.
 
 def _sign(body: str, secret: str) -> str:
     return hmac.new(secret.encode(), f"ref:{body}".encode(), hashlib.sha256).hexdigest()[:12]
 
 
-def make_ref(guild_id: int, user_id: int, product_id: int, secret: str) -> str:
-    body = f"{guild_id}-{user_id}-{product_id}"
+def make_ref(guild_id: int, user_id: int, product_id: int, secret: str, option_id: Optional[int] = None) -> str:
+    body = f"{guild_id}-{user_id}-{product_id}" + (f"_{option_id}" if option_id else "")
     return f"{body}-{_sign(body, secret)}"
+
+
+def parse_ref_full(ref: Optional[str], secrets: list[str]) -> Optional[tuple[int, int, int, Optional[int]]]:
+    """Returns (guild_id, user_id, product_id, option_id or None) if the reference is genuine, otherwise None."""
+    match = re.fullmatch(r"(\d{1,20})-(\d{1,20})-(\d{1,10})(?:_(\d{1,10}))?-([0-9a-f]{12})", ref or "")
+    if not match:
+        return None
+    body = f"{match[1]}-{match[2]}-{match[3]}" + (f"_{match[4]}" if match[4] else "")
+    if any(hmac.compare_digest(_sign(body, s), match[5]) for s in secrets):
+        return int(match[1]), int(match[2]), int(match[3]), (int(match[4]) if match[4] else None)
+    return None
 
 
 def parse_ref(ref: Optional[str], secrets: list[str]) -> Optional[tuple[int, int, int]]:
     """Returns (guild_id, user_id, product_id) if the reference is genuine, otherwise None."""
-    match = re.fullmatch(r"(\d{1,20})-(\d{1,20})-(\d{1,10})-([0-9a-f]{12})", ref or "")
-    if not match:
-        return None
-    body = f"{match[1]}-{match[2]}-{match[3]}"
-    if any(hmac.compare_digest(_sign(body, s), match[4]) for s in secrets):
-        return int(match[1]), int(match[2]), int(match[3])
-    return None
+    full = parse_ref_full(ref, secrets)
+    return full[:3] if full else None
 
 
 def tracked_url(url: str, ref: str) -> str:

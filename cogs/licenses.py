@@ -138,9 +138,16 @@ async def issue_for_order(guild_id: int, order, product) -> Optional[str]:
         return None
     if order["license_code"]:
         return order["license_code"]
-    if product is None or product["guild_id"] != guild_id or product["license_days"] is None:
+    if product is None or product["guild_id"] != guild_id:
         return None
-    code = await create_license(guild_id, product["license_days"] or None, user_id=order["user_id"], order_code=order["code"],
+    days = product["license_days"]
+    if order["option_id"]:  # bought a specific payment option: its length wins
+        option = await db.fetch_one("SELECT * FROM product_options WHERE id = ? AND product_id = ?", (order["option_id"], product["id"]))
+        if option is not None:
+            days = option["license_days"]
+    if days is None:
+        return None
+    code = await create_license(guild_id, days or None, user_id=order["user_id"], order_code=order["code"],
                                 note=f"Purchase of {order['product_name']}")
     await db.execute("UPDATE orders SET license_code = ? WHERE id = ?", (code, order["id"]))
     return code
