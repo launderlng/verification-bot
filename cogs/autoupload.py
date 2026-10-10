@@ -498,8 +498,10 @@ class AutoUpload(commands.Cog):
         # sent in -- putting the title in the embed (like the image case does) made it look stuck below the
         # video. So for a video/audio post, the title goes in the message content instead (always renders at the
         # very top) and the embed is left titleless, giving one clean flow: title, video, GIF, button.
-        title = None if (file_attach or extra_file) else row["pack_name"]
-        content = f"**{row['pack_name']}**" if (file_attach or extra_file) else None
+        # The directly-attached file (extra_file) is now sent as its own message under the post, so it no
+        # longer pushes the title down - only a video/audio preview still needs the title in the content.
+        title = None if file_attach else row["pack_name"]
+        content = f"**{row['pack_name']}**" if file_attach else None
         # A too-large preview just isn't shown, same as if there were no preview at all -- no warning text on
         # the public post. deliver is only set when the file went through the stored/Get-file path above --
         # when it's attached directly (extra_file), there's nothing to deliver, so no button.

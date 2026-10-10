@@ -62,8 +62,14 @@ class Draft:
         # title-like line ahead of a raw video/audio attachment instead of it looking stuck below one
 
     # photo / gif / file / extra_file are (name, bytes-or-None, size)
-    def files(self) -> list[discord.File]:
-        return [discord.File(io.BytesIO(item[1]), filename=item[0]) for item in (self.photo, self.gif, self.file, self.extra_file) if item and item[1] is not None]
+    def files(self, include_extra: bool = True) -> list[discord.File]:
+        items = (self.photo, self.gif, self.file, self.extra_file) if include_extra else (self.photo, self.gif, self.file)
+        return [discord.File(io.BytesIO(item[1]), filename=item[0]) for item in items if item and item[1] is not None]
+
+    def file_below(self) -> bool:
+        """The deliverable (extra_file) goes in its own message right under the post. Discord always draws a
+        message's attachments ABOVE its embeds, so sending it separately is the only way to get the file at the bottom."""
+        return bool(self.extra_file and self.extra_file[1] is not None)
 
     def embeds(self) -> list[discord.Embed]:
         color = self.color if self.color is not None else COLOR
@@ -92,7 +98,7 @@ class Draft:
             view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=self.button[0], url=self.button[1]))
         return view
 
-    def kwargs(self) -> dict:
+    def kwargs(self, include_extra: bool = True) -> dict:
         if self.ping or self.mention_all:
             mentions = discord.AllowedMentions(roles=[self.ping] if self.ping else False, users=False, everyone=bool(self.mention_all))
         else:
@@ -102,7 +108,7 @@ class Draft:
         content = " ".join(x for x in (self.content, mention_text) if x)
         if content:
             kw["content"] = content
-        files = self.files()
+        files = self.files(include_extra)
         if files:
             kw["files"] = files
         view = self.view()
@@ -143,7 +149,14 @@ def describe_post(draft: Draft) -> list:
 
 async def publish_draft(guild: discord.Guild, user, draft: Draft) -> discord.Message:
     """Send a post, record it so it can be edited later, and log it. Used by /post new and /post bulk."""
-    message = await draft.channel.send(**draft.kwargs())
+    below = draft.file_below()
+    message = await draft.channel.send(**draft.kwargs(include_extra=not below))
+    if below:  # the file goes underneath the card, image and GIF
+        name, data, _ = draft.extra_file
+        try:
+            await draft.channel.send(file=discord.File(io.BytesIO(data), filename=name), allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Couldn't post the file under post %s", message.id)
     await db.execute(
         "INSERT INTO posts (guild_id, channel_id, message_id, author_id, title, pack_name, file_name, created_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (guild.id, draft.channel.id, message.id, user.id, draft.title, draft.pack, draft.file[0] if draft.file else None, discord.utils.utcnow().isoformat(), draft.data()),
