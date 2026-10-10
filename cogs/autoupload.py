@@ -132,49 +132,60 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
 
         store_guild_id = post_channel.guild.id  # the file belongs to the server people actually claim it in
         taken = {r["name"].lower() for r in await db.fetch_all("SELECT name FROM stored_files WHERE guild_id = ?", (store_guild_id,))}
+
+        # A drop message is one file, one post. When staff forward a preview screenshot/clip ALONGSIDE the real
+        # file in the same message, the real (non-media) attachment is what gets stored and handed out by the
+        # Get-file button -- the image/video is shown inline as a preview only and is never itself claimable.
+        # When there's only a media attachment (no separate real file), it's used for both, same as before.
+        # Any attachment beyond these two roles is ignored outright (covers Discord occasionally attaching the
+        # same file to a message twice, which broke an earlier filename+size-based duplicate check).
+        def ctype_of(a: discord.Attachment) -> str:
+            return (a.content_type or mimetypes.guess_type(a.filename)[0] or "").lower()
+
+        media = [a for a in attachments if ctype_of(a).startswith(("image/", "video/", "audio/"))]
+        non_media = [a for a in attachments if a not in media]
+        preview_att = media[0] if media else None
+        deliver_att = non_media[0] if non_media else preview_att
+        if len(attachments) > (2 if (preview_att and deliver_att and preview_att is not deliver_att) else 1):
+            log.info("autoupload: message %s has %d attachments -- using preview=%s deliver=%s, ignoring the rest",
+                      message.id, len(attachments), preview_att.filename if preview_att else None, deliver_att.filename if deliver_att else None)
+
         posted, failed = [], []
-        # A drop message is one file, one post -- only the FIRST attachment on the message is ever used, no
-        # matter how many Discord says are on it (its own upload picker/drag-drop has repeatedly attached the
-        # same file to a message twice with different names/sizes, which broke matching on filename+size).
-        # Dropping two different files on purpose should be two separate messages.
-        if len(attachments) > 1:
-            log.info("autoupload: message %s has %d attachments -- only using the first (%s), ignoring the rest", message.id, len(attachments), attachments[0].filename)
-        for att in attachments[:1]:
-            # Atomic check-and-claim: if this exact (message, attachment) pair has already been processed --
-            # whether from a duplicate gateway event or two bot instances briefly overlapping during a deploy --
-            # this INSERT is ignored and we skip it, instead of posting the same upload twice.
+        if deliver_att is not None:
+            # Atomic check-and-claim: if this exact (message, deliverable attachment) pair has already been
+            # processed -- whether from a duplicate gateway event or two bot instances briefly overlapping
+            # during a deploy -- this INSERT is ignored and we skip it, instead of posting the same upload twice.
             claimed = await db.execute(
                 "INSERT OR IGNORE INTO processed_uploads (message_id, attachment_id, created_at) VALUES (?, ?, ?)",
-                (message.id, att.id, discord.utils.utcnow().isoformat()),
+                (message.id, deliver_att.id, discord.utils.utcnow().isoformat()),
             )
-            log.info("autoupload: claim attempt message %s attachment %s -> %s", message.id, att.id, "claimed" if claimed else "already processed, skipping")
-            if not claimed:
-                continue
-            try:
-                await self.ingest(message, att, row, post_channel, required_role, taken, store_guild_id)
-                posted.append(att.filename)
-            except UserError as e:
-                failed.append(f"**{att.filename}:** {e}")
-            except discord.HTTPException as e:
-                failed.append(f"**{att.filename}:** Discord wouldn't let me post that ({e.status}).")
+            log.info("autoupload: claim attempt message %s attachment %s -> %s", message.id, deliver_att.id, "claimed" if claimed else "already processed, skipping")
+            if claimed:
+                try:
+                    await self.ingest(message, preview_att, deliver_att, row, post_channel, required_role, taken, store_guild_id)
+                    posted.append(deliver_att.filename)
+                except UserError as e:
+                    failed.append(f"**{deliver_att.filename}:** {e}")
+                except discord.HTTPException as e:
+                    failed.append(f"**{deliver_att.filename}:** Discord wouldn't let me post that ({e.status}).")
 
         if posted:
             await message.add_reaction("✅")
         if failed:
             await message.reply(embed=ui.card("⚠️ Some files didn't make it", "\n".join(failed), color=WARN), mention_author=False)
 
-    async def ingest(self, message: discord.Message, att: discord.Attachment, row, post_channel: discord.TextChannel,
+    async def ingest(self, message: discord.Message, preview_att: Optional[discord.Attachment], deliver_att: discord.Attachment, row, post_channel: discord.TextChannel,
                       required_role: Optional[discord.Role], taken: set, store_guild_id: int) -> None:
-        check_filename(att.filename)
-        if att.size > max_file_bytes():
-            raise UserError(f"it's {human_size(att.size)}, over the {human_size(max_file_bytes())} limit")
-        if att.size > await self.room_left(store_guild_id):
+        check_filename(deliver_att.filename)
+        if deliver_att.size > max_file_bytes():
+            raise UserError(f"it's {human_size(deliver_att.size)}, over the {human_size(max_file_bytes())} limit")
+        if deliver_att.size > await self.room_left(store_guild_id):
             raise UserError(f"that would go over the {human_size(storage_cap_bytes())} storage limit")
-        if att.size > ATTACH_LIMIT and not public_base_url():
+        if deliver_att.size > ATTACH_LIMIT and not public_base_url():
             raise UserError(NEEDS_WEB)
 
-        name = clean_name(att.filename, taken)
-        data = await att.read()
+        name = clean_name(deliver_att.filename, taken)
+        data = await deliver_att.read()
         path = None
         stored_data = data
         if len(data) > ATTACH_LIMIT:
@@ -185,7 +196,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         await db.execute(
             "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (store_guild_id, name, att.filename, att.content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
+            (store_guild_id, name, deliver_att.filename, deliver_att.content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
              required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path),
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
@@ -195,29 +206,37 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         # attachment is given a clean generic name (not the messy original filename), and show_file_field=False
         # hides the "📎 File <name>" text Draft.embeds() would otherwise add -- the point is a clean post with no
         # filename text visible anywhere, just the pack name, the preview, and the Get-file button.
-        ext = Path(att.filename).suffix.lower()
-        # Discord doesn't always send a content_type for every attachment (some video containers come through
-        # with none at all) -- fall back to guessing from the file extension so a real video isn't silently
-        # treated as "unknown" and skipped.
-        ctype = (att.content_type or mimetypes.guess_type(att.filename)[0] or "").lower()
-        clean_attach_name = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file") + ext
-        # Use the destination server's REAL upload limit (boost-tier aware), not just our static guess -- a file
-        # that fits our guess but not this server's actual cap would otherwise fail the whole send with an
-        # HTTPException, or (if our guess were too high) silently never get attempted.
-        inline_limit = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
         photo = file_attach = None
         too_large_for_preview = False
-        if len(data) <= inline_limit:
-            if ctype.startswith("image/"):
-                photo = (clean_attach_name, data, len(data))
-            elif ctype.startswith("video/") or ctype.startswith("audio/"):
-                file_attach = (clean_attach_name, data, len(data))
-        elif ctype.startswith(("image/", "video/", "audio/")):
-            too_large_for_preview = True
-        log.info(
-            "autoupload: ingest %s -- raw content_type=%r resolved ctype=%r size=%d inline_limit=%d -> photo=%s file_attach=%s too_large=%s",
-            att.filename, att.content_type, ctype, len(data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
-        )
+        too_large_size = too_large_limit = None
+        if preview_att is not None:
+            # preview_att is only ever something other than deliver_att when a real (non-media) file was
+            # forwarded alongside a preview image/video -- that image/video is shown inline here but is NEVER
+            # stored or claimable, only the real file above is. When there's no separate real file, preview_att
+            # IS deliver_att and its bytes are already in `data`, so no second read happens.
+            preview_data = data if preview_att is deliver_att else await preview_att.read()
+            ext = Path(preview_att.filename).suffix.lower()
+            # Discord doesn't always send a content_type for every attachment (some video containers come
+            # through with none at all) -- fall back to guessing from the file extension so a real video isn't
+            # silently treated as "unknown" and skipped.
+            ctype = (preview_att.content_type or mimetypes.guess_type(preview_att.filename)[0] or "").lower()
+            clean_attach_name = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file") + ext
+            # Use the destination server's REAL upload limit (boost-tier aware), not just our static guess -- a
+            # file that fits our guess but not this server's actual cap would otherwise fail the whole send with
+            # an HTTPException, or (if our guess were too high) silently never get attempted.
+            inline_limit = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
+            if len(preview_data) <= inline_limit:
+                if ctype.startswith("image/"):
+                    photo = (clean_attach_name, preview_data, len(preview_data))
+                elif ctype.startswith("video/") or ctype.startswith("audio/"):
+                    file_attach = (clean_attach_name, preview_data, len(preview_data))
+            elif ctype.startswith(("image/", "video/", "audio/")):
+                too_large_for_preview = True
+                too_large_size, too_large_limit = len(preview_data), inline_limit
+            log.info(
+                "autoupload: ingest preview=%s deliver=%s -- raw content_type=%r resolved ctype=%r size=%d inline_limit=%d -> photo=%s file_attach=%s too_large=%s",
+                preview_att.filename, deliver_att.filename, preview_att.content_type, ctype, len(preview_data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
+            )
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
         # like "V1" or "Cielo_15") -- no filename and no "Uploaded in #..." text shown anywhere in the public
@@ -237,7 +256,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         log_fields = [("👤 By", message.author.mention), ("📦 Stored as", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention)]
         if too_large_for_preview:
             # Not shown on the public post -- staff can see why a video/image had no inline preview here instead.
-            log_fields.append(("⚠️ No preview", f"{human_size(len(data))} is over the {human_size(inline_limit)} inline limit"))
+            log_fields.append(("⚠️ No preview", f"{human_size(too_large_size)} is over the {human_size(too_large_limit)} inline limit"))
         await emit(post_channel.guild, "files", "File auto-uploaded", ui.kv(*log_fields), subject=message.author.id)
 
     # ----------------------------------------------------------- commands ----
