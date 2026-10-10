@@ -1,7 +1,9 @@
 import asyncio
+import io
 import logging
 import mimetypes
 import re
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -339,59 +341,87 @@ class AutoUpload(commands.Cog):
         store_guild_id = post_channel.guild.id  # the file belongs to the server people actually claim it in
         taken = {r["name"].lower() for r in await db.fetch_all("SELECT name FROM stored_files WHERE guild_id = ?", (store_guild_id,))}
 
-        # A drop message is one file, one post. When staff forward a preview screenshot/clip ALONGSIDE the real
-        # file in the same message, the real (non-media) attachment is what gets stored and handed out by the
-        # Get-file button -- the image/video is shown inline as a preview only and is never itself claimable.
-        # When there's only a media attachment (no separate real file), it's used for both, same as before.
-        # Any attachment beyond these two roles is ignored outright (covers Discord occasionally attaching the
-        # same file to a message twice, which broke an earlier filename+size-based duplicate check).
+        # A drop message is one post, but can carry MULTIPLE real files (e.g. a giveaway forward with several
+        # .zip/.rar attachments) -- those all get zipped together into a single archive, stored as one
+        # stored_files row, and handed out behind ONE Get-file button. When staff forward a preview
+        # screenshot/clip ALONGSIDE the real file(s) in the same message, that image/video is shown inline as a
+        # preview only and is never itself stored/claimable. When there's only a media attachment (no separate
+        # real file), it's used for both, same as before.
         def ctype_of(a: discord.Attachment) -> str:
             return (a.content_type or mimetypes.guess_type(a.filename)[0] or "").lower()
 
         media = [a for a in attachments if ctype_of(a).startswith(("image/", "video/", "audio/"))]
         non_media = [a for a in attachments if a not in media]
         preview_att = media[0] if media else None
-        deliver_att = non_media[0] if non_media else preview_att
-        if len(attachments) > (2 if (preview_att and deliver_att and preview_att is not deliver_att) else 1):
-            log.info("autoupload: message %s has %d attachments -- using preview=%s deliver=%s, ignoring the rest",
-                      message.id, len(attachments), preview_att.filename if preview_att else None, deliver_att.filename if deliver_att else None)
+        deliver_atts = non_media if non_media else ([preview_att] if preview_att else [])
+        if len(media) > 1:
+            log.info("autoupload: message %s has %d media attachment(s) -- using %s as the preview, ignoring the rest",
+                      message.id, len(media), preview_att.filename if preview_att else None)
 
         posted, failed = [], []
-        if deliver_att is not None:
-            # Atomic check-and-claim: if this exact (message, deliverable attachment) pair has already been
-            # processed -- whether from a duplicate gateway event or two bot instances briefly overlapping
-            # during a deploy -- this INSERT is ignored and we skip it, instead of posting the same upload twice.
+        if deliver_atts:
+            # Atomic check-and-claim keyed on the MESSAGE, not a single attachment -- one drop message is one
+            # claim, however many files it carries. Attachment id 0 is a sentinel ("whole message"), never a
+            # real Discord snowflake, so it can't collide with the old per-attachment rows this table used to
+            # get before bundling existed. Stops a duplicate gateway event, or two bot instances briefly
+            # overlapping during a deploy, from posting the same drop twice.
             claimed = await db.execute(
                 "INSERT OR IGNORE INTO processed_uploads (message_id, attachment_id, created_at) VALUES (?, ?, ?)",
-                (message.id, deliver_att.id, discord.utils.utcnow().isoformat()),
+                (message.id, 0, discord.utils.utcnow().isoformat()),
             )
-            log.info("autoupload: claim attempt message %s attachment %s -> %s", message.id, deliver_att.id, "claimed" if claimed else "already processed, skipping")
+            names = ", ".join(a.filename for a in deliver_atts)
+            log.info("autoupload: claim attempt message %s (%d deliverable file(s): %s) -> %s", message.id, len(deliver_atts), names, "claimed" if claimed else "already processed, skipping")
             if claimed:
                 try:
-                    await self.ingest(message, preview_att, deliver_att, row, post_channel, required_role, taken, store_guild_id)
-                    posted.append(deliver_att.filename)
+                    await self.ingest(message, preview_att, deliver_atts, row, post_channel, required_role, taken, store_guild_id)
+                    posted.append(names)
                 except UserError as e:
-                    failed.append(f"**{deliver_att.filename}:** {e}")
+                    failed.append(f"**{names}:** {e}")
                 except discord.HTTPException as e:
-                    failed.append(f"**{deliver_att.filename}:** Discord wouldn't let me post that ({e.status}).")
+                    failed.append(f"**{names}:** Discord wouldn't let me post that ({e.status}).")
 
         if posted:
             await message.add_reaction("✅")
         if failed:
             await message.reply(embed=ui.card("⚠️ Some files didn't make it", "\n".join(failed), color=WARN), mention_author=False)
 
-    async def ingest(self, message: discord.Message, preview_att: Optional[discord.Attachment], deliver_att: discord.Attachment, row, post_channel: discord.TextChannel,
+    async def ingest(self, message: discord.Message, preview_att: Optional[discord.Attachment], deliver_atts: list[discord.Attachment], row, post_channel: discord.TextChannel,
                       required_role: Optional[discord.Role], taken: set, store_guild_id: int) -> None:
-        check_filename(deliver_att.filename)
-        if deliver_att.size > max_file_bytes():
-            raise UserError(f"it's {human_size(deliver_att.size)}, over the {human_size(max_file_bytes())} limit")
-        if deliver_att.size > await self.room_left(store_guild_id):
+        for a in deliver_atts:
+            check_filename(a.filename)
+        total_declared = sum(a.size for a in deliver_atts)
+        if total_declared > max_file_bytes():
+            raise UserError(f"that's {human_size(total_declared)} total, over the {human_size(max_file_bytes())} limit")
+        if total_declared > await self.room_left(store_guild_id):
             raise UserError(f"that would go over the {human_size(storage_cap_bytes())} storage limit")
-        if deliver_att.size > ATTACH_LIMIT and not public_base_url():
+        if total_declared > ATTACH_LIMIT and not public_base_url():
             raise UserError(NEEDS_WEB)
 
-        name = clean_name(deliver_att.filename, taken)
-        data = await deliver_att.read()
+        single = len(deliver_atts) == 1
+        if single:
+            deliver_att = deliver_atts[0]
+            data = await deliver_att.read()
+            out_filename = deliver_att.filename
+            content_type = deliver_att.content_type
+        else:
+            # More than one real file dropped together -- zip them into one archive so there's still only ever
+            # one stored file and one Get-file button, same as the single-file case.
+            buf = io.BytesIO()
+            used = set()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for a in deliver_atts:
+                    entry, n = a.filename, 2
+                    while entry.lower() in used:
+                        stem, dot, ext = a.filename.rpartition(".")
+                        entry = f"{stem}-{n}.{ext}" if dot else f"{a.filename}-{n}"
+                        n += 1
+                    used.add(entry.lower())
+                    zf.writestr(entry, await a.read())
+            data = buf.getvalue()
+            out_filename = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "files") + ".zip"
+            content_type = "application/zip"
+
+        name = clean_name(out_filename, taken)
         path = None
         stored_data = data
         if len(data) > ATTACH_LIMIT:
@@ -402,7 +432,7 @@ class AutoUpload(commands.Cog):
         await db.execute(
             "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (store_guild_id, name, deliver_att.filename, deliver_att.content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
+            (store_guild_id, name, out_filename, content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
              required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path),
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
@@ -416,11 +446,12 @@ class AutoUpload(commands.Cog):
         too_large_for_preview = False
         too_large_size = too_large_limit = None
         if preview_att is not None:
-            # preview_att is only ever something other than deliver_att when a real (non-media) file was
-            # forwarded alongside a preview image/video -- that image/video is shown inline here but is NEVER
-            # stored or claimable, only the real file above is. When there's no separate real file, preview_att
-            # IS deliver_att and its bytes are already in `data`, so no second read happens.
-            preview_data = data if preview_att is deliver_att else await preview_att.read()
+            # preview_att is only ever something other than the sole deliverable when a real (non-media) file
+            # was forwarded alongside a preview image/video -- that image/video is shown inline here but is
+            # NEVER stored or claimable, only the real file(s) above are. When there's no separate real file,
+            # preview_att IS the (single) deliverable and its bytes are already in `data`, so no second read
+            # happens.
+            preview_data = data if (single and preview_att is deliver_atts[0]) else await preview_att.read()
             ext = Path(preview_att.filename).suffix.lower()
             # Discord doesn't always send a content_type for every attachment (some video containers come
             # through with none at all) -- fall back to guessing from the file extension so a real video isn't
@@ -441,7 +472,7 @@ class AutoUpload(commands.Cog):
                 too_large_size, too_large_limit = len(preview_data), inline_limit
             log.info(
                 "autoupload: ingest preview=%s deliver=%s -- raw content_type=%r resolved ctype=%r size=%d inline_limit=%d -> photo=%s file_attach=%s too_large=%s",
-                preview_att.filename, deliver_att.filename, preview_att.content_type, ctype, len(preview_data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
+                preview_att.filename, out_filename, preview_att.content_type, ctype, len(preview_data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
             )
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
@@ -455,7 +486,10 @@ class AutoUpload(commands.Cog):
         # very top) and the embed is left titleless, giving one clean flow: title, video, GIF, button.
         title = None if file_attach else row["pack_name"]
         content = f"**{row['pack_name']}**" if file_attach else None
-        draft = Draft(post_channel, title, None, None, None,
+        # If the preview itself was too big to attach inline, say so right on the post instead of the preview
+        # just silently not being there -- otherwise it looks like the upload failed when it didn't.
+        description = f"⚠️ Preview is {human_size(too_large_size)}, too large to show here ({human_size(too_large_limit)} limit) — press **Get file** below." if too_large_for_preview else None
+        draft = Draft(post_channel, title, description, None, None,
                        photo=photo, file=file_attach, gif_url=row["gif_url"],
                        deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
