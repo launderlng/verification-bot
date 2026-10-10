@@ -121,7 +121,12 @@ async def file_payload(user: discord.abc.User, guild: discord.Guild, f, embed: O
             return None
         url = f"{base}/dl/{make_token(f['id'], user.id, link_key())}"
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Download", emoji="⬇️", url=url))
-    kwargs["embed"] = embed if embed is not None else dm_card(guild, f, title, note, linked=linked)
+    main_embed = embed if embed is not None else dm_card(guild, f, title, note, linked=linked)
+    gif_url = f["gif_url"] if "gif_url" in f.keys() else None
+    if gif_url:
+        kwargs["embeds"] = [main_embed, ui.card(None, None, color=SUCCESS, image=gif_url)]
+    else:
+        kwargs["embed"] = main_embed
     channel_id = support_channel_id or (cfg["panel_channel_id"] if cfg else None)
     if channel_id:
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{channel_id}"))

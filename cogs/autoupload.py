@@ -400,10 +400,11 @@ class AutoUpload(commands.Cog):
             stored_data = b""
 
         await db.execute(
-            "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (store_guild_id, name, deliver_att.filename, deliver_att.content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
-             required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path),
+            "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path, gif_url) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (store_guild_id, name, deliver_att.filename, deliver_att.content_type, len(data), stored_data, None,
+             required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path,
+             row["gif_url"]),
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
 
