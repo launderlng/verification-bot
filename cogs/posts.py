@@ -47,10 +47,13 @@ class Draft:
 
     def __init__(self, channel, title: str, description: Optional[str], footer: Optional[str], color: Optional[int], photo=None, photo_url=None,
                  gif=None, gif_url=None, file=None, button=None, deliver=None, ping=None, pack: Optional[str] = None, mention_all: Optional[str] = None,
-                 show_file_field: bool = True, content: Optional[str] = None):
+                 show_file_field: bool = True, content: Optional[str] = None, extra_file=None):
         self.channel, self.title, self.description, self.footer, self.color = channel, title, description, footer, color
         self.photo, self.photo_url, self.gif, self.gif_url, self.file, self.button = photo, photo_url, gif, gif_url, file, button
         self.deliver = deliver  # (stored file id, name): a 📥 Get file button that DMs the file
+        self.extra_file = extra_file  # (name, bytes, size): a second raw attachment alongside self.file -- e.g.
+        # the real deliverable attached straight to the post when it's small enough, on top of a video preview
+        # already occupying self.file
         self.ping, self.pack = ping, pack  # a role to ping, and what pack this is (for the log)
         self.mention_all = mention_all  # 'everyone' or 'here'
         self.show_file_field = show_file_field  # False hides the "📎 File <name>" field even when self.file is set
@@ -58,9 +61,9 @@ class Draft:
         # raw file attachments) above any embeds, regardless of API call order, so this is the only way to put a
         # title-like line ahead of a raw video/audio attachment instead of it looking stuck below one
 
-    # photo / gif / file are (name, bytes-or-None, size)
+    # photo / gif / file / extra_file are (name, bytes-or-None, size)
     def files(self) -> list[discord.File]:
-        return [discord.File(io.BytesIO(item[1]), filename=item[0]) for item in (self.photo, self.gif, self.file) if item and item[1] is not None]
+        return [discord.File(io.BytesIO(item[1]), filename=item[0]) for item in (self.photo, self.gif, self.file, self.extra_file) if item and item[1] is not None]
 
     def embeds(self) -> list[discord.Embed]:
         color = self.color if self.color is not None else COLOR
@@ -114,6 +117,7 @@ class Draft:
             "photo": [self.photo[0], self.photo[2]] if self.photo else None, "photo_url": self.photo_url,
             "gif": [self.gif[0], self.gif[2]] if self.gif else None, "gif_url": self.gif_url,
             "file": [self.file[0], self.file[2]] if self.file else None, "button": list(self.button) if self.button else None,
+            "extra_file": [self.extra_file[0], self.extra_file[2]] if self.extra_file else None,
             "deliver": list(self.deliver) if self.deliver else None, "ping": self.ping.id if self.ping else None, "pack": self.pack, "mention_all": self.mention_all,
             "content": self.content,
         })
@@ -124,6 +128,7 @@ class Draft:
         ping = guild.get_role(d["ping"]) if d.get("ping") else None
         return cls(channel, d["title"], d["description"], d["footer"], d["color"], photo=(d["photo"][0], None, d["photo"][1]) if d["photo"] else None, photo_url=d["photo_url"],
                    gif=(d["gif"][0], None, d["gif"][1]) if d["gif"] else None, gif_url=d["gif_url"], file=(d["file"][0], None, d["file"][1]) if d["file"] else None,
+                   extra_file=(d["extra_file"][0], None, d["extra_file"][1]) if d.get("extra_file") else None,
                    content=d.get("content"),
                    button=tuple(d["button"]) if d["button"] else None, deliver=tuple(d["deliver"]) if d["deliver"] else None, ping=ping, pack=d.get("pack"), mention_all=d.get("mention_all"))
 
