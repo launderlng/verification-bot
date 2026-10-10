@@ -36,13 +36,14 @@ except ImportError:  # cogs/licenses.py isn't uploaded yet: the shop still works
 
     async def set_active_for_order(order, active):
         return False
-from stripeutil import format_amount, make_ref, parse_ref, tracked_url, verify_signature, webhook_secrets
+from stripeutil import format_amount, make_ref, parse_ref_full, tracked_url, verify_signature, webhook_secrets
 
 log = logging.getLogger("verification-bot")
 
 DEFAULT_BUTTON = "Buy now"
 DEFAULT_FOOTER = "🔒 Secure checkout by Stripe"
 MAX_PRODUCTS = 25  # Discord autocomplete shows 25 choices at most
+MAX_OPTIONS = 4    # payment options per product (one Buy button each)
 KEY_CHOICES = [app_commands.Choice(name=n, value=v) for n, v in
                (("1 Day", "1day"), ("1 Week", "1week"), ("1 Month", "1month"), ("Lifetime", "lifetime"), ("No key", "none"))]
 HANDLED_EVENTS = {"checkout.session.completed", "checkout.session.async_payment_succeeded"}
@@ -98,7 +99,7 @@ def pick(*values):
     return None
 
 
-def build_product(guild: discord.Guild, p, shop, rating=None) -> discord.Embed:
+def build_product(guild: discord.Guild, p, shop, rating=None, options=None) -> discord.Embed:
     """A branded product card: a status banner, a wide price field, and a clean rating line."""
     color_hex = pick(p["color"], shop["color"] if shop else None)
     color = int(color_hex, 16) if color_hex else ACCENT.value
@@ -111,7 +112,9 @@ def build_product(guild: discord.Guild, p, shop, rating=None) -> discord.Embed:
         perks.append("📥 Instant delivery by DM")
     if p["role_id"]:
         perks.append(f"🎭 Unlocks <@&{p['role_id']}>")
-    if p["license_days"] is not None:
+    if options and any(o["license_days"] is not None for o in options):
+        perks.append("🔑 Key included")
+    elif p["license_days"] is not None:
         perks.append(f"🔑 {length_label(p['license_days'])} key")
     banner_line = banner + ("  ·  " + "  ·  ".join(perks) if perks else "")
 
@@ -124,33 +127,73 @@ def build_product(guild: discord.Guild, p, shop, rating=None) -> discord.Embed:
         footer="🔒 " + pick(shop["footer"] if shop else None, DEFAULT_FOOTER),
         image=p["image_url"] or None,
     )
-    embed.add_field(name="💰 Price", value=f"## {p['price'] or 'See checkout'}", inline=True)
+    if options:
+        embed.add_field(name="💰 Options", value="\n".join(f"**{o['label']}** · {o['price'] or 'See checkout'}" for o in options), inline=True)
+    else:
+        embed.add_field(name="💰 Price", value=f"## {p['price'] or 'See checkout'}", inline=True)
     embed.add_field(name="⭐ Rating", value=ui.rating_line(average, count), inline=True)
     return embed
 
 
-def buy_item(p, shop):
-    """The Buy button: tracked (personal link) when the webhook is on, otherwise a plain link."""
-    label = pick(p["button_label"], shop["button_label"] if shop else None, DEFAULT_BUTTON)
+def buy_item(p, shop, option=None):
+    """The Buy button: tracked (personal link) when the webhook is on, otherwise a plain link.
+    With a payment option (e.g. 1 Week) the button is for that option and shows its price."""
+    if option is not None:
+        label = f"{option['label']} · {option['price']}" if option["price"] else option["label"]
+        url = option["buy_url"]
+    else:
+        label = pick(p["button_label"], shop["button_label"] if shop else None, DEFAULT_BUTTON)
+        url = p["buy_url"]
+    label = (label if p["available"] else "Sold out")[:80]
     if webhook_secrets():
-        return BuyButton(p["id"], label if p["available"] else "Sold out", disabled=not p["available"])
-    return discord.ui.Button(
-        style=discord.ButtonStyle.link, label=label if p["available"] else "Sold out", emoji="🛒",
-        url=p["buy_url"], disabled=not p["available"],
-    )
+        return BuyButton(p["id"], label, disabled=not p["available"], option_id=option["id"] if option is not None else None)
+    if not url:
+        return discord.ui.Button(style=discord.ButtonStyle.secondary, label="Not available yet", disabled=True)
+    return discord.ui.Button(style=discord.ButtonStyle.link, label=label, emoji="🛒", url=url, disabled=not p["available"])
 
 
-def build_view(p, shop) -> discord.ui.View:
+def build_view(p, shop, options=None) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(buy_item(p, shop))
+    if options:
+        for o in options[:MAX_OPTIONS]:
+            view.add_item(buy_item(p, shop, o))
+    else:
+        view.add_item(buy_item(p, shop))
     return view
 
 
+async def get_options(product_id: int) -> list:
+    return await db.fetch_all("SELECT * FROM product_options WHERE product_id = ? ORDER BY position, id", (product_id,))
+
+
 async def product_message(guild: discord.Guild, p) -> tuple:
-    """(embed, view) for a product, including its live star rating."""
+    """(embed, view) for a product, including its live star rating and payment options."""
     shop = await db.get_shop(guild.id)
     rating = await db.product_rating(guild.id, p["name"])
-    return build_product(guild, p, shop, rating), build_view(p, shop)
+    options = await get_options(p["id"])
+    return build_product(guild, p, shop, rating, options), build_view(p, shop, options)
+
+
+async def option_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """Options of the product picked in the same command."""
+    name = getattr(interaction.namespace, "product", None)
+    if not name or interaction.guild_id is None:
+        return []
+    p = await db.fetch_one("SELECT id FROM products WHERE guild_id = ? AND name = ?", (interaction.guild_id, name))
+    if not p:
+        return []
+    rows = await db.fetch_all("SELECT label, price FROM product_options WHERE product_id = ? AND label LIKE ? ORDER BY position, id",
+                              (p["id"], f"%{current}%"))
+    return [app_commands.Choice(name=f"{r['label']} · {r['price'] or '—'}"[:100], value=r["label"]) for r in rows[:25]]
+
+
+async def resolve_option(product, label: Optional[str]):
+    if not label:
+        return None
+    row = await db.fetch_one("SELECT * FROM product_options WHERE product_id = ? AND label = ?", (product["id"], label.strip()))
+    if not row:
+        raise UserError(f"**{product['name']}** has no option called **{label}**. See `/shop list`.")
+    return row
 
 
 async def product_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -256,18 +299,21 @@ async def find_order(guild_id: int, text: str):
 
 # ---------------------------------------------------------------- UI ----
 
-class BuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"shop:buy:(?P<id>[0-9]+)"):
-    """Persistent 'Buy now' button. Pressing it gives the buyer a personal Stripe link."""
+class BuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"shop:buy:(?P<id>[0-9]+)(?::(?P<opt>[0-9]+))?"):
+    """Persistent 'Buy now' button. Pressing it gives the buyer a personal Stripe link.
+    shop:buy:<product> is the product's own link, shop:buy:<product>:<option> one payment option."""
 
-    def __init__(self, product_id: int, label: str = DEFAULT_BUTTON, disabled: bool = False):
+    def __init__(self, product_id: int, label: str = DEFAULT_BUTTON, disabled: bool = False, option_id: Optional[int] = None):
         super().__init__(discord.ui.Button(
-            label=label, style=discord.ButtonStyle.success, emoji="🛒", custom_id=f"shop:buy:{product_id}", disabled=disabled,
+            label=label, style=discord.ButtonStyle.success, emoji="🛒", disabled=disabled,
+            custom_id=f"shop:buy:{product_id}" + (f":{option_id}" if option_id else ""),
         ))
         self.product_id = product_id
+        self.option_id = option_id
 
     @classmethod
     async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
-        return cls(int(match["id"]))
+        return cls(int(match["id"]), option_id=int(match["opt"]) if match["opt"] else None)
 
     async def callback(self, interaction: discord.Interaction):
         p = await db.get_product_by_id(self.product_id)
@@ -275,11 +321,21 @@ class BuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"shop:buy:(
             return await interaction.response.send_message("That product isn't available any more.", ephemeral=True)
         if not p["available"]:
             return await interaction.response.send_message("😔 That one is sold out right now.", ephemeral=True)
+        option = None
+        if self.option_id:
+            option = await db.fetch_one("SELECT * FROM product_options WHERE id = ? AND product_id = ?", (self.option_id, p["id"]))
+            if option is None:
+                return await interaction.response.send_message("That option isn't available any more. Check the card for the current ones.", ephemeral=True)
+        base_url = option["buy_url"] if option is not None else p["buy_url"]
+        if not base_url:
+            return await interaction.response.send_message("That isn't ready to buy yet. Check back soon!", ephemeral=True)
         known = webhook_secrets()
-        url = tracked_url(p["buy_url"], make_ref(interaction.guild_id, interaction.user.id, p["id"], known[0])) if known else p["buy_url"]
+        url = tracked_url(base_url, make_ref(interaction.guild_id, interaction.user.id, p["id"], known[0], self.option_id)) if known else base_url
+        title = f"{p['name']} · {option['label']}" if option is not None else p["name"]
+        price = (option["price"] if option is not None else p["price"]) or ""
         view = discord.ui.View()
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Continue to Stripe", emoji="💳", url=url))
-        embed = ui.card("💳 Ready to check out", f"**{p['name']}** · {p['price'] or ''}\n\n"
+        embed = ui.card("💳 Ready to check out", f"**{title}** · {price}\n\n"
                 "Press the button below to open Stripe's secure checkout page.\n"
                 "After you pay, I'll **DM you your Invoice ID**. Keep your DMs open, and you can always look it up later with `/myorders`.", color=COLOR, section="Shop")
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -334,7 +390,8 @@ class StoreSelect(discord.ui.Select):
             return await interaction.response.send_message("That product isn't available any more.", ephemeral=True)
         products = await db.fetch_all("SELECT * FROM products WHERE guild_id = ? ORDER BY name", (interaction.guild_id,))
         embed, _ = await product_message(interaction.guild, p)
-        await interaction.response.edit_message(embed=embed, view=StoreView(products, await db.get_shop(interaction.guild_id), selected=p))
+        await interaction.response.edit_message(embed=embed, view=StoreView(products, await db.get_shop(interaction.guild_id), selected=p,
+                                                                            options=await get_options(p["id"])))
 
 
 class BackButton(discord.ui.Button):
@@ -353,11 +410,15 @@ class BackButton(discord.ui.Button):
 class StoreView(discord.ui.View):
     """Catalogue with a dropdown. Picking a product shows its card, a Buy button and a way back."""
 
-    def __init__(self, products, shop, selected=None):
+    def __init__(self, products, shop, selected=None, options=None):
         super().__init__(timeout=300)
         self.add_item(StoreSelect(products, selected["id"] if selected else None))
         if selected:
-            self.add_item(buy_item(selected, shop))
+            if options:
+                for o in options[:MAX_OPTIONS]:
+                    self.add_item(buy_item(selected, shop, o))
+            else:
+                self.add_item(buy_item(selected, shop))
             self.add_item(BackButton())
 
 
@@ -404,9 +465,13 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         return web.Response(text="ok")
 
     async def insert_order(self, guild_id: int, user_id: int, product, amount, session_id: str, stripe_ref, livemode: bool,
-                           source: str = "stripe", note: Optional[str] = None, processed_by: Optional[int] = None) -> Optional[str]:
+                           source: str = "stripe", note: Optional[str] = None, processed_by: Optional[int] = None, option=None) -> Optional[str]:
         """Create the order and return its ID, or None if this payment was already recorded."""
         name = product["name"] if product and product["guild_id"] == guild_id else "Your purchase"
+        if option is not None and product and option["product_id"] == product["id"]:
+            name = f"{name} · {option['label']}"
+        else:
+            option = None
         file_id = product["file_id"] if product and product["guild_id"] == guild_id else None
         role_id = product["role_id"] if product and product["guild_id"] == guild_id else None
         for _ in range(8):
@@ -414,9 +479,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             try:
                 await db.execute(
                     "INSERT INTO orders (guild_id, code, user_id, product_id, product_name, amount, stripe_session_id, stripe_ref, livemode, created_at, file_id, source, note, role_id, "
-                    "processed_by, fulfillment, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "processed_by, fulfillment, processed_at, option_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (guild_id, code, user_id, product["id"] if product else None, name, amount, session_id, stripe_ref, int(livemode),
-                     discord.utils.utcnow().isoformat(), file_id, source, note, role_id, processed_by, "manual" if processed_by else "auto", discord.utils.utcnow().isoformat()),
+                     discord.utils.utcnow().isoformat(), file_id, source, note, role_id, processed_by, "manual" if processed_by else "auto", discord.utils.utcnow().isoformat(),
+                     option["id"] if option is not None else None),
                 )
                 return code
             except aiosqlite.IntegrityError:
@@ -424,11 +490,11 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
                     return None  # Stripe delivered the same event twice
         raise RuntimeError("Couldn't generate a unique order ID")
 
-    async def create_order(self, guild_id: int, user_id: int, product, session: dict, livemode: bool) -> Optional[str]:
+    async def create_order(self, guild_id: int, user_id: int, product, session: dict, livemode: bool, option=None) -> Optional[str]:
         session_id = session["id"]
         return await self.insert_order(
             guild_id, user_id, product, format_amount(session.get("amount_total"), session.get("currency")), session_id,
-            session.get("invoice") or session.get("payment_intent") or session_id, livemode,
+            session.get("invoice") or session.get("payment_intent") or session_id, livemode, option=option,
         )
 
     # --------------------------------------------------- receipt + file DM ----
@@ -535,11 +601,11 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         # Delayed payment methods (e.g. bank debits) complete later and send async_payment_succeeded instead
         if session.get("payment_status") != "paid" or not session.get("id"):
             return
-        parsed = parse_ref(session.get("client_reference_id"), webhook_secrets())
+        parsed = parse_ref_full(session.get("client_reference_id"), webhook_secrets())
         if not parsed:
             log.info("Ignoring a Stripe payment that didn't come from a Buy button")
             return
-        guild_id, user_id, product_id = parsed
+        guild_id, user_id, product_id, option_id = parsed
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             log.warning("Got a payment for guild %s, which the bot isn't in", guild_id)
@@ -549,7 +615,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
 
         livemode = bool(event.get("livemode", True))
         product = await db.get_product_by_id(product_id)
-        code = await self.create_order(guild_id, user_id, product, session, livemode)
+        option = await db.fetch_one("SELECT * FROM product_options WHERE id = ? AND product_id = ?", (option_id, product_id)) if option_id else None
+        code = await self.create_order(guild_id, user_id, product, session, livemode, option)
         if code is None:
             return
         details = session.get("customer_details") or {}
@@ -736,8 +803,9 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         amount="What they paid, e.g. $10 PayPal (default: the product's price)",
         note="A private note for staff (the buyer doesn't see it)",
         send="DM the buyer their receipt and file now (default: yes)",
+        option="Which payment option they bought (e.g. 1 Week), if the product has options",
     )
-    @app_commands.autocomplete(product=product_autocomplete)
+    @app_commands.autocomplete(product=product_autocomplete, option=option_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def createorder(
         self,
@@ -747,13 +815,18 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         amount: Optional[app_commands.Range[str, 1, 50]] = None,
         note: Optional[app_commands.Range[str, 1, 200]] = None,
         send: bool = True,
+        option: Optional[str] = None,
     ):
         if member.bot:
             raise UserError("Pick a real member, not a bot.")
         p = await resolve_product(interaction, product)
+        opt = await resolve_option(p, option)
+        if opt is None and await get_options(p["id"]):
+            raise UserError(f"**{p['name']}** has payment options. Pick which one they bought with the `option` setting.")
         await interaction.response.defer(ephemeral=True)
         code = await self.insert_order(
-            interaction.guild_id, member.id, p, amount or p["price"], f"manual-{uuid.uuid4().hex}", None, True, source="manual", note=note, processed_by=interaction.user.id,
+            interaction.guild_id, member.id, p, amount or (opt["price"] if opt is not None else None) or p["price"], f"manual-{uuid.uuid4().hex}", None, True,
+            source="manual", note=note, processed_by=interaction.user.id, option=opt,
         )
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (interaction.guild_id, code))
         if await issue_for_order(interaction.guild_id, order, p):
@@ -875,7 +948,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
     @app_commands.describe(
         name="Product name",
         price="Shown on the card, e.g. $9.99, £5/month or Free",
-        stripe_link="Your Stripe Payment Link (https://buy.stripe.com/...)",
+        stripe_link="Your Stripe Payment Link (leave empty if you'll add payment options with /shop addoption)",
         description="Short description (use /shop describe for multiple lines)",
         image_url="Product image (direct https link)",
         button_label="Button text for this product (default: Buy now)",
@@ -889,14 +962,14 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         interaction: discord.Interaction,
         name: app_commands.Range[str, 1, 100],
         price: app_commands.Range[str, 1, 50],
-        stripe_link: str,
+        stripe_link: Optional[str] = None,
         description: Optional[app_commands.Range[str, 1, 1000]] = None,
         image_url: Optional[str] = None,
         button_label: Optional[app_commands.Range[str, 1, 30]] = None,
         color: Optional[str] = None,
         license_key: Optional[str] = None,
     ):
-        link = stripe_url(stripe_link)
+        link = stripe_url(stripe_link) if stripe_link else ""
         key_days = None if license_key in (None, "none") else LENGTHS.get(license_key, 0)
         image = image_link(image_url) if image_url else None
         color_hex = f"{parse_color(color):06X}" if color else None
@@ -912,8 +985,9 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             raise UserError(f"You already have a product called **{name}**. Use `/shop edit` to change it.") from None
         p = await db.fetch_one("SELECT * FROM products WHERE guild_id = ? AND name = ?", (interaction.guild_id, name.strip()))
         embed, view = await product_message(interaction.guild, p)
+        nxt = "Publish it with `/shop post`." if link else "Now add its payment options with `/shop addoption`, then `/shop post` it."
         await interaction.response.send_message(
-            f"✅ Added **{p['name']}**. Here's how it looks. Publish it with `/shop post`.{test_note(link)}",
+            f"✅ Added **{p['name']}**. Here's how it looks. {nxt}{test_note(link)}",
             embed=embed, view=view, ephemeral=True,
         )
 
@@ -1039,6 +1113,9 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             posted = f"posted in <#{p['channel_id']}>" if p["channel_id"] and p["message_id"] else "not posted"
             mode = " · ⚠️ test link" if is_test_link(p["buy_url"]) else ""
             lines.append(f"{'✅' if p['available'] else '❌'} **{p['name']}** · {p['price'] or '—'} · {posted}{mode}")
+            for o in await get_options(p["id"]):
+                key = "" if o["license_days"] is None else f" · 🔑 {length_label(o['license_days'])}"
+                lines.append(f"　↳ {o['label']} · {o['price'] or '—'}{key}{' · ⚠️ test link' if is_test_link(o['buy_url']) else ''}")
         await interaction.response.send_message(embed=ui.card("🛒 Products", "\n".join(lines), guild=interaction.guild, section="Shop"), ephemeral=True)
 
     @app_commands.command(description="Delete a product (and its posted card)")
@@ -1049,7 +1126,58 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         await interaction.response.defer(ephemeral=True)
         await self.delete_post(interaction.guild, p)
         await db.execute("DELETE FROM products WHERE id = ?", (p["id"],))
+        await db.execute("DELETE FROM product_options WHERE product_id = ?", (p["id"],))
         await interaction.followup.send(f"🗑️ Removed **{p['name']}**.", ephemeral=True)
+
+    @app_commands.command(description="Add a payment option to a product (e.g. 1 Day / 1 Week), each with its own price and Stripe link")
+    @app_commands.describe(
+        product="Which product",
+        length="Macro key length this option gives (or No key)",
+        price="Price shown on its button, e.g. $3",
+        stripe_link="The Stripe Payment Link for THIS option (https://buy.stripe.com/...)",
+        label="Button name (default: the key length, e.g. 1 Week)",
+    )
+    @app_commands.autocomplete(product=product_autocomplete)
+    @app_commands.choices(length=KEY_CHOICES)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def addoption(self, interaction: discord.Interaction, product: str, length: str, price: app_commands.Range[str, 1, 30],
+                        stripe_link: str, label: Optional[app_commands.Range[str, 1, 40]] = None):
+        p = await resolve_product(interaction, product)
+        link = stripe_url(stripe_link)
+        days = None if length == "none" else LENGTHS.get(length, 0)
+        name = (label or (length_label(days) if days is not None else "Standard")).strip()
+        existing = await get_options(p["id"])
+        same = next((o for o in existing if o["label"].lower() == name.lower()), None)
+        if same is None and len(existing) >= MAX_OPTIONS:
+            raise UserError(f"A product can have {MAX_OPTIONS} options at most. Remove one with `/shop removeoption` first.")
+        if same is not None:
+            await db.execute("UPDATE product_options SET price = ?, buy_url = ?, license_days = ? WHERE id = ?", (price.strip(), link, days, same["id"]))
+            verb = "Updated"
+        else:
+            position = max([o["position"] for o in existing], default=-1) + 1
+            await db.execute("INSERT INTO product_options (guild_id, product_id, label, price, buy_url, license_days, position) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (interaction.guild_id, p["id"], name, price.strip(), link, days, position))
+            verb = "Added"
+        refreshed = await self.refresh_post(interaction.guild, p)
+        embed, view = await product_message(interaction.guild, p)
+        key = "no key" if days is None else f"a **{length_label(days)}** key"
+        await interaction.response.send_message(
+            f"✅ {verb} option **{name}** ({price.strip()}, gives {key}) on **{p['name']}**."
+            + (" The posted card was updated." if refreshed else " Publish it with `/shop post`.") + test_note(link),
+            embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(description="Remove a payment option from a product")
+    @app_commands.autocomplete(product=product_autocomplete, option=option_autocomplete)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def removeoption(self, interaction: discord.Interaction, product: str, option: str):
+        p = await resolve_product(interaction, product)
+        o = await resolve_option(p, option)
+        await db.execute("DELETE FROM product_options WHERE id = ?", (o["id"],))
+        refreshed = await self.refresh_post(interaction.guild, p)
+        left = await get_options(p["id"])
+        note = "" if left or p["buy_url"] else " ⚠️ It has no options left and no Stripe link, so add an option or a `stripe_link` with `/shop edit`."
+        await interaction.response.send_message(
+            f"🗑️ Removed **{o['label']}** from **{p['name']}**." + (" The posted card was updated." if refreshed else "") + note, ephemeral=True)
 
 
 @app_commands.guild_only()
