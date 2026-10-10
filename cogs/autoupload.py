@@ -399,10 +399,14 @@ class AutoUpload(commands.Cog):
             await asyncio.to_thread(Path(path).write_bytes, data)
             stored_data = b""
 
+        # description is left blank on purpose -- it used to say "Auto-added from #channel (guild)" and that
+        # showed up as a "📝 About" line on the DM card members get from the Get-file button, leaking exactly
+        # where the file came from. No description means ui.kv() (which dm_card() in cogs/files.py uses) skips
+        # that line entirely.
         await db.execute(
             "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (store_guild_id, name, deliver_att.filename, deliver_att.content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
+            (store_guild_id, name, deliver_att.filename, deliver_att.content_type, len(data), stored_data, None,
              required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path),
         )
         file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
