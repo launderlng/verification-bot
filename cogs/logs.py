@@ -131,6 +131,39 @@ class LogsDashboard(discord.ui.View):
         await self.cog.refresh_dashboard(interaction, note=f"🧪 Sent a test message to {sent} channel(s)." if sent else "🧪 Nothing to test yet. Press **⚡ Set up everything** first.")
 
 
+class ConfirmLogCleanup(discord.ui.View):
+    """Two-step: the preview shows exactly what will go, nothing happens until Confirm."""
+
+    def __init__(self, cog: "Logs", owner_id: int, what: str):
+        super().__init__(timeout=120)
+        self.cog, self.owner_id, self.what = cog, owner_id, what
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the person who ran the command can confirm it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Clean up", emoji="🧹", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(embed=ui.card("🧹 Cleaning up…", "This takes a few seconds per channel."), view=None)
+        emptied, failed, cleared = await self.cog.clean_logs(interaction.guild, self.what, interaction.user)
+        lines = []
+        if self.what in ("all", "channels"):
+            lines.append(f"📭 **{emptied}** log channel{'s' if emptied != 1 else ''} emptied (fresh copies, same name, place and permissions)")
+            if failed:
+                lines.append(f"⚠️ {failed} couldn't be emptied. I need **Manage Channels** there")
+        if self.what in ("all", "history"):
+            lines.append(f"🗂️ **{cleared:,}** saved log entries cleared (used by `/logs search`)")
+        await interaction.edit_original_response(embed=ui.card("✅ Logs cleaned up", "\n".join(lines), color=SUCCESS, guild=interaction.guild, section="Logs"))
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(embed=ui.card("Cancelled", "Nothing was removed."), view=None)
+
+
 # --------------------------------------------------------------------- cog ----
 
 @app_commands.guild_only()
@@ -292,6 +325,72 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         return (user.display_name if hasattr(user, "display_name") else user.name, user.display_avatar.url)
 
     # --------------------------------------------------------- commands ----
+
+    async def log_channels(self, guild: discord.Guild) -> list:
+        """Every channel logs are going to right now."""
+        cfg = await db.get_config(guild.id)
+        ids = {r["channel_id"] for r in await db.fetch_all(
+            "SELECT DISTINCT channel_id FROM log_routes WHERE guild_id = ? AND channel_id IS NOT NULL", (guild.id,))}
+        if cfg and cfg["log_channel_id"]:
+            ids.add(cfg["log_channel_id"])
+        return [c for c in (guild.get_channel(i) for i in ids) if isinstance(c, discord.TextChannel)]
+
+    async def clean_logs(self, guild: discord.Guild, what: str, actor: discord.abc.User) -> tuple:
+        """Returns (channels emptied, channels that failed, history rows cleared)."""
+        emptied = failed = cleared = 0
+        if what in ("all", "channels"):
+            cfg = await db.get_config(guild.id)
+            for old in await self.log_channels(guild):
+                # A fresh copy is instant and complete; deleting messages one by one would take hours and
+                # Discord won't bulk-delete anything older than 14 days.
+                try:
+                    new = await old.clone(reason=f"Log cleanup by {actor}")
+                    await new.edit(position=old.position)
+                    await old.delete(reason=f"Log cleanup by {actor}")
+                except discord.HTTPException:
+                    failed += 1
+                    continue
+                await db.execute("UPDATE log_routes SET channel_id = ? WHERE guild_id = ? AND channel_id = ?", (new.id, guild.id, old.id))
+                if cfg and cfg["log_channel_id"] == old.id:
+                    await db.upsert_config(guild.id, log_channel_id=new.id)
+                emptied += 1
+        if what in ("all", "history"):
+            row = await db.fetch_one("SELECT COUNT(*) AS c FROM log_history WHERE guild_id = ?", (guild.id,))
+            cleared = row["c"] if row else 0
+            await db.execute("DELETE FROM log_history WHERE guild_id = ?", (guild.id,))
+        await emit(guild, "staff", "🧹 Logs cleaned up",
+                   ui.kv(("🛡️ By", actor.mention), ("📭 Channels emptied", str(emptied) if what != "history" else None),
+                         ("🗂️ History cleared", f"{cleared:,} entries" if what != "channels" else None)), subject=actor.id)
+        return emptied, failed, cleared
+
+    @app_commands.command(description="Clean up logs: empty every log channel and/or clear saved log history (asks first)")
+    @app_commands.describe(what="What to clean up")
+    @app_commands.choices(what=[
+        app_commands.Choice(name="Everything (empty all log channels + clear saved history)", value="all"),
+        app_commands.Choice(name="Empty all log channels", value="channels"),
+        app_commands.Choice(name="Only the saved history used by /logs search", value="history"),
+    ])
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def cleanup(self, interaction: discord.Interaction, what: str = "all"):
+        channels = await self.log_channels(interaction.guild)
+        history = (await db.fetch_one("SELECT COUNT(*) AS c FROM log_history WHERE guild_id = ?", (interaction.guild_id,)))["c"]
+        lines = []
+        if what in ("all", "channels"):
+            if not channels:
+                lines.append("📭 No log channels are set up.")
+            else:
+                lines.append(f"📭 **Empty {len(channels)} log channel{'s' if len(channels) != 1 else ''}**: each is swapped for a fresh copy "
+                             "with the same name, position and permissions, so logging carries on as normal.")
+                lines.append(" ".join(c.mention for c in channels[:30]) + (" …" if len(channels) > 30 else ""))
+                if not interaction.guild.me.guild_permissions.manage_channels:
+                    lines.append("⚠️ I need the **Manage Channels** permission for this.")
+        if what in ("all", "history"):
+            lines.append(f"🗂️ **Clear {history:,} saved log entries** (what `/logs search` looks through).")
+        lines.append("\nOld log messages can't be brought back afterwards. Settings, tickets, orders and keys are **not** touched.")
+        nothing = (what == "channels" and not channels) or (what == "history" and not history) or (what == "all" and not channels and not history)
+        await interaction.response.send_message(
+            embed=ui.card("🧹 Log cleanup preview", "\n".join(lines), color=WARN, guild=interaction.guild, section="Logs"),
+            view=None if nothing else ConfirmLogCleanup(self, interaction.user.id, what), ephemeral=True)
 
     @app_commands.command(description="Set up logging with one screen (channels, what to log, test)")
     @app_commands.describe(channel="Optional: send logs to this one channel")

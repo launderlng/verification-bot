@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from datetime import timedelta
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -8,7 +10,7 @@ from discord.ext import commands
 import db
 import ui
 from cogs.files import delete_disk_file
-from common import SUCCESS, WARN
+from common import SUCCESS, WARN, UserError
 from logutil import emit
 
 log = logging.getLogger("verification-bot")
@@ -122,5 +124,67 @@ class Cleanup(commands.Cog):
         )
 
 
+# Bot DMs worth keeping by default: purchase receipts and anything with a macro key in it.
+KEEP_TITLES = ("payment received", "order confirmed", "macro key", "your keys", "your purchases")
+
+
+def is_receipt(message: discord.Message) -> bool:
+    for e in message.embeds:
+        text = " ".join(filter(None, [e.title or "", *(f.name or "" for f in e.fields)])).lower()
+        if any(k in text for k in KEEP_TITLES):
+            return True
+    return False
+
+
+@app_commands.guild_only()
+class ClearDMs(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(description="Delete the messages I've sent you by DM (admins can clear a member's)")
+    @app_commands.describe(
+        member="Admins only: clear this member's DMs from me instead of your own",
+        keep_receipts="Keep purchase receipts and macro key messages (default: yes)",
+    )
+    async def cleardms(self, interaction: discord.Interaction, member: Optional[discord.Member] = None, keep_receipts: bool = True):
+        target = member or interaction.user
+        if target.id != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
+            raise UserError("Only admins can clear someone else's DMs. Leave `member` empty to clear your own.")
+        if target.bot:
+            raise UserError("Bots don't have DMs with me.")
+        await interaction.response.defer(ephemeral=True)
+        try:
+            dm = target.dm_channel or await target.create_dm()
+        except discord.HTTPException:
+            raise UserError("I couldn't open that DM.") from None
+        deleted = kept = 0
+        try:
+            async for message in dm.history(limit=500):
+                if message.author.id != self.bot.user.id:
+                    continue  # I can only delete my own messages
+                if keep_receipts and is_receipt(message):
+                    kept += 1
+                    continue
+                try:
+                    await message.delete()
+                    deleted += 1
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(0.4)  # DMs can't be bulk-deleted, so go gently
+        except discord.HTTPException:
+            pass
+        whose = "your" if target.id == interaction.user.id else f"{target.mention}'s"
+        body = f"🗑️ Deleted **{deleted}** of my messages from {whose} DMs."
+        if kept:
+            body += f"\n🧾 Kept **{kept}** receipt/key message{'s' if kept != 1 else ''}. Run again with `keep_receipts:False` to remove them too."
+        body += "\n\nOnly my messages can be deleted. Anything you sent stays, and Discord may take a moment to update."
+        if target.id != interaction.user.id:
+            await emit(interaction.guild, "staff", "🧹 Bot DMs cleared",
+                       ui.kv(("👤 Member", f"{target.mention} · `{target.id}`"), ("🛡️ By", interaction.user.mention), ("🗑️ Deleted", str(deleted)),
+                             ("🧾 Kept receipts", "yes" if keep_receipts else "no")), subject=target.id)
+        await interaction.followup.send(embed=ui.card("🧹 DMs cleared", body, color=SUCCESS, guild=interaction.guild), ephemeral=True)
+
+
 async def setup(bot: commands.Bot):
+    await bot.add_cog(ClearDMs(bot))
     await bot.add_cog(Cleanup())
