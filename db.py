@@ -517,6 +517,7 @@ MIGRATIONS = [
     ("posts", "data", "TEXT"),
     ("products", "license_days", "INTEGER"),
     ("orders", "license_code", "TEXT"),
+    ("licenses", "duration_days", "INTEGER"),
 ]
 
 

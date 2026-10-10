@@ -3,8 +3,8 @@
 * The macro checks a key with  POST /api/activate  (form field `code`) and gets back
   `OK|LICENSE VALID` or `DENIED|<reason>` - the same format the old website used, so the
   macro only needs the bot's web address.
-* Products can hand out a key automatically: `/shop edit product:<name> license_days:<n>`
-  (0 = lifetime). Every Stripe purchase or /shop createorder for that product gets a fresh
+* Products can hand out a key automatically: `/shop edit product:<name> license_key:<length>`
+  (1 Day / 1 Week / 1 Month / Lifetime; timed keys start on their first login). Every Stripe purchase or /shop createorder for that product gets a fresh
   key in the receipt DM.
 * Admins manage keys with /key ..., members see theirs with /mykeys.
 * Discord linking (on once DISCORD_CLIENT_SECRET is set): before a key works, the macro must
@@ -49,6 +49,18 @@ PENDING_MINUTES = 10     # how long a not-yet-authorized link session stays usab
 DISCORD_API = "https://discord.com/api/v10"
 INVITE = os.getenv("DISCORD_INVITE", "discord.gg/xzxx")
 
+# Key lengths offered in /shop and /key. Timed keys start counting at the buyer's FIRST macro
+# login, so a key bought late at night still gets its full time.
+LENGTHS = {"1day": 1, "1week": 7, "1month": 30, "lifetime": 0}
+LENGTH_CHOICES = [app_commands.Choice(name="1 Day", value="1day"), app_commands.Choice(name="1 Week", value="1week"),
+                  app_commands.Choice(name="1 Month", value="1month"), app_commands.Choice(name="Lifetime", value="lifetime")]
+
+
+def length_label(days: Optional[int]) -> str:
+    if not days:
+        return "Lifetime"
+    return {1: "1 Day", 7: "1 Week", 30: "1 Month"}.get(days, f"{days} Days")
+
 
 # ------------------------------------------------------------ helpers ----
 
@@ -77,6 +89,8 @@ def parse_time(value) -> Optional[datetime]:
 def expiry_text(row) -> str:
     exp = parse_time(row["expires_at"])
     if exp is None:
+        if row["duration_days"]:
+            return f"{length_label(row['duration_days'])} · starts on first login"
         return "Lifetime"
     if exp <= now():
         return f"Expired {discord.utils.format_dt(exp, 'R')}"
@@ -101,17 +115,16 @@ async def log_event(license_id: Optional[int], event_type: str, detail: str = ""
 
 async def create_license(guild_id: Optional[int], days: Optional[int], *, user_id: Optional[int] = None, order_code: Optional[str] = None,
                          created_by: Optional[int] = None, note: Optional[str] = None) -> str:
-    """Make a new unique key. days None/0 = lifetime."""
+    """Make a new unique key. days None/0 = lifetime; otherwise the clock starts on its first login."""
     created = now()
-    expires = (created + timedelta(days=days)).isoformat() if days else None
     for _ in range(40):
         code = new_code()
         if await db.fetch_one("SELECT 1 FROM licenses WHERE code = ?", (code,)):
             continue
         await db.execute(
-            "INSERT INTO licenses (code, active, created_at, expires_at, activations, guild_id, user_id, order_code, created_by, note) "
-            "VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?)",
-            (code, created.isoformat(), expires, guild_id, user_id, order_code, created_by, note),
+            "INSERT INTO licenses (code, active, created_at, expires_at, duration_days, activations, guild_id, user_id, order_code, created_by, note) "
+            "VALUES (?, 1, ?, NULL, ?, 0, ?, ?, ?, ?, ?)",
+            (code, created.isoformat(), days or None, guild_id, user_id, order_code, created_by, note),
         )
         row = await db.fetch_one("SELECT id FROM licenses WHERE code = ?", (code,))
         await log_event(row["id"] if row else None, "created", f"order {order_code}" if order_code else (note or "manual"))
@@ -378,6 +391,10 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             if not owner:  # first use locks the key to this account
                 await db.execute("UPDATE licenses SET user_id = ? WHERE id = ? AND user_id IS NULL", (link["user_id"], row["id"]))
                 await log_event(row["id"], "bound", str(link["user_id"]))
+        if row["expires_at"] is None and row["duration_days"]:  # first login starts a timed key's clock
+            await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ? AND expires_at IS NULL",
+                             ((now() + timedelta(days=row["duration_days"])).isoformat(), row["id"]))
+            await log_event(row["id"], "started", length_label(row["duration_days"]))
         await db.execute("UPDATE licenses SET last_seen = ?, activations = activations + 1 WHERE id = ?", (now().isoformat(), row["id"]))
         await log_event(row["id"], "activated", "Macro login")
         return web.Response(text="OK|LICENSE VALID")
@@ -386,18 +403,21 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
 
     @app_commands.command(description="Make new macro keys")
     @app_commands.describe(
+        length="How long the key lasts (starts on its first login)",
         count="How many keys (1-25)",
-        days="How long they last in days (leave empty for lifetime)",
         member="Give the key(s) to this member and DM them",
         note="A private note for staff",
+        custom_days="Any other length in days (overrides length)",
     )
-    async def generate(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 25] = 1,
-                       days: Optional[app_commands.Range[int, 1, 3650]] = None, member: Optional[discord.Member] = None,
-                       note: Optional[app_commands.Range[str, 1, 200]] = None):
+    @app_commands.choices(length=LENGTH_CHOICES)
+    async def generate(self, interaction: discord.Interaction, length: str = "lifetime", count: app_commands.Range[int, 1, 25] = 1,
+                       member: Optional[discord.Member] = None, note: Optional[app_commands.Range[str, 1, 200]] = None,
+                       custom_days: Optional[app_commands.Range[int, 1, 3650]] = None):
+        days = custom_days or LENGTHS.get(length, 0) or None
         await interaction.response.defer(ephemeral=True)
         codes = [await create_license(interaction.guild_id, days, user_id=member.id if member else None,
                                       created_by=interaction.user.id, note=note) for _ in range(count)]
-        length = f"{days} days" if days else "Lifetime"
+        length = length_label(days) + (" (starts on first login)" if days else "")
         dm = ""
         if member:
             try:
@@ -437,7 +457,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             raise UserError("No keys match that.")
         total = (await db.fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(active), 0) AS a FROM licenses"))
         lines = [f"{status_text(r)[:1]} `{r['code']}` · {('<@' + str(r['user_id']) + '>') if r['user_id'] else (r['owner_name'] or 'unassigned')} · "
-                 f"{'Lifetime' if not r['expires_at'] else expiry_text(r)}" for r in rows[:20]]
+                 f"{expiry_text(r)}" for r in rows[:20]]
         more = f"\n…and {len(rows) - 20} more" if len(rows) > 20 else ""
         await interaction.response.send_message(
             embed=ui.card("🔑 Keys", "\n".join(lines) + more, guild=interaction.guild,
@@ -470,13 +490,16 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                      lifetime: bool = False):
         row = await find_license(code)
         if lifetime:
-            new_exp = None
+            await db.execute("UPDATE licenses SET expires_at = NULL, duration_days = NULL WHERE id = ?", (row["id"],))
+        elif days and row["expires_at"] is None and row["duration_days"]:  # not started yet: make it longer
+            await db.execute("UPDATE licenses SET duration_days = duration_days + ? WHERE id = ?", (days, row["id"]))
+        elif days and row["expires_at"] is None:
+            raise UserError("That key is already lifetime.")
         elif days:
             base = max(parse_time(row["expires_at"]) or now(), now())
-            new_exp = (base + timedelta(days=days)).isoformat()
+            await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ?", ((base + timedelta(days=days)).isoformat(), row["id"]))
         else:
             raise UserError("Fill in `days` or set `lifetime` to True.")
-        await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ?", (new_exp, row["id"]))
         await log_event(row["id"], "extended", "lifetime" if lifetime else f"+{days}d")
         row = await find_license(code)
         await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
@@ -551,8 +574,8 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         else:
             where = ("⚠️ I don't know my public web address yet. In Railway open this bot's service → **Settings → Networking → "
                      "Generate Domain**, redeploy, then run this again.")
-        products = "\n".join(f"• **{p['name']}** · {'Lifetime' if not p['license_days'] else str(p['license_days']) + ' days'}" for p in selling) \
-            or "None yet. Use `/shop edit product:<name> license_days:0` (0 = lifetime)."
+        products = "\n".join(f"• **{p['name']}** · {length_label(p['license_days'])} key" for p in selling) \
+            or "None yet. Use `/shop edit product:<name> license_key:<length>`."
         embed = ui.card("🔑 Key system", where, guild=interaction.guild, section="Keys")
         embed.add_field(name="Products that give a key", value=products, inline=False)
         embed.add_field(name="Keys stored", value=f"{total['c']:,}", inline=True)

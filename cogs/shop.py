@@ -21,8 +21,13 @@ from fileutil import ATTACH_LIMIT, LINK_SECONDS, human_size
 from logutil import emit
 
 try:
-    from cogs.licenses import issue_for_order, receipt_line, set_active_for_order
+    from cogs.licenses import LENGTHS, issue_for_order, length_label, receipt_line, set_active_for_order
 except ImportError:  # cogs/licenses.py isn't uploaded yet: the shop still works, just without macro keys
+    LENGTHS = {"1day": 1, "1week": 7, "1month": 30, "lifetime": 0}
+
+    def length_label(days):
+        return "Lifetime" if not days else f"{days} Days"
+
     async def issue_for_order(guild_id, order, product):
         return None
 
@@ -38,6 +43,8 @@ log = logging.getLogger("verification-bot")
 DEFAULT_BUTTON = "Buy now"
 DEFAULT_FOOTER = "🔒 Secure checkout by Stripe"
 MAX_PRODUCTS = 25  # Discord autocomplete shows 25 choices at most
+KEY_CHOICES = [app_commands.Choice(name=n, value=v) for n, v in
+               (("1 Day", "1day"), ("1 Week", "1week"), ("1 Month", "1month"), ("Lifetime", "lifetime"), ("No key", "none"))]
 HANDLED_EVENTS = {"checkout.session.completed", "checkout.session.async_payment_succeeded"}
 
 # Stripe-hosted checkout pages. If you set up a custom domain for your Payment Links in Stripe
@@ -104,6 +111,8 @@ def build_product(guild: discord.Guild, p, shop, rating=None) -> discord.Embed:
         perks.append("📥 Instant delivery by DM")
     if p["role_id"]:
         perks.append(f"🎭 Unlocks <@&{p['role_id']}>")
+    if p["license_days"] is not None:
+        perks.append(f"🔑 {length_label(p['license_days'])} key")
     banner_line = banner + ("  ·  " + "  ·  ".join(perks) if perks else "")
 
     description = (p["description"] or "").strip()
@@ -871,7 +880,9 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         image_url="Product image (direct https link)",
         button_label="Button text for this product (default: Buy now)",
         color="Card colour as hex, e.g. #635BFF",
+        license_key="Give buyers a macro key of this length (timed keys start on first login)",
     )
+    @app_commands.choices(license_key=KEY_CHOICES)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def add(
         self,
@@ -883,8 +894,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         image_url: Optional[str] = None,
         button_label: Optional[app_commands.Range[str, 1, 30]] = None,
         color: Optional[str] = None,
+        license_key: Optional[str] = None,
     ):
         link = stripe_url(stripe_link)
+        key_days = None if license_key in (None, "none") else LENGTHS.get(license_key, 0)
         image = image_link(image_url) if image_url else None
         color_hex = f"{parse_color(color):06X}" if color else None
         count = (await db.fetch_one("SELECT COUNT(*) AS c FROM products WHERE guild_id = ?", (interaction.guild_id,)))["c"]
@@ -892,8 +905,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             raise UserError(f"You've reached the limit of {MAX_PRODUCTS} products. Remove one with `/shop remove` first.")
         try:
             await db.execute(
-                "INSERT INTO products (guild_id, name, description, price, buy_url, image_url, color, button_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (interaction.guild_id, name.strip(), description, price.strip(), link, image, color_hex, button_label),
+                "INSERT INTO products (guild_id, name, description, price, buy_url, image_url, color, button_label, license_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (interaction.guild_id, name.strip(), description, price.strip(), link, image, color_hex, button_label, key_days),
             )
         except aiosqlite.IntegrityError:
             raise UserError(f"You already have a product called **{name}**. Use `/shop edit` to change it.") from None
@@ -917,8 +930,9 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         delivery_file="A stored file (see /files add) sent to buyers by DM after they pay (or 'none')",
         grant_role="Buyers automatically get this role when they pay (e.g. Premium)",
         remove_role="Stop giving a role with this product",
-        license_days="Give buyers a macro key: 0 = lifetime, 30 = 30 days, -1 = stop giving keys",
+        license_key="Give buyers a macro key of this length (timed keys start on first login)",
     )
+    @app_commands.choices(license_key=KEY_CHOICES)
     @app_commands.autocomplete(product=product_autocomplete, delivery_file=file_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def edit(
@@ -935,12 +949,12 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         delivery_file: Optional[str] = None,
         grant_role: Optional[discord.Role] = None,
         remove_role: bool = False,
-        license_days: Optional[app_commands.Range[int, -1, 3650]] = None,
+        license_key: Optional[str] = None,
     ):
         p = await resolve_product(interaction, product)
         updates: dict = {}
-        if license_days is not None:
-            updates["license_days"] = None if license_days < 0 else license_days
+        if license_key is not None:
+            updates["license_days"] = None if license_key == "none" else LENGTHS.get(license_key, 0)
         if grant_role is not None:
             check_role_sellable(interaction.guild, grant_role)
             updates["role_id"] = grant_role.id
