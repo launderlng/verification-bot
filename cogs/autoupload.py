@@ -21,7 +21,6 @@ log = logging.getLogger("verification-bot")
 
 NEEDS_WEB = "Files over 25 MB need a public web address to deliver as a link. In Railway: Settings → Networking → Generate Domain."
 INVITE_PERMS = 8  # Administrator -- the only permission that lets the bot see channels in locked-down categories it isn't explicitly added to
-FIX_PERM_CATEGORIES = ("FIVEM", "RZ", "Boosters")
 
 
 def clean_name(filename: str, taken: set) -> str:
@@ -87,16 +86,223 @@ def resolve_channel_id(raw: str) -> int:
     return int(raw)
 
 
+def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
+    """Parse a role from text (an @mention or a plain ID) typed into a modal field -- modals can't use Discord's
+    native role picker the way a slash command parameter can. Blank input means "no role", same as leaving the
+    slash command's optional parameter unset."""
+    raw = (raw or "").strip().strip("<@&>").strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        raise UserError("That doesn't look like a role. @mention it or right-click it in Server Settings → Roles → **Copy Role ID** (turn on **Developer Mode** first).")
+    role = guild.get_role(int(raw))
+    if role is None:
+        raise UserError("I can't find that role on this server.")
+    return role
+
+
+def parse_yes_no(raw: str, default: bool) -> bool:
+    raw = (raw or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("y", "yes", "true", "1", "on")
+
+
 async def used_bytes(guild_id: int) -> int:
     return (await db.fetch_one("SELECT COALESCE(SUM(size), 0) AS n FROM stored_files WHERE guild_id = ?", (guild_id,)))["n"]
 
 
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="Drop files in a channel (even on another server) and auto-add + auto-post them"):
+async def send_component_error(interaction: discord.Interaction, error: Exception) -> None:
+    """Mirrors bot.py's @bot.tree.error handler, which only covers slash commands -- a button click or modal
+    submit is a different kind of interaction and never reaches that handler at all, so without this a UserError
+    raised from one of these would just vanish as a silent "This interaction failed" on the user's end."""
+    if isinstance(error, UserError):
+        msg = f"⚠️ {error}"
+    elif isinstance(error, discord.Forbidden):
+        msg = "I don't have permission to do that. Check my role position and permissions."
+    else:
+        log.exception("Unhandled component error", exc_info=error)
+        msg = "Something went wrong with that."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+class AddDropZoneModal(discord.ui.Modal, title="➕ Add a drop zone"):
+    upload_channel_id = discord.ui.TextInput(label="Upload channel ID (where files get dropped)", placeholder="Right-click the channel → Copy Channel ID")
+    post_channel_id = discord.ui.TextInput(label="Post channel (in THIS server)", placeholder="#channel mention or its ID")
+    pack = discord.ui.TextInput(label="Pack name", placeholder="e.g. ReShade", max_length=60)
+    required_role_id = discord.ui.TextInput(label="Required role to claim (optional)", placeholder="@role or role ID", required=False)
+    gif_url = discord.ui.TextInput(label="Branding GIF URL (optional)", placeholder="https://....gif", required=False)
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        post_channel = interaction.guild.get_channel(resolve_channel_id(self.post_channel_id.value))
+        if not isinstance(post_channel, discord.TextChannel):
+            raise UserError("The post channel needs to be a text channel in this server.")
+        required_role = resolve_role(interaction.guild, self.required_role_id.value)
+        await self.cog.add(
+            interaction, self.upload_channel_id.value, post_channel, self.pack.value,
+            required_role=required_role, once_per_user=False, gif_url=(self.gif_url.value.strip() or None),
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_component_error(interaction, error)
+
+
+class RemoveDropZoneModal(discord.ui.Modal, title="🗑️ Remove a drop zone"):
+    upload_channel_id = discord.ui.TextInput(label="Upload channel ID to remove", placeholder="Right-click the channel → Copy Channel ID")
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.remove(interaction, self.upload_channel_id.value)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_component_error(interaction, error)
+
+
+class PresetModal(discord.ui.Modal, title="⚡ Preset: FIVEM/RZ/Boosters"):
+    vault_guild_id = discord.ui.TextInput(label="Vault server ID", placeholder="Right-click the server icon → Copy Server ID")
+    required_role_id = discord.ui.TextInput(label="Required role to claim (optional)", placeholder="@role or role ID", required=False)
+    gif_url = discord.ui.TextInput(label="Branding GIF URL (optional)", placeholder="https://....gif", required=False)
+    create_missing = discord.ui.TextInput(label="Create missing channels here? (yes/no)", placeholder="yes", required=False)
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        required_role = resolve_role(interaction.guild, self.required_role_id.value)
+        await self.cog.preset(
+            interaction, self.vault_guild_id.value, required_role=required_role, once_per_user=False,
+            create_missing=parse_yes_no(self.create_missing.value, True), gif_url=(self.gif_url.value.strip() or None),
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_component_error(interaction, error)
+
+
+class BulkAddModal(discord.ui.Modal, title="📥 Bulk add a category"):
+    vault_guild_id = discord.ui.TextInput(label="Other server's ID", placeholder="Right-click the server icon → Copy Server ID")
+    category = discord.ui.TextInput(label="Category to match (optional)", placeholder="e.g. RZ -- leave blank for the whole server", required=False)
+    exclude = discord.ui.TextInput(label="Skip channels containing (optional)", placeholder="e.g. no-,chat", required=False)
+    required_role_id = discord.ui.TextInput(label="Required role to claim (optional)", placeholder="@role or role ID", required=False)
+    gif_url = discord.ui.TextInput(label="Branding GIF URL (optional)", placeholder="https://....gif", required=False)
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        required_role = resolve_role(interaction.guild, self.required_role_id.value)
+        await self.cog.bulkadd(
+            interaction, self.vault_guild_id.value, category=(self.category.value.strip() or None),
+            exclude=(self.exclude.value.strip() or None), required_role=required_role, once_per_user=False,
+            create_missing=True, gif_url=(self.gif_url.value.strip() or None),
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_component_error(interaction, error)
+
+
+class SeedVaultModal(discord.ui.Modal, title="🌱 Seed an empty vault"):
+    vault_guild_id = discord.ui.TextInput(label="Empty vault server's ID", placeholder="Right-click the server icon → Copy Server ID")
+    required_role_id = discord.ui.TextInput(label="Required role to claim (optional)", placeholder="@role or role ID", required=False)
+    gif_url = discord.ui.TextInput(label="Branding GIF URL (optional)", placeholder="https://....gif", required=False)
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        required_role = resolve_role(interaction.guild, self.required_role_id.value)
+        await self.cog.seedvault(
+            interaction, self.vault_guild_id.value, required_role=required_role, once_per_user=False,
+            gif_url=(self.gif_url.value.strip() or None),
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_component_error(interaction, error)
+
+
+class AutoUploadMenuView(discord.ui.View):
+    """The buttons behind the one `/autoupload` command. The menu message is ephemeral (only the staff member who
+    ran it can even see it), so there's no need to re-check who's clicking -- Discord already scoped that."""
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__(timeout=300)
+        self.cog = cog
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await send_component_error(interaction, error)
+
+    @discord.ui.button(label="Add drop zone", emoji="➕", style=discord.ButtonStyle.success, row=0)
+    async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddDropZoneModal(self.cog))
+
+    @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.danger, row=0)
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RemoveDropZoneModal(self.cog))
+
+    @discord.ui.button(label="List drop zones", emoji="📋", style=discord.ButtonStyle.secondary, row=0)
+    async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.list(interaction)
+
+    @discord.ui.button(label="Staff guide", emoji="📤", style=discord.ButtonStyle.primary, row=1)
+    async def guide_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.guide(interaction)
+
+    @discord.ui.button(label="Invite link", emoji="🔗", style=discord.ButtonStyle.secondary, row=1)
+    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.inviteinfo(interaction)
+
+    @discord.ui.button(label="Preset (FIVEM/RZ/Boosters)", emoji="⚡", style=discord.ButtonStyle.success, row=2)
+    async def preset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PresetModal(self.cog))
+
+    @discord.ui.button(label="Bulk add category", emoji="📥", style=discord.ButtonStyle.secondary, row=2)
+    async def bulkadd_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BulkAddModal(self.cog))
+
+    @discord.ui.button(label="Seed empty vault", emoji="🌱", style=discord.ButtonStyle.secondary, row=2)
+    async def seedvault_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SeedVaultModal(self.cog))
+
+
+class AutoUpload(commands.Cog):
+    """Everything here is reached through the single `/autoupload` menu command below -- its buttons and modals
+    call straight into the plain (undecorated) methods further down, so there's only ever one entry in Discord's
+    slash-command list instead of a dozen. `/autoupload` itself is the only thing gated on Manage Server; since
+    its own response (and everything opened from it) is ephemeral, nothing further down needs its own check."""
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        super().__init__()
+
+    @app_commands.command(name="autoupload", description="Manage drop zones that auto-upload and auto-post files")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def menu(self, interaction: discord.Interaction):
+        body = (
+            "**➕ Add drop zone** — wire up one channel to auto-post into another (can be on another server)\n"
+            "**🗑️ Remove** — stop a channel being a drop zone\n"
+            "**📋 List drop zones** — see everything currently wired up\n"
+            "**📤 Staff guide** — post the forwarding how-to for staff to pin\n"
+            "**🔗 Invite link** — invite me to another server (e.g. a vault)\n"
+            "**⚡ Preset** — one-click setup for a FIVEM/RZ/Boosters vault\n"
+            "**📥 Bulk add category** — pair a whole category by matching channel names\n"
+            "**🌱 Seed empty vault** — build matching empty channels in a brand-new vault server"
+        )
+        await interaction.response.send_message(
+            embed=ui.card("📂 Auto-Upload Menu", body, guild=interaction.guild, section="Files"),
+            view=AutoUploadMenuView(self), ephemeral=True,
+        )
 
     async def room_left(self, guild_id: int) -> int:
         return storage_cap_bytes() - await used_bytes(guild_id)
@@ -261,24 +467,15 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
 
     # ----------------------------------------------------------- commands ----
 
-    @app_commands.command(description="Turn a channel into a drop zone (it can be on another server you've invited me to)")
-    @app_commands.describe(
-        upload_channel_id="The upload channel's ID (right-click it → Copy Channel ID). Can be on another server.",
-        post_channel="Where the auto-post goes, in THIS server, e.g. #reshades",
-        pack="What to call this pack/category, e.g. ReShade",
-        required_role="Only members with this role can claim the file (optional)",
-        once_per_user="Each member can only claim it once (default: no)",
-        gif_url="A branding GIF to show under every auto-post from this channel (optional, must end in .gif)",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def add(
         self, interaction: discord.Interaction, upload_channel_id: str, post_channel: discord.TextChannel,
-        pack: app_commands.Range[str, 1, 60], required_role: Optional[discord.Role] = None, once_per_user: bool = False,
+        pack: str, required_role: Optional[discord.Role] = None, once_per_user: bool = False,
         gif_url: Optional[str] = None,
     ):
+        pack = pack.strip()[:60]
         channel = self.bot.get_channel(resolve_channel_id(upload_channel_id))
         if channel is None:
-            raise UserError("I can't see that channel. Make sure I've been invited to the server it's on — run `/autoupload inviteinfo` for an invite link.")
+            raise UserError("I can't see that channel. Make sure I've been invited to the server it's on — use the menu's **Invite link** button.")
         if not isinstance(channel, discord.TextChannel):
             raise UserError("That needs to be a text channel.")
         check_can_send(post_channel, interaction.guild.me, files=False)
@@ -374,20 +571,9 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 f"#{vc.name} → {t.mention}" + (" 🆕 (new channel)" if vc.id in created_ids else "") for vc, t in matched
             ) + "\n\n"
         if unmatched:
-            body += "**⚠️ No match found on this server** (add these by hand with `/autoupload add`)\n" + "\n".join(f"#{vc.name} (`{vc.id}`)" for vc in unmatched)
+            body += "**⚠️ No match found on this server** (add these by hand from the menu's **Add drop zone** button)\n" + "\n".join(f"#{vc.name} (`{vc.id}`)" for vc in unmatched)
         return ui.card(title, body or "Nothing matched.", color=SUCCESS if matched else WARN, guild=guild, section="Files")
 
-    @app_commands.command(description="Pair up a whole category from another server by matching channel names to this server's channels")
-    @app_commands.describe(
-        vault_guild_id="The other server's ID (right-click its icon → Copy Server ID)",
-        category="Only match channels in this category on the other server (optional, e.g. RZ)",
-        exclude="Skip channel names containing any of these, comma-separated (e.g. no-,chat)",
-        required_role="Only members with this role can claim any matched file (optional)",
-        once_per_user="Each member can only claim a matched file once (default: no)",
-        create_missing="Create a new channel here for any vault channel with no match yet (default: yes)",
-        gif_url="A branding GIF to show under every post from these channels (optional, must end in .gif)",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def bulkadd(
         self, interaction: discord.Interaction, vault_guild_id: str, category: Optional[str] = None, exclude: Optional[str] = None,
         required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
@@ -397,7 +583,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
         vault = self.bot.get_guild(int(vault_guild_id.strip()))
         if vault is None:
-            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
+            raise UserError("I'm not in that server. Use the menu's **Invite link** button, add me there, then try again.")
         skip = [s.strip().lower() for s in (exclude or "").split(",") if s.strip()]
         await interaction.response.defer(ephemeral=True)
         matched, unmatched, created = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user, create_missing, gif_url=gif_url)
@@ -405,15 +591,6 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             raise UserError("No text channels found over there. Check the category name, or leave it blank to scan every channel.")
         await interaction.followup.send(embed=self.pairing_result_embed(interaction.guild, f"📥 {len(matched)} drop zone(s) paired", matched, unmatched, created), ephemeral=True)
 
-    @app_commands.command(description="One-click setup for your FIVEM/RZ/Boosters vault: pairs everything except NO PROPS and chat channels")
-    @app_commands.describe(
-        vault_guild_id="The vault server's ID (right-click its icon → Copy Server ID)",
-        required_role="Only members with this role can claim any matched file (optional)",
-        once_per_user="Each member can only claim a matched file once (default: no)",
-        create_missing="Create a new channel here for any vault channel with no match yet (default: yes)",
-        gif_url="A branding GIF to show under every auto-post (optional, must end in .gif)",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def preset(
         self, interaction: discord.Interaction, vault_guild_id: str,
         required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
@@ -425,7 +602,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
         vault = self.bot.get_guild(int(vault_guild_id.strip()))
         if vault is None:
-            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
+            raise UserError("I'm not in that server. Use the menu's **Invite link** button, add me there, then try again.")
 
         await interaction.response.defer(ephemeral=True)
         all_matched, all_unmatched, all_created = [], [], []
@@ -485,14 +662,6 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             paired.append((vc, mc))
         return paired, created
 
-    @app_commands.command(description="Fill an empty vault with channels copied from FIVEM/RZ/Boosters here, wired to post back here")
-    @app_commands.describe(
-        vault_guild_id="The (new/empty) vault server's ID (right-click its icon → Copy Server ID)",
-        required_role="Only members with this role can claim any matched file (optional)",
-        once_per_user="Each member can only claim a matched file once (default: no)",
-        gif_url="A branding GIF to show under every auto-post (optional, must end in .gif)",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def seedvault(
         self, interaction: discord.Interaction, vault_guild_id: str,
         required_role: Optional[discord.Role] = None, once_per_user: bool = False, gif_url: Optional[str] = None,
@@ -504,7 +673,7 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
         vault = self.bot.get_guild(int(vault_guild_id.strip()))
         if vault is None:
-            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
+            raise UserError("I'm not in that server. Use the menu's **Invite link** button, add me there, then try again.")
         if vault.id == interaction.guild.id:
             raise UserError("That's this server's own ID -- `vault_guild_id` needs to be the *other*, empty server you want to seed.")
 
@@ -522,41 +691,6 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             ephemeral=True,
         )
 
-    @app_commands.command(description="Same-server bulkadd: mirror a category here into a new public category, auto-posting across")
-    @app_commands.describe(
-        source_category="Category in THIS server to watch for uploads (e.g. RZ)",
-        dest_category="Category to post into (created if it doesn't exist, e.g. 'RZ Downloads')",
-        exclude="Skip channel names containing any of these, comma-separated (e.g. no-,chat)",
-        required_role="Only members with this role can claim any matched file (optional)",
-        once_per_user="Each member can only claim a matched file once (default: no)",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def mirror(
-        self, interaction: discord.Interaction, source_category: str, dest_category: str, exclude: Optional[str] = None,
-        required_role: Optional[discord.Role] = None, once_per_user: bool = False,
-    ):
-        """For staff-only categories that already live in this server (not a separate vault): watches each channel
-        in `source_category` and auto-posts uploads into a same-named channel under `dest_category`, a new or
-        existing category kept separate so the public destination channels don't collide names with the private
-        source ones."""
-        if source_category.strip().lower() == dest_category.strip().lower():
-            raise UserError("Source and destination categories need different names, or uploads would post right back into themselves.")
-        await interaction.response.defer(ephemeral=True)
-        skip = [s.strip().lower() for s in (exclude or "").split(",") if s.strip()]
-        matched, unmatched, created = await self.pair_category(
-            interaction, interaction.guild, source_category, skip, required_role, once_per_user,
-            create_missing=True, dest_category_name=dest_category,
-        )
-        if not matched and not unmatched:
-            raise UserError(f"No channels found in a category matching \"{source_category}\" on this server.")
-        await interaction.followup.send(
-            embed=self.pairing_result_embed(interaction.guild, f"🪞 {len(matched)} channel(s) mirrored into \"{dest_category}\"", matched, unmatched, created),
-            ephemeral=True,
-        )
-
-    @app_commands.command(description="Stop a channel being a drop zone")
-    @app_commands.describe(upload_channel_id="The upload channel's ID (right-click it → Copy Channel ID)")
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def remove(self, interaction: discord.Interaction, upload_channel_id: str):
         cid = resolve_channel_id(upload_channel_id)
         row = await db.fetch_one("SELECT guild_id FROM upload_channels WHERE channel_id = ?", (cid,))
@@ -565,15 +699,13 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
         await db.execute("DELETE FROM upload_channels WHERE channel_id = ?", (cid,))
         await interaction.response.send_message(embed=ui.card("🗑️ Removed", f"`{cid}` is no longer a drop zone.", color=SUCCESS), ephemeral=True)
 
-    @app_commands.command(description="See every drop zone that posts into this server")
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def list(self, interaction: discord.Interaction):
         all_rows = await db.fetch_all("SELECT * FROM upload_channels ORDER BY pack_name")
         # upload_channels isn't keyed by the posting guild (the upload side may be on another server),
         # so filter here to just the rows that actually post into this server.
         rows = [r for r in all_rows if interaction.guild.get_channel(r["post_channel_id"]) is not None]
         if not rows:
-            raise UserError("No drop zones post into this server yet. Add one with `/autoupload add` or `/autoupload bulkadd`.")
+            raise UserError("No drop zones post into this server yet. Add one from the menu's **Add drop zone** or **Bulk add** button.")
         lines = []
         for r in rows:
             src = self.bot.get_channel(r["channel_id"])
@@ -584,46 +716,36 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
             )
         await interaction.response.send_message(embed=ui.card("📥 Drop zones", "\n".join(lines), guild=interaction.guild, section="Files"), ephemeral=True)
 
-    @app_commands.command(description="Post a staff guide: how to forward files into the right channel to auto-upload them")
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def guide(self, interaction: discord.Interaction):
         all_rows = await db.fetch_all("SELECT * FROM upload_channels ORDER BY pack_name")
         rows = [r for r in all_rows if interaction.guild.get_channel(r["post_channel_id"]) is not None]
         if not rows:
-            raise UserError("No drop zones post into this server yet. Add one with `/autoupload add` or `/autoupload bulkadd` first, then run this again.")
+            raise UserError("No drop zones post into this server yet. Add one from the menu's **Add drop zone** or **Bulk add** button first, then run this again.")
 
-        steps = (
-            "**1.** Find the file somewhere else (a DM, another server, wherever it was sent to you).\n"
-            "**2.** Right-click (or long-press on mobile) the message it's attached to → **Forward**.\n"
-            "**3.** Pick the matching channel from the list below and send it there.\n"
-            "**4.** That's it — I'll pull it out and auto-post it into the right channel on the main server within a few seconds, no further steps needed.\n\n"
-            "⚠️ Drop the file in the **wrong** channel from the list and it'll post to the wrong place, so double check before sending."
-        )
-        embed = ui.card("📤 How to Upload Files to the Main Discord (by Forwarding)", steps, guild=interaction.guild, section="Files")
-
-        # One line per drop zone, "forward into this channel" -> "it posts here". Chunked across fields since a
-        # single embed field caps out at 1024 characters and this list grows as more packs get added.
+        # One line per drop zone, "forward into this channel" -> "it posts here".
         lines = []
         for r in rows:
             src = self.bot.get_channel(r["channel_id"])
             src_label = f"{src.mention} ({src.guild.name})" if src and src.guild.id != interaction.guild_id else (src.mention if src else f"`{r['channel_id']}`")
             lines.append(f"**{r['pack_name']}** — forward into {src_label} → posts in <#{r['post_channel_id']}>")
 
-        chunk, chunks, length = [], [], 0
-        for line in lines:
-            if length + len(line) + 1 > 1000:
-                chunks.append(chunk)
-                chunk, length = [], 0
-            chunk.append(line)
-            length += len(line) + 1
-        if chunk:
-            chunks.append(chunk)
-        for i, c in enumerate(chunks):
-            embed.add_field(name="Forward into these channels" if i == 0 else "​", value="\n".join(c), inline=False)
-
+        # "# " / "## " are Discord's big-heading markdown -- only renders large inside the description/content
+        # text, not an embed's title field, so the whole thing (title included) goes in the description to
+        # actually look bigger instead of the usual small embed text.
+        description = (
+            "# 📤 How to Upload Files to the Main Discord\n"
+            "### (by Forwarding)\n\n"
+            "## Steps\n"
+            "**1.** Find the file somewhere else (a DM, another server, wherever it was sent to you).\n"
+            "**2.** Right-click (or long-press on mobile) the message it's attached to → **Forward**.\n"
+            "**3.** Pick the matching channel from the list below and send it there.\n"
+            "**4.** That's it — I'll pull it out and auto-post it into the right channel on the main server within a few seconds, no further steps needed.\n\n"
+            "⚠️ Drop the file in the **wrong** channel from the list and it'll post to the wrong place, so double check before sending.\n\n"
+            "## Forward into these channels\n" + "\n".join(lines)
+        )
+        embed = ui.card(None, description[:4096], guild=interaction.guild, section="Files")
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(description="Get an invite link to add me to another server (e.g. your vault/source server)")
     async def inviteinfo(self, interaction: discord.Interaction):
         url = f"https://discord.com/oauth2/authorize?client_id={self.bot.user.id}&scope=bot%20applications.commands&permissions={INVITE_PERMS}"
         await interaction.response.send_message(
@@ -638,121 +760,6 @@ class AutoUpload(commands.GroupCog, group_name="autoupload", group_description="
                 guild=interaction.guild, section="Files",
             ), ephemeral=True,
         )
-
-    @app_commands.command(description="List every server I'm in with real channel counts, to spot a wrong/duplicate vault ID")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def servers(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        lines = []
-        for g in self.bot.guilds:
-            try:
-                raw = await self.bot.http.get_all_guild_channels(g.id)
-                count = sum(1 for ch in raw if ch.get("type") in (0, 5))  # 0 = text, 5 = announcement
-            except Exception:
-                count = "?"
-            me = g.me
-            admin = " 👑" if me and me.guild_permissions.administrator else ""
-            lines.append(f"**{g.name}**{admin} — `{g.id}` — {count} text channel(s)")
-        body = "\n".join(lines) or "I'm not in any servers."
-        body += (
-            "\n\n👑 = I have Administrator there. If two servers share a name, compare channel counts and IDs here "
-            "against the real one in Discord (right-click its icon → **Copy Server ID**) to find the right `vault_guild_id`."
-        )
-        await interaction.followup.send(embed=ui.card("🌐 My servers", body, guild=interaction.guild, section="Files"), ephemeral=True)
-
-    @app_commands.command(description="Check whether I can actually see a server's FIVEM/RZ/Boosters categories")
-    @app_commands.describe(vault_guild_id="The vault server's ID (right-click its icon → Copy Server ID)")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def fixperms(self, interaction: discord.Interaction, vault_guild_id: str):
-        if not vault_guild_id.strip().isdigit():
-            raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
-        vault = self.bot.get_guild(int(vault_guild_id.strip()))
-        if vault is None:
-            raise UserError("I'm not in that server. Run `/autoupload inviteinfo` for an invite link, add me there, then try again.")
-        me = vault.me
-        try:
-            vault_cats, vault_texts = await fetch_live(vault)
-        except discord.HTTPException as e:
-            raise UserError(f"Couldn't list that server's channels (Discord said: {e}). Try again in a moment.")
-        found_cats = [cat for cat in vault_cats if any(c.lower() in cat.name.lower() for c in FIX_PERM_CATEGORIES)]
-        if found_cats:
-            # Categories and their channels come from the SAME live fetch above, so this can't suffer the
-            # cache-mismatch bug that made every category look empty before.
-            by_cat: dict = {}
-            for ch in vault_texts:
-                by_cat.setdefault(ch.category_id, []).append(ch)
-            lines = []
-            for cat in found_cats:
-                kinds = {}
-                for ch in by_cat.get(cat.id, []):
-                    kinds[type(ch).__name__] = kinds.get(type(ch).__name__, 0) + 1
-                breakdown = ", ".join(f"{n} {k}" for k, n in kinds.items()) if kinds else "no channels inside"
-                lines.append(f"📁 {cat.name} — {breakdown}")
-            admin_note = f"Checking **{vault.name}** (`{vault.id}`). " + ("I'm an Administrator there.\n\n" if me and me.guild_permissions.administrator else "\n\n")
-            found_cat_ids = {c.id for c in found_cats}
-            text_total = sum(1 for ch in vault_texts if ch.category_id in found_cat_ids)
-            if text_total:
-                tail = "\n\nRun `/autoupload preset` — it should find channels now."
-            else:
-                # Zero TextChannels anywhere in the server (not just these categories) despite the user seeing
-                # plenty in their own client -- bypass discord.py's parsing entirely and look at Discord's raw
-                # JSON for this guild's channels, which shows the real numeric `type` for every channel regardless
-                # of how (or whether) this library version's object model classifies it.
-                try:
-                    raw = await self.bot.http.get_all_guild_channels(vault.id)
-                except Exception as e:
-                    raw = None
-                    raw_err = str(e)
-                if raw is not None:
-                    type_counts: dict = {}
-                    for ch in raw:
-                        type_counts[ch.get("type")] = type_counts.get(ch.get("type"), 0) + 1
-                    sample = "\n".join(f"`{ch.get('name')}` — type `{ch.get('type')}`, parent_id `{ch.get('parent_id')}`" for ch in raw[:10]) or "(none at all)"
-                    tail = (
-                        f"\n\n⚠️ No plain TextChannels parsed from the API.\n\n"
-                        f"Raw debug: Discord reports {len(raw)} channel(s) total in this server, by type: "
-                        f"{type_counts}.\nMatched category IDs: {', '.join(str(i) for i in found_cat_ids) or '(none)'}.\n"
-                        f"Sample (raw, unfiltered):\n{sample}"
-                    )
-                else:
-                    tail = f"\n\n⚠️ Couldn't even fetch the raw channel list (Discord said: {raw_err})."
-            return await interaction.response.send_message(
-                embed=ui.card("✅ Categories found", admin_note + "\n".join(lines) + tail,
-                               color=SUCCESS if text_total else WARN, guild=interaction.guild, section="Files"),
-                ephemeral=True,
-            )
-        # Can't see any category matching the expected names. Show exactly what server and what categories I DO see,
-        # so a wrong vault_guild_id (easy to mix up with the main server's ID) is obvious instead of guessed at.
-        all_cats = [cat.name for cat in vault_cats]
-        body = (
-            f"Checking **{vault.name}** (`{vault.id}`) — "
-            f"I don't see any category matching {', '.join(FIX_PERM_CATEGORIES)} there.\n\n"
-        )
-        if all_cats:
-            body += "Categories I *can* see on this server:\n" + "\n".join(f"📁 {n}" for n in all_cats[:25])
-            body += (
-                "\n\nIf none of those look like your vault's FIVEM/RZ/Boosters categories, double-check `vault_guild_id` — "
-                "it needs to be the **vault server's** ID, not this bot's main server. Right-click the vault server's icon "
-                "(not a channel) → **Copy Server ID**.\n\nIf one of them *is* meant to be FIVEM/RZ/Boosters but is named "
-                "differently (emojis, abbreviations), tell me the exact name and I can match on that instead."
-            )
-        else:
-            body += (
-                "In fact I can't see **any** categories on this server at all, which points at `vault_guild_id` being wrong "
-                "rather than a permissions issue — if this really is the vault, right-click its icon (not a channel) → "
-                "**Copy Server ID** and double check against what you pasted.\n\n"
-            )
-            if me and me.guild_permissions.administrator:
-                body += "That's despite me having Administrator here, so this genuinely looks like the wrong server ID rather than a permission problem."
-            else:
-                body += (
-                    "**Two ways to fix it if this is the right server and it's a permissions issue:**\n"
-                    "**1.** Re-invite me with `/autoupload inviteinfo` (now asks for Administrator, which bypasses hidden-channel limits).\n"
-                    "**2.** Or, without changing my permissions: right-click each category on that server → **Edit Category** → "
-                    "**Permissions** → add my role → allow **View Channel** (and ideally Send Messages, Read Message History, Add Reactions)."
-                )
-        raise UserError(body)
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AutoUpload(bot))
