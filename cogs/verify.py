@@ -513,7 +513,7 @@ class Verification(commands.GroupCog, group_name="verify", group_description="Me
             embed=self.status_embed(interaction.guild, cfg, bool(await self.effective_rules(interaction.guild_id, cfg))), ephemeral=True,
         )
 
-    @app_commands.command(description="Customise how the verify panel looks")
+    @app_commands.command(description="Restyle the verify panel (leave everything blank to just re-post it)")
     @app_commands.describe(
         title="Panel title, e.g. '🔒 Verify to enter'",
         text="The message under the title",
@@ -550,13 +550,12 @@ class Verification(commands.GroupCog, group_name="verify", group_description="Me
                 raise UserError("The image must be a direct link starting with `https://` (or type `none`).")
         if button_label:
             updates["button_label"] = button_label
-        if not updates:
-            raise UserError("Nothing to change. Fill in at least one option.")
         await interaction.response.defer(ephemeral=True)
-        await db.upsert_config(interaction.guild_id, **updates)
-        cfg = await db.get_config(interaction.guild_id)
-        message = await self.post_panel(interaction.guild, cfg)
-        await interaction.followup.send(f"✅ Panel updated: {message.jump_url}", ephemeral=True)
+        if updates:
+            await db.upsert_config(interaction.guild_id, **updates)
+            cfg = await db.get_config(interaction.guild_id)
+        message = await self.post_panel(interaction.guild, cfg)  # nothing filled in = just re-post it (was /verify repost)
+        await interaction.followup.send(f"✅ Panel {'updated' if updates else 're-posted'}: {message.jump_url}", ephemeral=True)
 
     @app_commands.command(description="Preview how the verify panel looks (only you see it)")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -566,7 +565,7 @@ class Verification(commands.GroupCog, group_name="verify", group_description="Me
             raise UserError("Run `/verify setup` first.")
         await interaction.response.send_message("Preview (the real panel has working buttons):", embed=build_panel(interaction.guild, cfg), ephemeral=True)
 
-    @app_commands.command(description="Change verification settings (only the options you fill in)")
+    @app_commands.command(description="See or change verification settings (fill in only what you want to change)")
     @app_commands.describe(
         method="How members prove they're human",
         log_channel="Channel for verification logs",
@@ -617,8 +616,8 @@ class Verification(commands.GroupCog, group_name="verify", group_description="Me
             updates["max_attempts"] = max_attempts
         if raid_threshold is not None:
             updates["raid_threshold"] = raid_threshold
-        if not updates:
-            raise UserError("Nothing to change. Fill in at least one option.")
+        if not updates:  # nothing filled in = show the current settings (was /verify status)
+            return await interaction.response.send_message(embed=self.status_embed(guild, cfg, bool(await self.effective_rules(guild.id, cfg))), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
         await db.upsert_config(guild.id, **updates)
@@ -626,24 +625,6 @@ class Verification(commands.GroupCog, group_name="verify", group_description="Me
         if method and cfg["panel_message_id"]:
             await self.post_panel(guild, cfg)  # the 'How it works' steps depend on the method
         await interaction.followup.send("\n".join(["✅ Settings saved."] + notes), embed=self.status_embed(guild, cfg, bool(await self.effective_rules(guild.id, cfg))), ephemeral=True)
-
-    @app_commands.command(description="Show the current verification settings")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def status(self, interaction: discord.Interaction):
-        cfg = await db.get_config(interaction.guild_id)
-        if not cfg or not cfg["verified_role_id"]:
-            raise UserError("Verification isn't set up. Use `/verify setup`.")
-        await interaction.response.send_message(embed=self.status_embed(interaction.guild, cfg, bool(await self.effective_rules(interaction.guild_id, cfg))), ephemeral=True)
-
-    @app_commands.command(description="Re-post the verify panel (e.g. if it was deleted)")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def repost(self, interaction: discord.Interaction):
-        cfg = await db.get_config(interaction.guild_id)
-        if not cfg or not cfg["verified_role_id"]:
-            raise UserError("Verification isn't set up. Use `/verify setup`.")
-        await interaction.response.defer(ephemeral=True)
-        message = await self.post_panel(interaction.guild, cfg)
-        await interaction.followup.send(f"✅ Panel re-posted: {message.jump_url}", ephemeral=True)
 
     @app_commands.command(description="Pause or resume verification (use during a raid)")
     @app_commands.describe(enabled="True = pause verification, False = resume")

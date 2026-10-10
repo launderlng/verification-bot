@@ -532,6 +532,9 @@ MIGRATIONS = [
     ("orders", "license_code", "TEXT"),
     ("licenses", "duration_days", "INTEGER"),
     ("orders", "option_id", "INTEGER"),
+    ("ticket_types", "questions", "TEXT"),
+    ("ticket_types", "accept_role_id", "INTEGER"),
+    ("tickets", "app_status", "TEXT"),
 ]
 
 

@@ -6,7 +6,7 @@
 * Products can hand out a key automatically: `/shop edit product:<name> license_key:<length>`
   (1 Day / 1 Week / 1 Month / Lifetime; timed keys start on their first login). Every Stripe purchase or /shop createorder for that product gets a fresh
   key in the receipt DM.
-* Admins manage keys with /key ..., members see theirs with /mykeys.
+* Admins manage keys with /key ..., members see theirs with /myorders.
 * Discord linking (on once DISCORD_CLIENT_SECRET is set): before a key works, the macro must
   link a Discord account. The macro gets a session from POST /api/auth/new, opens
   /auth/start?s=<session> (Discord's Authorize page), and polls GET /api/auth/status?s=<session>.
@@ -159,7 +159,7 @@ async def receipt_line(order) -> Optional[str]:
         return None
     row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (order["license_code"],))
     length = expiry_text(row) if row else "Lifetime"
-    return f"```{order['license_code']}```**Valid** · {length}\nPaste it into the macro's login screen. `/mykeys` shows it any time."
+    return f"```{order['license_code']}```**Valid** · {length}\nPaste it into the macro's login screen. `/myorders` shows it any time."
 
 
 async def set_active_for_order(order, active: bool) -> bool:
@@ -668,19 +668,11 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@app_commands.guild_only()
-class MyKeys(commands.Cog):
-    @app_commands.command(description="See your macro keys")
-    async def mykeys(self, interaction: discord.Interaction):
-        rows = await db.fetch_all("SELECT * FROM licenses WHERE user_id = ? ORDER BY id DESC LIMIT 10", (interaction.user.id,))
-        if not rows:
-            raise UserError("You don't have any keys yet. Buy one from the shop with `/store`.")
-        lines = [f"```{r['code']}```{status_text(r)} · {expiry_text(r)}" for r in rows]
-        await interaction.response.send_message(
-            embed=ui.card("🔑 Your keys", "\n".join(lines) + "\nPaste a key into the macro's login screen.", guild=interaction.guild, section="Keys"),
-            ephemeral=True)
+async def my_keys(user_id: int) -> list[str]:
+    """A member's keys, one line each, for /myorders (which replaced /mykeys)."""
+    rows = await db.fetch_all("SELECT * FROM licenses WHERE user_id = ? ORDER BY id DESC LIMIT 10", (user_id,))
+    return [f"`{r['code']}` · {status_text(r)} · {expiry_text(r)}" for r in rows]
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Keys(bot))
-    await bot.add_cog(MyKeys())
