@@ -486,10 +486,9 @@ class AutoUpload(commands.Cog):
         # very top) and the embed is left titleless, giving one clean flow: title, video, GIF, button.
         title = None if file_attach else row["pack_name"]
         content = f"**{row['pack_name']}**" if file_attach else None
-        # If the preview itself was too big to attach inline, say so right on the post instead of the preview
-        # just silently not being there -- otherwise it looks like the upload failed when it didn't.
-        description = f"⚠️ Preview is {human_size(too_large_size)}, too large to show here ({human_size(too_large_limit)} limit) — press **Get file** below." if too_large_for_preview else None
-        draft = Draft(post_channel, title, description, None, None,
+        # A too-large preview just isn't shown, same as if there were no preview at all -- no warning text on
+        # the public post, just the pack name, the GIF (if any), and the Get-file button.
+        draft = Draft(post_channel, title, None, None, None,
                        photo=photo, file=file_attach, gif_url=row["gif_url"],
                        deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
