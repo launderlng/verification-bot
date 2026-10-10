@@ -482,6 +482,7 @@ MIGRATIONS = [
     ("welcome_config", "banner_url", "TEXT"),
     ("welcome_config", "banner_file_id", "INTEGER"),
     ("posts", "data", "TEXT"),
+    ("stored_files", "gif_url", "TEXT"),
 ]
 
 
