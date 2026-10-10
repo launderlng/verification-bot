@@ -21,7 +21,7 @@ from fileutil import ATTACH_LIMIT, LINK_SECONDS, human_size
 from logutil import emit
 
 try:
-    from cogs.licenses import LENGTHS, issue_for_order, length_label, receipt_line, set_active_for_order
+    from cogs.licenses import LENGTHS, issue_for_order, length_label, my_keys, receipt_line, set_active_for_order
 except ImportError:  # cogs/licenses.py isn't uploaded yet: the shop still works, just without macro keys
     LENGTHS = {"1day": 1, "1week": 7, "1month": 30, "lifetime": 0}
 
@@ -36,6 +36,9 @@ except ImportError:  # cogs/licenses.py isn't uploaded yet: the shop still works
 
     async def set_active_for_order(order, active):
         return False
+
+    async def my_keys(user_id):
+        return []
 from stripeutil import format_amount, make_ref, parse_ref_full, tracked_url, verify_signature, webhook_secrets
 
 log = logging.getLogger("verification-bot")
@@ -100,39 +103,51 @@ def pick(*values):
 
 
 def build_product(guild: discord.Guild, p, shop, rating=None, options=None) -> discord.Embed:
-    """A branded product card: a status banner, a wide price field, and a clean rating line."""
+    """A clean product card: the text, then the price big and clear, then three tidy columns
+    (stock, what you get, rating), the image, and one secure-checkout line at the bottom."""
     color_hex = pick(p["color"], shop["color"] if shop else None)
     color = int(color_hex, 16) if color_hex else ACCENT.value
     average, count = rating or (None, 0)
-
     in_stock = bool(p["available"])
-    banner = "🟢 **IN STOCK**" if in_stock else "🔴 **SOLD OUT**"
+
     perks = []
     if p["file_id"]:
-        perks.append("📥 Instant delivery by DM")
+        perks.append("📥 Instant delivery")
     if p["role_id"]:
-        perks.append(f"🎭 Unlocks <@&{p['role_id']}>")
+        perks.append(f"🎭 <@&{p['role_id']}>")
     if options and any(o["license_days"] is not None for o in options):
-        perks.append("🔑 Key included")
+        perks.append("🔑 Macro key")
     elif p["license_days"] is not None:
         perks.append(f"🔑 {length_label(p['license_days'])} key")
-    banner_line = banner + ("  ·  " + "  ·  ".join(perks) if perks else "")
 
+    parts = []
     description = (p["description"] or "").strip()
-    body = (description + "\n\n" if description else "") + banner_line
+    if description:
+        parts.append(description)
+    if options:
+        # one line per option, prices lined up after the name
+        parts.append("\n".join(f"**{o['label']}** — `{o['price'] or 'See checkout'}`" for o in options))
+    else:
+        # headings only render in the description (in a field they showed as a raw "## $5")
+        parts.append(f"## {p['price'] or 'See checkout'}")
 
     embed = ui.card(
-        f"💎 {p['name']}", body, color=color,
+        f"💎 {p['name']}", "\n\n".join(parts), color=color,
         author=(f"{guild.name.upper()} · SHOP", guild.icon.url if guild.icon else None),
-        footer="🔒 " + pick(shop["footer"] if shop else None, DEFAULT_FOOTER),
+        footer=checkout_footer(shop),
         image=p["image_url"] or None,
     )
-    if options:
-        embed.add_field(name="💰 Options", value="\n".join(f"**{o['label']}** · {o['price'] or 'See checkout'}" for o in options), inline=True)
-    else:
-        embed.add_field(name="💰 Price", value=f"## {p['price'] or 'See checkout'}", inline=True)
+    embed.add_field(name="📦 Status", value="🟢 In stock" if in_stock else "🔴 Sold out", inline=True)
+    embed.add_field(name="🎁 You get", value="\n".join(perks) or "—", inline=True)
     embed.add_field(name="⭐ Rating", value=ui.rating_line(average, count), inline=True)
     return embed
+
+
+def checkout_footer(shop) -> str:
+    """Exactly one lock in front, however the custom footer was typed."""
+    text = pick(shop["footer"] if shop else None, DEFAULT_FOOTER)
+    text = text.lstrip().lstrip("🔒🔐").strip() or DEFAULT_FOOTER.lstrip("🔒 ")
+    return "🔒 " + text
 
 
 def buy_item(p, shop, option=None):
@@ -1182,40 +1197,43 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
 
 @app_commands.guild_only()
 class BuyCog(commands.Cog):
-    """The member-facing /buy and /myorders commands."""
+    """The member-facing /store and /myorders commands. (/store also does what /buy used to:
+    pick a product to jump straight to its card.)"""
 
-    @app_commands.command(description="Show a product and its Buy button")
-    @app_commands.describe(product="Which product", public="Show it to everyone in the channel (default: only you)")
+    @app_commands.command(description="Browse everything for sale, or jump straight to one product")
+    @app_commands.describe(product="Optional: show this product and its Buy buttons", public="Show it to everyone in the channel (default: only you)")
     @app_commands.autocomplete(product=product_autocomplete)
-    async def buy(self, interaction: discord.Interaction, product: Optional[str] = None, public: bool = False):
-        p = await resolve_product(interaction, product)
-        embed, view = await product_message(interaction.guild, p)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=not public)
-
-    @app_commands.command(description="Browse everything for sale")
-    async def store(self, interaction: discord.Interaction):
+    async def store(self, interaction: discord.Interaction, product: Optional[str] = None, public: bool = False):
+        if product:
+            p = await resolve_product(interaction, product)
+            embed, view = await product_message(interaction.guild, p)
+            return await interaction.response.send_message(embed=embed, view=view, ephemeral=not public)
         products = await db.fetch_all("SELECT * FROM products WHERE guild_id = ? ORDER BY name", (interaction.guild_id,))
         if not products:
             raise UserError("There's nothing for sale yet. Check back soon!")
         shop = await db.get_shop(interaction.guild_id)
         await interaction.response.send_message(
-            embed=await catalog_embed(interaction.guild, products), view=StoreView(products, shop), ephemeral=True
+            embed=await catalog_embed(interaction.guild, products), view=StoreView(products, shop), ephemeral=not public
         )
 
-    @app_commands.command(description="See your past purchases and Invoice IDs")
+    @app_commands.command(description="See your purchases, Invoice IDs and macro keys")
     async def myorders(self, interaction: discord.Interaction):
         rows = await db.fetch_all(
             "SELECT * FROM orders WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT 10", (interaction.guild_id, interaction.user.id)
         )
-        if not rows:
+        keys = await my_keys(interaction.user.id)
+        if not rows and not keys:
             raise UserError("You don't have any purchases here yet.")
         shop = await db.get_shop(interaction.guild_id)
         tickets_cfg = await db.get_ticket_config(interaction.guild_id)
         channel_id = (shop["ticket_channel_id"] if shop else None) or (tickets_cfg["panel_channel_id"] if tickets_cfg else None)
         ticket = f"Send it in <#{channel_id}>" if channel_id else "Send it to any staff member"
-        lines = [f"`{o['code']}` · **{o['product_name']}** · {o['amount'] or '—'} · {discord.utils.format_dt(discord.utils.parse_time(o['created_at']), 'd')}"
-                 + (f"\n  🔑 `{o['license_code']}`" if o["license_code"] else "") for o in rows]
-        embed = ui.card("🧾 Your purchases", "\n".join(lines) + f"\n\n{ui.DIVIDER}\n🎫 **Need help? Just use your ID.** {ticket}, that's all staff need to find your order.", guild=interaction.guild, section="Shop")
+        lines = [f"`{o['code']}` · **{o['product_name']}** · {o['amount'] or '—'} · {discord.utils.format_dt(discord.utils.parse_time(o['created_at']), 'd')}" for o in rows]
+        embed = ui.card("🧾 Your purchases", "\n".join(lines) or "No orders yet.", guild=interaction.guild, section="Shop")
+        if keys:
+            # (this used to be its own /mykeys command)
+            embed.add_field(name="🔑 Your macro keys", value="\n".join(keys)[:1024] + "\nPaste a key into the macro's login screen.", inline=False)
+        embed.add_field(name="🎫 Need help?", value=f"**Just use your ID.** {ticket}, that's all staff need to find your order.", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

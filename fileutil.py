@@ -27,11 +27,11 @@ def human_size(n: float) -> str:
 
 
 def max_file_bytes() -> int:
-    return int(float(os.getenv("MAX_FILE_MB", "200")) * 1024 * 1024)
+    return int(float(os.getenv("MAX_FILE_MB", "1000")) * 1024 * 1024)
 
 
 def storage_cap_bytes() -> int:
-    return int(float(os.getenv("FILE_STORAGE_MB", "1000")) * 1024 * 1024)
+    return int(float(os.getenv("FILE_STORAGE_MB", "10000")) * 1024 * 1024)
 
 
 def public_base_url() -> Optional[str]:
