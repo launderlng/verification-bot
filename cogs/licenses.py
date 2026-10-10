@@ -385,14 +385,15 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             guild = guilds[0] if guilds else None
         return guild
 
-    async def key_log(self, row, title: str, user_id: Optional[int], lines: tuple, color=None) -> None:
+    async def key_log(self, row, title: str, user_id: Optional[int], lines: tuple, color=None,
+                      who_label: str = "👤 Discord", name: Optional[str] = None) -> None:
         """Post to the 🔑 key-logs channel (set up with /logs). Never lets a logging problem block a login."""
-        who = (f"<@{user_id}> · `{user_id}`" if user_id else "No Discord account linked")
+        who = (f"<@{user_id}> · `{user_id}`" + (f" · {name}" if name else "") if user_id else "No Discord account linked")
         try:
             guild = self.log_guild(row)
             if guild is None:
                 return
-            await emit(guild, "keys", title, ui.kv(("👤 Discord", who), ("🔑 Key", f"`{row['code']}`" if row is not None else None), *lines),
+            await emit(guild, "keys", title, ui.kv((who_label, who), ("🔑 Key", f"`{row['code']}`" if row is not None else None), *lines),
                        color, subject=user_id)
         except Exception:
             log.exception("Couldn't post a key log")
@@ -440,12 +441,16 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             if link is None:
                 return web.Response(text="DENIED|LINK YOUR DISCORD ACCOUNT FIRST")
             if not self.in_server(link["user_id"]):
-                await self.key_log(row, "🚪 Key tried by someone not in the server", link["user_id"], (("❌ Refused", "Not in the server"),), WARN)
+                await self.key_log(row, "🚪 Key tried by someone not in the server", link["user_id"], (("❌ Refused", "Not in the server"),), WARN,
+                                   who_label="🕵️ Tried by", name=link["username"])
                 return web.Response(text=f"DENIED|JOIN {INVITE.upper()} FIRST")
             if owner and owner != link["user_id"]:
                 await log_event(row["id"], "activation_denied", f"used by other account {link['user_id']}")
-                await self.key_log(row, "🚫 Key used by a different account", link["user_id"],
-                                   (("🔐 Owner", f"<@{owner}> · `{owner}`"), ("❌ Refused", "Possible key sharing")), DANGER)
+                await self.key_log(row, "🚫 Someone tried to use another person's key", link["user_id"],
+                                   (("🔐 Key owner", f"<@{owner}> · `{owner}`"),
+                                    ("❌ Refused", "Possible key sharing"),
+                                    ("🔎 Look up", f"`/key list member:` → pick <@{link['user_id']}> to see their own keys")),
+                                   DANGER, who_label="🕵️ Tried by", name=link["username"])
                 return web.Response(text="DENIED|THIS KEY BELONGS TO ANOTHER DISCORD ACCOUNT")
             if not owner:  # first use locks the key to this account
                 await db.execute("UPDATE licenses SET user_id = ? WHERE id = ? AND user_id IS NULL", (link["user_id"], row["id"]))
