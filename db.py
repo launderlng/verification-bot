@@ -410,6 +410,31 @@ CREATE TABLE IF NOT EXISTS upload_channels (
 -- than once (gateway resume, or two bot instances briefly overlapping during a deploy). A row here means that
 -- attachment has already been processed; INSERT OR IGNORE against the primary key is how callers check-and-claim
 -- atomically without a separate read-then-write race.
+-- Macro license keys (checked by the macro at POST /api/activate, see cogs/licenses.py)
+CREATE TABLE IF NOT EXISTS licenses (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    code        TEXT NOT NULL UNIQUE,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT,
+    last_seen   TEXT,
+    activations INTEGER NOT NULL DEFAULT 0,
+    guild_id    INTEGER,
+    user_id     INTEGER,
+    owner_name  TEXT,
+    order_code  TEXT,
+    created_by  INTEGER,
+    note        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_licenses_user ON licenses (user_id);
+CREATE TABLE IF NOT EXISTS license_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_id INTEGER,
+    event_type TEXT NOT NULL,
+    detail     TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS processed_uploads (
     message_id    INTEGER NOT NULL,
     attachment_id INTEGER NOT NULL,
@@ -482,6 +507,8 @@ MIGRATIONS = [
     ("welcome_config", "banner_url", "TEXT"),
     ("welcome_config", "banner_file_id", "INTEGER"),
     ("posts", "data", "TEXT"),
+    ("products", "license_days", "INTEGER"),
+    ("orders", "license_code", "TEXT"),
 ]
 
 
@@ -549,6 +576,7 @@ async def upsert_welcome(guild_id: int, **fields) -> None:
 
 PRODUCT_COLUMNS = {
     "name", "description", "price", "buy_url", "image_url", "color", "button_label", "available", "channel_id", "message_id", "file_id", "role_id",
+    "license_days",
 }
 SHOP_COLUMNS = {"default_channel_id", "color", "button_label", "footer", "ticket_channel_id", "receipt_note", "order_prefix", "order_style", "order_counter"}
 
