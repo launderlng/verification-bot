@@ -2,14 +2,12 @@ import asyncio
 import io
 import logging
 import mimetypes
-import os
 import re
 import zipfile
 from pathlib import Path
 from typing import Optional
 
 import discord
-from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 
@@ -289,28 +287,6 @@ class AutoUpload(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    async def cog_load(self):
-        app = getattr(self.bot, "web_app", None)
-        if app is not None:
-            app.router.add_get("/preview/{filename}", self.handle_preview)
-
-    # --------------------------------------------------- oversized previews ----
-
-    async def handle_preview(self, request: web.Request) -> web.StreamResponse:
-        """Serves a preview image/video that was too big to attach to the Discord message directly -- pasted as a
-        plain link in the post's content instead, which Discord unfurls into a native inline player the same as
-        a real attachment, as long as this answers with the right Content-Type and isn't forced to download.
-        Public by design: a URL here is exactly what would otherwise have been a plain inline attachment, which
-        was never role-gated either -- only the real deliverable behind the Get-file button is."""
-        raw_id = request.match_info.get("filename", "").split(".", 1)[0]
-        if not raw_id.isdigit():
-            return web.Response(status=404, text="Not found.")
-        row = await db.fetch_one("SELECT path, content_type FROM preview_media WHERE id = ?", (int(raw_id),))
-        if not row or not row["path"] or not os.path.exists(row["path"]):
-            return web.Response(status=404, text="This preview isn't available any more.")
-        headers = {"Content-Type": row["content_type"] or "application/octet-stream", "Cache-Control": "public, max-age=3600"}
-        return web.FileResponse(row["path"], headers=headers)
-
     @app_commands.command(name="autoupload", description="Manage drop zones that auto-upload and auto-post files")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -469,7 +445,6 @@ class AutoUpload(commands.Cog):
         photo = file_attach = None
         too_large_for_preview = False
         too_large_size = too_large_limit = None
-        preview_url = None
         if preview_att is not None:
             # preview_att is only ever something other than the sole deliverable when a real (non-media) file
             # was forwarded alongside a preview image/video -- that image/video is shown inline here but is
@@ -495,27 +470,9 @@ class AutoUpload(commands.Cog):
             elif ctype.startswith(("image/", "video/", "audio/")):
                 too_large_for_preview = True
                 too_large_size, too_large_limit = len(preview_data), inline_limit
-                # Can't attach it to the message, but a plain https link to it in the post's CONTENT (not an
-                # embed) still gets unfurled by Discord into a native inline player, the same as a real
-                # attachment would -- as long as handle_preview answers with the right Content-Type and isn't
-                # forced to download. Needs a public web address to serve it from; without one, the post just
-                # gets the "too large to preview" note below instead.
-                base = public_base_url()
-                if base:
-                    try:
-                        preview_path = new_path(store_guild_id)
-                        await asyncio.to_thread(Path(preview_path).write_bytes, preview_data)
-                        await db.execute(
-                            "INSERT INTO preview_media (guild_id, path, filename, content_type, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (store_guild_id, preview_path, preview_att.filename, ctype or "application/octet-stream", discord.utils.utcnow().isoformat()),
-                        )
-                        media_row = await db.fetch_one("SELECT id FROM preview_media WHERE path = ?", (preview_path,))
-                        preview_url = f"{base}/preview/{media_row['id']}{ext}"
-                    except OSError:
-                        log.exception("autoupload: couldn't save oversized preview to disk for message %s", message.id)
             log.info(
-                "autoupload: ingest preview=%s deliver=%s -- raw content_type=%r resolved ctype=%r size=%d inline_limit=%d -> photo=%s file_attach=%s too_large=%s preview_url=%s",
-                preview_att.filename, out_filename, preview_att.content_type, ctype, len(preview_data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview, bool(preview_url),
+                "autoupload: ingest preview=%s deliver=%s -- raw content_type=%r resolved ctype=%r size=%d inline_limit=%d -> photo=%s file_attach=%s too_large=%s",
+                preview_att.filename, out_filename, preview_att.content_type, ctype, len(preview_data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
             )
 
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
@@ -527,27 +484,19 @@ class AutoUpload(commands.Cog):
         # sent in -- putting the title in the embed (like the image case does) made it look stuck below the
         # video. So for a video/audio post, the title goes in the message content instead (always renders at the
         # very top) and the embed is left titleless, giving one clean flow: title, video, GIF, button.
-        title = None if (file_attach or preview_url) else row["pack_name"]
-        if file_attach or preview_url:
-            content = f"**{row['pack_name']}**" + (f"\n{preview_url}" if preview_url else "")
-        else:
-            content = None
-        # If the preview itself was too big to attach AND couldn't be served as a link either (no public web
-        # address set up), say so right on the post instead of the preview just silently not being there.
-        description = (
-            f"⚠️ Preview is {human_size(too_large_size)}, too large to show here ({human_size(too_large_limit)} limit) — press **Get file** below."
-            if too_large_for_preview and not preview_url else None
-        )
+        title = None if file_attach else row["pack_name"]
+        content = f"**{row['pack_name']}**" if file_attach else None
+        # If the preview itself was too big to attach inline, say so right on the post instead of the preview
+        # just silently not being there -- otherwise it looks like the upload failed when it didn't.
+        description = f"⚠️ Preview is {human_size(too_large_size)}, too large to show here ({human_size(too_large_limit)} limit) — press **Get file** below." if too_large_for_preview else None
         draft = Draft(post_channel, title, description, None, None,
                        photo=photo, file=file_attach, gif_url=row["gif_url"],
                        deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
         log_fields = [("👤 By", message.author.mention), ("📦 Stored as", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention)]
         if too_large_for_preview:
-            log_fields.append((
-                "🎬 Oversized preview" if preview_url else "⚠️ No preview",
-                f"{human_size(too_large_size)} is over the {human_size(too_large_limit)} inline limit" + (" -- served as a link instead" if preview_url else ""),
-            ))
+            # Not shown on the public post -- staff can see why a video/image had no inline preview here instead.
+            log_fields.append(("⚠️ No preview", f"{human_size(too_large_size)} is over the {human_size(too_large_limit)} inline limit"))
         await emit(post_channel.guild, "files", "File auto-uploaded", ui.kv(*log_fields), subject=message.author.id)
 
     # ----------------------------------------------------------- commands ----

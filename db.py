@@ -416,21 +416,6 @@ CREATE TABLE IF NOT EXISTS processed_uploads (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (message_id, attachment_id)
 );
-
--- A preview image/video too big for Discord to attach inline (over the 25 MB bot-upload cap) gets saved here and
--- served from the bot's own web address instead, so it can still be pasted as a plain link in the post -- Discord
--- unfurls a direct video/image link into a native inline player the same as an attachment, as long as the URL
--- answers with the right Content-Type and isn't forced to download. Public by design (no token/role check): this
--- is exactly what would otherwise have been a plain inline attachment, which was never role-gated either -- only
--- the real deliverable behind the Get-file button is.
-CREATE TABLE IF NOT EXISTS preview_media (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id     INTEGER NOT NULL,
-    path         TEXT NOT NULL,
-    filename     TEXT NOT NULL,
-    content_type TEXT,
-    created_at   TEXT NOT NULL
-);
 """
 
 CONFIG_COLUMNS = {
