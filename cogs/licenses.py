@@ -3,12 +3,19 @@
 * The macro checks a key with  POST /api/activate  (form field `code`) and gets back
   `OK|LICENSE VALID` or `DENIED|<reason>` - the same format the old website used, so the
   macro only needs the bot's web address.
-* Products can hand out a key automatically: `/shop edit product:<name> license_days:<n>`
-  (0 = lifetime). Every Stripe purchase or /shop createorder for that product gets a fresh
+* Products can hand out a key automatically: `/shop edit product:<name> license_key:<length>`
+  (1 Day / 1 Week / 1 Month / Lifetime; timed keys start on their first login). Every Stripe purchase or /shop createorder for that product gets a fresh
   key in the receipt DM.
 * Admins manage keys with /key ..., members see theirs with /mykeys.
+* Discord linking (on once DISCORD_CLIENT_SECRET is set): before a key works, the macro must
+  link a Discord account. The macro gets a session from POST /api/auth/new, opens
+  /auth/start?s=<session> (Discord's Authorize page), and polls GET /api/auth/status?s=<session>.
+  The key check then needs that linked session: a key with no owner is locked to the first
+  account that uses it, a key owned by someone else is refused, and the account must still be in
+  the server. Links are remembered for LINK_DAYS days.
 """
 import csv
+import html
 import io
 import logging
 import os
@@ -17,6 +24,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -34,6 +42,24 @@ ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I mix-ups
 PREFIX = "".join(c for c in os.getenv("LICENSE_PREFIX", "XZX").upper() if c.isalnum())[:8] or "XZX"
 RATE_LIMIT = 30          # key checks allowed per IP ...
 RATE_WINDOW = 60         # ... per this many seconds
+CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
+CLIENT_ID_ENV = os.getenv("DISCORD_CLIENT_ID", "").strip()
+LINK_DAYS = max(1, int(os.getenv("LINK_DAYS", "30") or 30))
+PENDING_MINUTES = 10     # how long a not-yet-authorized link session stays usable
+DISCORD_API = "https://discord.com/api/v10"
+INVITE = os.getenv("DISCORD_INVITE", "discord.gg/xzxx")
+
+# Key lengths offered in /shop and /key. Timed keys start counting at the buyer's FIRST macro
+# login, so a key bought late at night still gets its full time.
+LENGTHS = {"1day": 1, "1week": 7, "1month": 30, "lifetime": 0}
+LENGTH_CHOICES = [app_commands.Choice(name="1 Day", value="1day"), app_commands.Choice(name="1 Week", value="1week"),
+                  app_commands.Choice(name="1 Month", value="1month"), app_commands.Choice(name="Lifetime", value="lifetime")]
+
+
+def length_label(days: Optional[int]) -> str:
+    if not days:
+        return "Lifetime"
+    return {1: "1 Day", 7: "1 Week", 30: "1 Month"}.get(days, f"{days} Days")
 
 
 # ------------------------------------------------------------ helpers ----
@@ -63,6 +89,8 @@ def parse_time(value) -> Optional[datetime]:
 def expiry_text(row) -> str:
     exp = parse_time(row["expires_at"])
     if exp is None:
+        if row["duration_days"]:
+            return f"{length_label(row['duration_days'])} · starts on first login"
         return "Lifetime"
     if exp <= now():
         return f"Expired {discord.utils.format_dt(exp, 'R')}"
@@ -87,17 +115,16 @@ async def log_event(license_id: Optional[int], event_type: str, detail: str = ""
 
 async def create_license(guild_id: Optional[int], days: Optional[int], *, user_id: Optional[int] = None, order_code: Optional[str] = None,
                          created_by: Optional[int] = None, note: Optional[str] = None) -> str:
-    """Make a new unique key. days None/0 = lifetime."""
+    """Make a new unique key. days None/0 = lifetime; otherwise the clock starts on its first login."""
     created = now()
-    expires = (created + timedelta(days=days)).isoformat() if days else None
     for _ in range(40):
         code = new_code()
         if await db.fetch_one("SELECT 1 FROM licenses WHERE code = ?", (code,)):
             continue
         await db.execute(
-            "INSERT INTO licenses (code, active, created_at, expires_at, activations, guild_id, user_id, order_code, created_by, note) "
-            "VALUES (?, 1, ?, ?, 0, ?, ?, ?, ?, ?)",
-            (code, created.isoformat(), expires, guild_id, user_id, order_code, created_by, note),
+            "INSERT INTO licenses (code, active, created_at, expires_at, duration_days, activations, guild_id, user_id, order_code, created_by, note) "
+            "VALUES (?, 1, ?, NULL, ?, 0, ?, ?, ?, ?, ?)",
+            (code, created.isoformat(), days or None, guild_id, user_id, order_code, created_by, note),
         )
         row = await db.fetch_one("SELECT id FROM licenses WHERE code = ?", (code,))
         await log_event(row["id"] if row else None, "created", f"order {order_code}" if order_code else (note or "manual"))
@@ -166,6 +193,33 @@ async def key_autocomplete(interaction: discord.Interaction, current: str) -> li
     return [app_commands.Choice(name=r["code"], value=r["code"]) for r in rows]
 
 
+# ----------------------------------------------------- discord linking ----
+
+def redirect_uri() -> Optional[str]:
+    base = public_base_url()
+    return f"{base}/auth/callback" if base else None
+
+
+def clean_session(value: Optional[str]) -> str:
+    v = (value or "").strip()
+    return v if 20 <= len(v) <= 64 and all(c.isalnum() or c in "-_" for c in v) else ""
+
+
+def page(title: str, text: str, ok: bool = True) -> web.Response:
+    """The little page shown in the browser after Authorize - same purple look as the macro."""
+    icon = "✓" if ok else "!"
+    accent = "#9d4eff" if ok else "#f0587e"
+    body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title><style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Segoe UI,system-ui,sans-serif;color:#f4eeff;
+background:radial-gradient(ellipse at 15% 0%,#3a1474 0%,#09060f 65%)}}
+.c{{width:min(420px,88vw);padding:36px 32px;border-radius:22px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.13);text-align:center}}
+.i{{width:56px;height:56px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center;font-size:28px;background:{accent};box-shadow:0 0 34px {accent}}}
+h1{{font-size:22px;margin:0 0 10px}}p{{margin:0;color:#a99cc4;line-height:1.5}}</style></head>
+<body><div class="c"><div class="i">{icon}</div><h1>{html.escape(title)}</h1><p>{text}</p></div></body></html>"""
+    return web.Response(text=body, content_type="text/html")
+
+
 # -------------------------------------------------------------- cog ----
 
 @app_commands.guild_only()
@@ -180,7 +234,117 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         app = getattr(self.bot, "web_app", None)
         if app is not None:
             app.router.add_post("/api/activate", self.handle_activate)
-            log.info("License check route is ready at /api/activate")
+            app.router.add_post("/api/auth/new", self.handle_auth_new)
+            app.router.add_get("/api/auth/status", self.handle_auth_status)
+            app.router.add_get("/auth/start", self.handle_auth_start)
+            app.router.add_get("/auth/callback", self.handle_auth_callback)
+            log.info("License check route is ready at /api/activate (Discord linking %s)",
+                     "ON" if self.linking_enabled() else "off: set DISCORD_CLIENT_SECRET to turn it on")
+
+    # --------------------------------------------------- discord linking ----
+
+    def client_id(self) -> Optional[str]:
+        return CLIENT_ID_ENV or (str(self.bot.application_id) if getattr(self.bot, "application_id", None) else None)
+
+    def linking_enabled(self) -> bool:
+        return bool(CLIENT_SECRET and self.client_id() and redirect_uri())
+
+    def in_server(self, user_id: int) -> bool:
+        guilds = getattr(self.bot, "guilds", None) or []
+        if not guilds:
+            return True  # not connected yet: don't lock people out during a restart
+        return any(g.get_member(user_id) is not None for g in guilds)
+
+    async def linked_user(self, session: str):
+        """The linked session row if it's authorized and not expired, else None."""
+        if not session:
+            return None
+        row = await db.fetch_one("SELECT * FROM auth_sessions WHERE id = ?", (session,))
+        if not row or not row["user_id"]:
+            return None
+        linked = parse_time(row["linked_at"])
+        if linked is None or linked + timedelta(days=LINK_DAYS) <= now():
+            return None
+        return row
+
+    async def handle_auth_new(self, request: web.Request) -> web.Response:
+        ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "?")
+        if self.limited("new:" + ip):
+            return web.Response(text="DENIED|TOO MANY ATTEMPTS, WAIT A MINUTE")
+        if not self.linking_enabled():
+            return web.Response(text="OFF|DISCORD LINKING IS NOT SET UP")
+        session = secrets.token_urlsafe(24)
+        await db.execute("INSERT INTO auth_sessions (id, created_at) VALUES (?, ?)", (session, now().isoformat()))
+        # tidy up stale sessions now and then
+        cutoff_pending = (now() - timedelta(minutes=PENDING_MINUTES * 3)).isoformat()
+        cutoff_linked = (now() - timedelta(days=LINK_DAYS + 1)).isoformat()
+        await db.execute("DELETE FROM auth_sessions WHERE (user_id IS NULL AND created_at < ?) OR (linked_at IS NOT NULL AND linked_at < ?)",
+                         (cutoff_pending, cutoff_linked))
+        return web.Response(text=f"OK|{session}|{public_base_url()}/auth/start?s={session}")
+
+    async def handle_auth_status(self, request: web.Request) -> web.Response:
+        if not self.linking_enabled():
+            return web.Response(text="OFF")
+        session = clean_session(request.query.get("s"))
+        row = await db.fetch_one("SELECT * FROM auth_sessions WHERE id = ?", (session,)) if session else None
+        if not row:
+            return web.Response(text="EXPIRED")
+        if row["error"]:
+            return web.Response(text=f"ERROR|{row['error']}")
+        if row["user_id"]:
+            if await self.linked_user(session) is None:
+                return web.Response(text="EXPIRED")
+            name = (row["username"] or "your account").replace("|", "")
+            return web.Response(text=f"LINKED|{name}|{row['user_id']}")
+        created = parse_time(row["created_at"])
+        if created is None or created + timedelta(minutes=PENDING_MINUTES) <= now():
+            return web.Response(text="EXPIRED")
+        return web.Response(text="PENDING")
+
+    async def handle_auth_start(self, request: web.Request) -> web.Response:
+        session = clean_session(request.query.get("s"))
+        row = await db.fetch_one("SELECT * FROM auth_sessions WHERE id = ?", (session,)) if session else None
+        if not self.linking_enabled() or not row:
+            return page("Link expired", "Go back to the macro and press <b>Link Discord account</b> again.", ok=False)
+        from urllib.parse import urlencode
+        query = urlencode({"client_id": self.client_id(), "redirect_uri": redirect_uri(), "response_type": "code",
+                           "scope": "identify", "state": session, "prompt": "consent"})
+        raise web.HTTPFound(f"https://discord.com/oauth2/authorize?{query}")
+
+    async def handle_auth_callback(self, request: web.Request) -> web.Response:
+        session = clean_session(request.query.get("state"))
+        row = await db.fetch_one("SELECT * FROM auth_sessions WHERE id = ?", (session,)) if session else None
+        if not row:
+            return page("Link expired", "Go back to the macro and press <b>Link Discord account</b> again.", ok=False)
+        if request.query.get("error"):
+            await db.execute("UPDATE auth_sessions SET error = ? WHERE id = ?", ("AUTHORIZE WAS CANCELLED", session))
+            return page("Cancelled", "You didn't authorize. Go back to the macro and try again.", ok=False)
+        code = request.query.get("code", "")
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
+                async with http.post(f"{DISCORD_API}/oauth2/token", data={
+                    "client_id": self.client_id(), "client_secret": CLIENT_SECRET, "grant_type": "authorization_code",
+                    "code": code, "redirect_uri": redirect_uri(),
+                }) as r:
+                    token = await r.json(content_type=None)
+                if "access_token" not in token:
+                    raise RuntimeError(f"token exchange failed: {token.get('error')} {token.get('error_description', '')}")
+                async with http.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {token['access_token']}"}) as r:
+                    me = await r.json(content_type=None)
+        except Exception as e:
+            log.warning("Discord link failed: %s", e)
+            await db.execute("UPDATE auth_sessions SET error = ? WHERE id = ?", ("DISCORD LOGIN FAILED, TRY AGAIN", session))
+            return page("Something went wrong", "Discord didn't confirm the login. Go back to the macro and try again.", ok=False)
+        user_id = int(me["id"])
+        name = (me.get("global_name") or me.get("username") or "your account")[:40]
+        if not self.in_server(user_id):
+            await db.execute("UPDATE auth_sessions SET error = ? WHERE id = ?", (f"JOIN {INVITE.upper()} FIRST", session))
+            return page("Join the Discord first", f"<b>{html.escape(name)}</b> isn't in the server yet. Join "
+                        f"<a style='color:#b57bff' href='https://{html.escape(INVITE)}'>{html.escape(INVITE)}</a>, then link again.", ok=False)
+        await db.execute("UPDATE auth_sessions SET user_id = ?, username = ?, linked_at = ?, error = NULL WHERE id = ?",
+                         (user_id, name, now().isoformat(), session))
+        log.info("Macro linked to Discord user %s (%s)", name, user_id)
+        return page("Account linked", f"Signed in as <b>{html.escape(name)}</b>.<br>You can close this tab and go back to the macro.")
 
     # ------------------------------------------------- macro key check ----
 
@@ -214,6 +378,23 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if exp is not None and exp <= now():
             await log_event(row["id"], "activation_denied", "Expired")
             return web.Response(text="DENIED|KEY EXPIRED")
+        owner = row["user_id"]
+        if self.linking_enabled():
+            link = await self.linked_user(clean_session(form.get("session")))
+            if link is None:
+                return web.Response(text="DENIED|LINK YOUR DISCORD ACCOUNT FIRST")
+            if not self.in_server(link["user_id"]):
+                return web.Response(text=f"DENIED|JOIN {INVITE.upper()} FIRST")
+            if owner and owner != link["user_id"]:
+                await log_event(row["id"], "activation_denied", f"used by other account {link['user_id']}")
+                return web.Response(text="DENIED|THIS KEY BELONGS TO ANOTHER DISCORD ACCOUNT")
+            if not owner:  # first use locks the key to this account
+                await db.execute("UPDATE licenses SET user_id = ? WHERE id = ? AND user_id IS NULL", (link["user_id"], row["id"]))
+                await log_event(row["id"], "bound", str(link["user_id"]))
+        if row["expires_at"] is None and row["duration_days"]:  # first login starts a timed key's clock
+            await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ? AND expires_at IS NULL",
+                             ((now() + timedelta(days=row["duration_days"])).isoformat(), row["id"]))
+            await log_event(row["id"], "started", length_label(row["duration_days"]))
         await db.execute("UPDATE licenses SET last_seen = ?, activations = activations + 1 WHERE id = ?", (now().isoformat(), row["id"]))
         await log_event(row["id"], "activated", "Macro login")
         return web.Response(text="OK|LICENSE VALID")
@@ -222,18 +403,21 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
 
     @app_commands.command(description="Make new macro keys")
     @app_commands.describe(
+        length="How long the key lasts (starts on its first login)",
         count="How many keys (1-25)",
-        days="How long they last in days (leave empty for lifetime)",
         member="Give the key(s) to this member and DM them",
         note="A private note for staff",
+        custom_days="Any other length in days (overrides length)",
     )
-    async def generate(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 25] = 1,
-                       days: Optional[app_commands.Range[int, 1, 3650]] = None, member: Optional[discord.Member] = None,
-                       note: Optional[app_commands.Range[str, 1, 200]] = None):
+    @app_commands.choices(length=LENGTH_CHOICES)
+    async def generate(self, interaction: discord.Interaction, length: str = "lifetime", count: app_commands.Range[int, 1, 25] = 1,
+                       member: Optional[discord.Member] = None, note: Optional[app_commands.Range[str, 1, 200]] = None,
+                       custom_days: Optional[app_commands.Range[int, 1, 3650]] = None):
+        days = custom_days or LENGTHS.get(length, 0) or None
         await interaction.response.defer(ephemeral=True)
         codes = [await create_license(interaction.guild_id, days, user_id=member.id if member else None,
                                       created_by=interaction.user.id, note=note) for _ in range(count)]
-        length = f"{days} days" if days else "Lifetime"
+        length = length_label(days) + (" (starts on first login)" if days else "")
         dm = ""
         if member:
             try:
@@ -273,7 +457,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             raise UserError("No keys match that.")
         total = (await db.fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(active), 0) AS a FROM licenses"))
         lines = [f"{status_text(r)[:1]} `{r['code']}` · {('<@' + str(r['user_id']) + '>') if r['user_id'] else (r['owner_name'] or 'unassigned')} · "
-                 f"{'Lifetime' if not r['expires_at'] else expiry_text(r)}" for r in rows[:20]]
+                 f"{expiry_text(r)}" for r in rows[:20]]
         more = f"\n…and {len(rows) - 20} more" if len(rows) > 20 else ""
         await interaction.response.send_message(
             embed=ui.card("🔑 Keys", "\n".join(lines) + more, guild=interaction.guild,
@@ -306,13 +490,16 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                      lifetime: bool = False):
         row = await find_license(code)
         if lifetime:
-            new_exp = None
+            await db.execute("UPDATE licenses SET expires_at = NULL, duration_days = NULL WHERE id = ?", (row["id"],))
+        elif days and row["expires_at"] is None and row["duration_days"]:  # not started yet: make it longer
+            await db.execute("UPDATE licenses SET duration_days = duration_days + ? WHERE id = ?", (days, row["id"]))
+        elif days and row["expires_at"] is None:
+            raise UserError("That key is already lifetime.")
         elif days:
             base = max(parse_time(row["expires_at"]) or now(), now())
-            new_exp = (base + timedelta(days=days)).isoformat()
+            await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ?", ((base + timedelta(days=days)).isoformat(), row["id"]))
         else:
             raise UserError("Fill in `days` or set `lifetime` to True.")
-        await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ?", (new_exp, row["id"]))
         await log_event(row["id"], "extended", "lifetime" if lifetime else f"+{days}d")
         row = await find_license(code)
         await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
@@ -387,11 +574,21 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         else:
             where = ("⚠️ I don't know my public web address yet. In Railway open this bot's service → **Settings → Networking → "
                      "Generate Domain**, redeploy, then run this again.")
-        products = "\n".join(f"• **{p['name']}** · {'Lifetime' if not p['license_days'] else str(p['license_days']) + ' days'}" for p in selling) \
-            or "None yet. Use `/shop edit product:<name> license_days:0` (0 = lifetime)."
+        products = "\n".join(f"• **{p['name']}** · {length_label(p['license_days'])} key" for p in selling) \
+            or "None yet. Use `/shop edit product:<name> license_key:<length>`."
         embed = ui.card("🔑 Key system", where, guild=interaction.guild, section="Keys")
         embed.add_field(name="Products that give a key", value=products, inline=False)
         embed.add_field(name="Keys stored", value=f"{total['c']:,}", inline=True)
+        if self.linking_enabled():
+            linking = f"✅ On. People must link their Discord before a key works (remembered {LINK_DAYS} days)."
+        else:
+            cb = redirect_uri() or "https://<your bot address>/auth/callback"
+            linking = ("⚠️ Off. To turn it on:\n"
+                       "**1.** Discord Developer Portal → your bot's app → **OAuth2**.\n"
+                       f"**2.** Under **Redirects** add:\n```{cb}```"
+                       "**3.** Copy the **Client Secret** (Reset Secret if it's hidden).\n"
+                       "**4.** Railway → this bot → **Variables** → add `DISCORD_CLIENT_SECRET` = that secret, then redeploy.")
+        embed.add_field(name="🔗 Discord linking", value=linking, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

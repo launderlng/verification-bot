@@ -179,7 +179,7 @@ class General(commands.Cog):
             "config": {"verified_role_id", "rules_text"}, "verifications": set(), "welcome_config": {"style", "bg_url", "banner_mode"}, "log_routes": set(),
             "warnings": set(), "products": {"buy_url", "available", "file_id", "role_id"}, "shop_settings": {"ticket_channel_id", "order_prefix", "order_style", "order_counter"},
             "orders": {"code", "file_status", "source", "role_status", "processed_by", "fulfillment"}, "ticket_config": {"staff_roles"}, "ticket_types": {"needs_invoice"}, "tickets": {"rating"}, "ticket_blacklist": set(), "reviews": {"stars", "kind", "staff_id", "ticket_id"}, "review_settings": {"require_purchase"}, "giveaways": {"required_role_id", "min_invites", "ping_role_id"}, "giveaway_entries": set(), "log_history": {"subject_id"}, "stored_files": {"data", "required_role_id", "path"}, "allowed_guilds": {"guild_id"}, "file_deliveries": set(), "pages": {"image_file_id"}, "invite_joins": {"inviter_id"}, "message_counts": {"count"}, "ping_roles": {"role_id"}, "automod_settings": {"enabled"}, "staff_notes": {"text"}, "posts": {"message_id"},
-            "licenses": {"code", "expires_at", "user_id"}, "license_events": set(),
+            "licenses": {"code", "expires_at", "user_id"}, "license_events": set(), "auth_sessions": {"user_id", "linked_at"},
         }
         db_problems = []
         existing = {r["name"] for r in await db.fetch_all("SELECT name FROM sqlite_master WHERE type = 'table'")}
