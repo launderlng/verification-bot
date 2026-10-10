@@ -36,6 +36,7 @@ CATEGORIES = {
     "staff": "Staff actions",
     "commands": "Every slash command anyone runs",
     "events": "Scheduled server events",
+    "keys": "Macro key logins and Discord links",
 }
 
 
@@ -69,6 +70,7 @@ LOG_CHANNELS = {
     "staff": ("🛠️・staff-logs", "Staff actions", ["staff"]),
     "commands": ("⌨️・command-logs", "Every slash command anyone runs", ["commands"]),
     "events": ("🗓️・event-logs", "Scheduled server events", ["events"]),
+    "keys": ("🔑・key-logs", "Macro key logins, refused keys and Discord links", ["keys"]),
 }
 ESSENTIALS = {"join", "leave", "message_edit", "message_delete", "ban", "kick", "timeout", "warn", "verification", "tickets", "role_create", "role_delete", "role_update"}
 HISTORY_DAYS = 30
@@ -110,7 +112,7 @@ CATEGORY_STYLE = {
     "channel_create": ("📁 Channel created", SUCCESS), "channel_delete": ("📁 Channel deleted", DANGER), "channel_update": ("📁 Channel updated", INFO),
     "nicknames": ("✏️ Names", INFO), "voice": ("🔊 Voice", ACCENT), "server": ("⚙️ Server", WARN),
     "shop": ("🛒 Shop", SUCCESS), "tickets": ("🎫 Tickets", ACCENT), "giveaways": ("🎉 Giveaways", ACCENT), "invites": ("🔗 Invites", INFO), "files": ("📥 Files", INFO), "automod": ("🤖 Automod", WARN), "posts": ("📢 Posts", INFO), "staff": ("🛠️ Staff", INFO),
-    "commands": ("⌨️ Commands", INFO), "events": ("🗓️ Events", ACCENT),
+    "commands": ("⌨️ Commands", INFO), "events": ("🗓️ Events", ACCENT), "keys": ("🔑 Keys", ACCENT),
 }
 
 

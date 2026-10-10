@@ -32,7 +32,7 @@ from discord.ext import commands
 
 import db
 import ui
-from common import SUCCESS, WARN, UserError
+from common import DANGER, SUCCESS, WARN, UserError
 from fileutil import public_base_url
 from logutil import emit
 
@@ -235,6 +235,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.hits: dict[str, list[float]] = {}
+        self.login_logged: dict[tuple, float] = {}
         super().__init__()
 
     async def cog_load(self):
@@ -351,6 +352,16 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         await db.execute("UPDATE auth_sessions SET user_id = ?, username = ?, linked_at = ?, error = NULL WHERE id = ?",
                          (user_id, name, now().isoformat(), session))
         log.info("Macro linked to Discord user %s (%s)", name, user_id)
+        try:
+            guild = self.log_guild()
+        except Exception:
+            guild = None
+        if guild is not None:
+            try:
+                await emit(guild, "keys", "🔗 Discord account linked to the macro",
+                           ui.kv(("👤 Discord", f"<@{user_id}> · `{user_id}`"), ("🏷️ Name", name)), SUCCESS, subject=user_id)
+            except Exception:
+                log.exception("Couldn't post a link log")
         return page("Account linked", f"Signed in as <b>{html.escape(name)}</b>.<br>You can close this tab and go back to the macro.")
 
     # ------------------------------------------------- macro key check ----
@@ -363,6 +374,41 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if len(self.hits) > 5000:  # keep memory bounded
             self.hits = {k: v for k, v in self.hits.items() if v and t - v[-1] < RATE_WINDOW}
         return len(recent) > RATE_LIMIT
+
+    # ------------------------------------------------------------ key logs ----
+
+    def log_guild(self, row=None) -> Optional[discord.Guild]:
+        gid = row["guild_id"] if row is not None and row["guild_id"] else None
+        guild = self.bot.get_guild(gid) if gid else None
+        if guild is None:
+            guilds = getattr(self.bot, "guilds", None) or []
+            guild = guilds[0] if guilds else None
+        return guild
+
+    async def key_log(self, row, title: str, user_id: Optional[int], lines: tuple, color=None,
+                      who_label: str = "👤 Discord", name: Optional[str] = None) -> None:
+        """Post to the 🔑 key-logs channel (set up with /logs). Never lets a logging problem block a login."""
+        who = (f"<@{user_id}> · `{user_id}`" + (f" · {name}" if name else "") if user_id else "No Discord account linked")
+        try:
+            guild = self.log_guild(row)
+            if guild is None:
+                return
+            await emit(guild, "keys", title, ui.kv((who_label, who), ("🔑 Key", f"`{row['code']}`" if row is not None else None), *lines),
+                       color, subject=user_id)
+        except Exception:
+            log.exception("Couldn't post a key log")
+
+    def should_log_login(self, key_id: int, user_id: Optional[int]) -> bool:
+        """At most one 'logged in' entry per key + account every 10 minutes, so relaunching doesn't spam."""
+        t = time.monotonic()
+        k = (key_id, user_id)
+        last = self.login_logged.get(k, 0)
+        if t - last < 600:
+            return False
+        self.login_logged[k] = t
+        if len(self.login_logged) > 5000:
+            self.login_logged = {x: v for x, v in self.login_logged.items() if t - v < 600}
+        return True
 
     async def handle_activate(self, request: web.Request) -> web.Response:
         ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "?")
@@ -378,32 +424,55 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (code,))
         if not row:
             return web.Response(text="DENIED|INVALID KEY")
+        link = await self.linked_user(clean_session(form.get("session"))) if self.linking_enabled() else None
+        who = link["user_id"] if link else row["user_id"]
         if not row["active"]:
             await log_event(row["id"], "activation_denied", "Disabled")
+            await self.key_log(row, "⛔ Disabled key tried", who, (("❌ Refused", "The key is disabled"),), DANGER)
             return web.Response(text="DENIED|KEY DISABLED")
         exp = parse_time(row["expires_at"])
         if exp is not None and exp <= now():
             await log_event(row["id"], "activation_denied", "Expired")
+            await self.key_log(row, "⌛ Expired key tried", who, (("❌ Refused", f"Expired {discord.utils.format_dt(exp, 'R')}"),), WARN)
             return web.Response(text="DENIED|KEY EXPIRED")
         owner = row["user_id"]
+        first_link = False
         if self.linking_enabled():
-            link = await self.linked_user(clean_session(form.get("session")))
             if link is None:
                 return web.Response(text="DENIED|LINK YOUR DISCORD ACCOUNT FIRST")
             if not self.in_server(link["user_id"]):
+                await self.key_log(row, "🚪 Key tried by someone not in the server", link["user_id"], (("❌ Refused", "Not in the server"),), WARN,
+                                   who_label="🕵️ Tried by", name=link["username"])
                 return web.Response(text=f"DENIED|JOIN {INVITE.upper()} FIRST")
             if owner and owner != link["user_id"]:
                 await log_event(row["id"], "activation_denied", f"used by other account {link['user_id']}")
+                await self.key_log(row, "🚫 Someone tried to use another person's key", link["user_id"],
+                                   (("🔐 Key owner", f"<@{owner}> · `{owner}`"),
+                                    ("❌ Refused", "Possible key sharing"),
+                                    ("🔎 Look up", f"`/key list member:` → pick <@{link['user_id']}> to see their own keys")),
+                                   DANGER, who_label="🕵️ Tried by", name=link["username"])
                 return web.Response(text="DENIED|THIS KEY BELONGS TO ANOTHER DISCORD ACCOUNT")
             if not owner:  # first use locks the key to this account
                 await db.execute("UPDATE licenses SET user_id = ? WHERE id = ? AND user_id IS NULL", (link["user_id"], row["id"]))
                 await log_event(row["id"], "bound", str(link["user_id"]))
+                first_link = True
+        started = False
         if row["expires_at"] is None and row["duration_days"]:  # first login starts a timed key's clock
             await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ? AND expires_at IS NULL",
                              ((now() + timedelta(days=row["duration_days"])).isoformat(), row["id"]))
             await log_event(row["id"], "started", length_label(row["duration_days"]))
+            started = True
         await db.execute("UPDATE licenses SET last_seen = ?, activations = activations + 1 WHERE id = ?", (now().isoformat(), row["id"]))
         await log_event(row["id"], "activated", "Macro login")
+        first = started or first_link or not row["activations"]
+        if first or self.should_log_login(row["id"], who):
+            fresh = await db.fetch_one("SELECT * FROM licenses WHERE id = ?", (row["id"],))
+            await self.key_log(
+                fresh, "🟢 Key activated (first login)" if first else "🔓 Macro login", who,
+                (("⏳ Length", expiry_text(fresh)), ("🔢 Logins", f"{fresh['activations']:,}"),
+                 ("🔗 Locked to", "this account (first use)" if first_link else None),
+                 ("🧾 Order", f"`{fresh['order_code']}`" if fresh["order_code"] else None)),
+                SUCCESS)
         return web.Response(text="OK|LICENSE VALID")
 
     # ---------------------------------------------------------- commands ----
@@ -435,7 +504,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                 dm = f"\n📬 Sent to {member.mention} by DM."
             except discord.HTTPException:
                 dm = f"\n📪 Couldn't DM {member.mention} (DMs closed). Give them the key yourself."
-        await emit(interaction.guild, "shop", "🔑 Keys generated",
+        await emit(interaction.guild, "keys", "🔑 Keys generated",
                    ui.kv(("Count", str(count)), ("Length", length), ("For", member.mention if member else None), ("By", interaction.user.mention), ("Note", note)),
                    SUCCESS, subject=member.id if member else None)
         body = "\n".join(f"`{c}`" for c in codes)
@@ -474,7 +543,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await find_license(code)
         await db.execute("UPDATE licenses SET active = ? WHERE id = ?", (int(active), row["id"]))
         await log_event(row["id"], "activated" if active else "deactivated", f"by {interaction.user.id}")
-        await emit(interaction.guild, "shop", "🔑 Key enabled" if active else "⛔ Key disabled",
+        await emit(interaction.guild, "keys", "🔑 Key enabled" if active else "⛔ Key disabled",
                    ui.kv(("Key", f"`{row['code']}`"), ("Owner", f"<@{row['user_id']}>" if row["user_id"] else None), ("By", interaction.user.mention)),
                    subject=row["user_id"])
         row = await find_license(code)
