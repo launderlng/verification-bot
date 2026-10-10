@@ -392,10 +392,6 @@ class AutoUpload(commands.Cog):
         total_declared = sum(a.size for a in deliver_atts)
         if total_declared > max_file_bytes():
             raise UserError(f"that's {human_size(total_declared)} total, over the {human_size(max_file_bytes())} limit")
-        if total_declared > await self.room_left(store_guild_id):
-            raise UserError(f"that would go over the {human_size(storage_cap_bytes())} storage limit")
-        if total_declared > ATTACH_LIMIT and not public_base_url():
-            raise UserError(NEEDS_WEB)
 
         single = len(deliver_atts) == 1
         if single:
@@ -421,21 +417,39 @@ class AutoUpload(commands.Cog):
             out_filename = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "files") + ".zip"
             content_type = "application/zip"
 
-        name = clean_name(out_filename, taken)
-        path = None
-        stored_data = data
-        if len(data) > ATTACH_LIMIT:
-            path = new_path(store_guild_id)
-            await asyncio.to_thread(Path(path).write_bytes, data)
-            stored_data = b""
+        # Attach the real file straight to the post when it fits Discord's own cap for this server (boost-tier
+        # aware) -- no Get-file button, no DM, it's just sitting right there in the channel. The one exception is
+        # a drop zone with a required role set: attaching directly would hand the file to anyone who can see the
+        # channel with no role check at all, so those still go through the gated Get-file/DM flow regardless of
+        # size.
+        deliver_inline_limit = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
+        attach_directly = len(data) <= deliver_inline_limit and not required_role
 
-        await db.execute(
-            "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (store_guild_id, name, out_filename, content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
-             required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path),
-        )
-        file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
+        file_row = extra_file = None
+        name = out_filename
+        if attach_directly:
+            extra_file = (out_filename, data, len(data))
+        else:
+            if total_declared > await self.room_left(store_guild_id):
+                raise UserError(f"that would go over the {human_size(storage_cap_bytes())} storage limit")
+            if total_declared > ATTACH_LIMIT and not public_base_url():
+                raise UserError(NEEDS_WEB)
+
+            name = clean_name(out_filename, taken)
+            path = None
+            stored_data = data
+            if len(data) > ATTACH_LIMIT:
+                path = new_path(store_guild_id)
+                await asyncio.to_thread(Path(path).write_bytes, data)
+                stored_data = b""
+
+            await db.execute(
+                "INSERT INTO stored_files (guild_id, name, filename, content_type, size, data, description, required_role_id, once_per_user, uploaded_by, created_at, path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (store_guild_id, name, out_filename, content_type, len(data), stored_data, f"Auto-added from #{message.channel.name} ({message.guild.name})",
+                 required_role.id if required_role else None, int(row["once_per_user"]), message.author.id, discord.utils.utcnow().isoformat(), path),
+            )
+            file_row = await db.fetch_one("SELECT id FROM stored_files WHERE guild_id = ? AND name = ?", (store_guild_id, name))
 
         # Image/video/audio previews go inline when small enough to attach directly -- images as the embed's big
         # photo, video/audio attached to the message so Discord renders its native player. Either way the
@@ -484,15 +498,19 @@ class AutoUpload(commands.Cog):
         # sent in -- putting the title in the embed (like the image case does) made it look stuck below the
         # video. So for a video/audio post, the title goes in the message content instead (always renders at the
         # very top) and the embed is left titleless, giving one clean flow: title, video, GIF, button.
-        title = None if file_attach else row["pack_name"]
-        content = f"**{row['pack_name']}**" if file_attach else None
+        title = None if (file_attach or extra_file) else row["pack_name"]
+        content = f"**{row['pack_name']}**" if (file_attach or extra_file) else None
         # A too-large preview just isn't shown, same as if there were no preview at all -- no warning text on
-        # the public post, just the pack name, the GIF (if any), and the Get-file button.
+        # the public post. deliver is only set when the file went through the stored/Get-file path above --
+        # when it's attached directly (extra_file), there's nothing to deliver, so no button.
         draft = Draft(post_channel, title, None, None, None,
-                       photo=photo, file=file_attach, gif_url=row["gif_url"],
-                       deliver=(file_row["id"], name), pack=row["pack_name"], show_file_field=False, content=content)
+                       photo=photo, file=file_attach, extra_file=extra_file, gif_url=row["gif_url"],
+                       deliver=(file_row["id"], name) if file_row else None, pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
-        log_fields = [("👤 By", message.author.mention), ("📦 Stored as", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention)]
+        log_fields = [
+            ("👤 By", message.author.mention), ("📦 Name", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention),
+            ("📎 Delivery", "Attached directly to the post" if attach_directly else "Get-file button"),
+        ]
         if too_large_for_preview:
             # Not shown on the public post -- staff can see why a video/image had no inline preview here instead.
             log_fields.append(("⚠️ No preview", f"{human_size(too_large_size)} is over the {human_size(too_large_limit)} inline limit"))
