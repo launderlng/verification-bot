@@ -19,6 +19,18 @@ from cogs.files import file_autocomplete, file_payload, record_delivery
 from common import ACCENT, COLOR, INFO, SUCCESS, WARN, UserError, check_can_send, parse_color
 from fileutil import ATTACH_LIMIT, LINK_SECONDS, human_size
 from logutil import emit
+
+try:
+    from cogs.licenses import issue_for_order, receipt_line, set_active_for_order
+except ImportError:  # cogs/licenses.py isn't uploaded yet: the shop still works, just without macro keys
+    async def issue_for_order(guild_id, order, product):
+        return None
+
+    async def receipt_line(order):
+        return None
+
+    async def set_active_for_order(order, active):
+        return False
 from stripeutil import format_amount, make_ref, parse_ref, tracked_url, verify_signature, webhook_secrets
 
 log = logging.getLogger("verification-bot")
@@ -173,6 +185,7 @@ def order_embed(o, title: str = "🧾 Order") -> discord.Embed:
         ("📬 Receipt DM", "✅ Delivered" if o["dm_sent"] else "❌ Couldn't DM"),
         ("📥 File", {"delivered": "✅ Delivered", "failed": "❌ Not delivered (use /shop resend)"}.get(o["file_status"])),
         ("🎭 Role", {"granted": "✅ Given", "failed": "❌ Not given (use /shop resend)", "removed": "↩️ Taken back"}.get(o["role_status"])),
+        ("🔑 Macro key", f"`{o['license_code']}`" if o["license_code"] else None),
         ("🧰 Created by", "Staff (manual order)" if o["source"] == "manual" else None), ("⚙️ Fulfilment", fulfilment_text(o)),
         ("🕒 Processed", discord.utils.format_dt(discord.utils.parse_time(o["processed_at"]), "f") if o["processed_at"] else None), ("📝 Note", o["note"]),
         ("🔖 Stripe reference", f"`{o['stripe_ref']}`" if o["stripe_ref"] and o["source"] != "manual" else None),
@@ -412,7 +425,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
     # --------------------------------------------------- receipt + file DM ----
 
     def receipt_embed(self, guild: discord.Guild, order, shop, support_channel_id: Optional[int], file_line: Optional[str] = None,
-                      file_problem: bool = False, role_line: Optional[str] = None) -> discord.Embed:
+                      file_problem: bool = False, role_line: Optional[str] = None, key_line: Optional[str] = None) -> discord.Embed:
         """The purchase DM, kept clean: your order ID big and copyable, product / paid / file in three columns, one line on getting help."""
         code = order["code"]
         embed = ui.card(
@@ -429,6 +442,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             embed.add_field(name="📥 Your file", value=file_line, inline=True)
         if role_line:
             embed.add_field(name="🎭 Your role", value=role_line, inline=True)
+        if key_line:
+            embed.add_field(name="🔑 Your macro key", value=key_line, inline=False)
         where = f" in <#{support_channel_id}>" if support_channel_id else ""
         help_text = f"**Just use this ID.** Send `{code}` to support{where} or to any staff member. That's all we need."
         if shop and shop["receipt_note"]:
@@ -449,16 +464,17 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             role = guild.get_role(role_id)
             role_line = (f"✅ **{role.name}** added to your account" if role is not None else "✅ Added to your account") if role_status == "granted" else \
                 "⚠️ Couldn't add it automatically. Send your ID to support and we'll add it."
+        key_line = await receipt_line(order)
         payload = None
         if stored is not None:
             linked = stored["size"] > ATTACH_LIMIT
             line = f"`{stored['filename']}`\n{human_size(stored['size'])} · " + (
                 f"press **Download** below (private, valid {LINK_SECONDS // 60} min)" if linked else "attached below")
-            payload = await file_payload(user, guild, stored, embed=self.receipt_embed(guild, order, shop, support_channel, line, role_line=role_line), support_channel_id=support_channel)
+            payload = await file_payload(user, guild, stored, embed=self.receipt_embed(guild, order, shop, support_channel, line, role_line=role_line, key_line=key_line), support_channel_id=support_channel)
         if payload is not None:
             kwargs = payload
         else:  # no file for this product, or it couldn't be attached: send the receipt on its own
-            kwargs = {"embed": self.receipt_embed(guild, order, shop, support_channel, file_problem=stored is not None, role_line=role_line)}
+            kwargs = {"embed": self.receipt_embed(guild, order, shop, support_channel, file_problem=stored is not None, role_line=role_line, key_line=key_line)}
             if support_channel:
                 view = discord.ui.View()
                 view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{support_channel}"))
@@ -532,6 +548,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         country = ((details.get("address") or {}).get("country") or "").strip()[:2] or None
         await db.execute("UPDATE orders SET buyer_email = ?, buyer_country = ? WHERE guild_id = ? AND code = ?", (email, country, guild_id, code))
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (guild_id, code))
+        if await issue_for_order(guild_id, order, product):  # products with license_days get a macro key
+            order = await db.fetch_one("SELECT * FROM orders WHERE id = ?", (order["id"],))
         shop = await db.get_shop(guild_id)
 
         user = await self.resolve_buyer(guild, user_id)
@@ -550,7 +568,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
                     ("📧 Email", email), ("🌍 Country", country),
                     ("⚙️ Sent", "🤖 Automatically, no staff involved"), ("📬 Receipt DM", "✅ delivered" if delivered else "❌ couldn't DM, they can use /myorders"),
                     ("📥 File", None if file_status is None else ("✅ delivered with the receipt" if file_status == "delivered" else "❌ not delivered, use /shop resend")),
-                    ("🎭 Role", None if role_status is None else ("✅ given" if role_status == "granted" else "❌ not given: put my role above it, then use /shop resend"))),
+                    ("🎭 Role", None if role_status is None else ("✅ given" if role_status == "granted" else "❌ not given: put my role above it, then use /shop resend")),
+                    ("🔑 Macro key", f"`{order['license_code']}`" if order["license_code"] else None)),
             SUCCESS if livemode else WARN, subject=user_id,
         )
 
@@ -728,6 +747,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             interaction.guild_id, member.id, p, amount or p["price"], f"manual-{uuid.uuid4().hex}", None, True, source="manual", note=note, processed_by=interaction.user.id,
         )
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (interaction.guild_id, code))
+        if await issue_for_order(interaction.guild_id, order, p):
+            order = await db.fetch_one("SELECT * FROM orders WHERE id = ?", (order["id"],))
         shop = await db.get_shop(interaction.guild_id)
         delivered, file_status = False, ("failed" if order["file_id"] else None)
         role_status = await self.grant_role(interaction.guild, member, order, p)
@@ -748,32 +769,40 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             ("📪 I couldn't DM them (DMs closed?). Use `/shop resend` once they open DMs." if send else "Nothing was sent yet. Use `/shop resend` when you're ready."))
         await interaction.followup.send(
             embed=ui.card("🧾 Order created", ui.kv(("🧾 Invoice ID", f"`{code}`"), ("👤 Buyer", member.mention), ("📦 Product", p["name"]), ("💰 Amount", order["amount"] or "—"),
-                                                   ("📥 File", "Yes" if order["file_id"] else "None attached")) + f"\n\n{status}", color=SUCCESS, guild=interaction.guild, section="Shop"),
+                                                   ("📥 File", "Yes" if order["file_id"] else "None attached"),
+                                                   ("🔑 Macro key", f"`{order['license_code']}`" if order["license_code"] else None)) + f"\n\n{status}", color=SUCCESS, guild=interaction.guild, section="Shop"),
             ephemeral=True,
         )
 
-    @app_commands.command(description="Take back the role an order gave (for refunds)")
+    @app_commands.command(description="Refund clean-up: take back the role and turn off the macro key an order gave")
     @app_commands.describe(invoice_id="The order ID, e.g. INV-3F9A1C2E")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def revoke(self, interaction: discord.Interaction, invoice_id: app_commands.Range[str, 1, 30]):
         order = await find_order(interaction.guild_id, invoice_id)
         if not order:
             raise UserError(f"I can't find an order with ID `{invoice_id.strip().upper()}` in this server.")
-        if not order["role_id"]:
-            raise UserError("That order didn't give a role, so there's nothing to take back.")
+        if not order["role_id"] and not order["license_code"]:
+            raise UserError("That order didn't give a role or a macro key, so there's nothing to take back.")
         guild = interaction.guild
-        role, member = guild.get_role(order["role_id"]), guild.get_member(order["user_id"])
-        if role is None:
-            raise UserError("That role doesn't exist any more.")
-        if member is None:
-            raise UserError("That buyer isn't in the server any more, so they don't have the role.")
-        try:
-            await member.remove_roles(role, reason=f"Refund/revoke for {order['code']} by {interaction.user}")
-        except discord.HTTPException:
-            raise UserError("I couldn't take the role back. Make sure my role is above it.") from None
-        await db.execute("UPDATE orders SET role_status = 'removed' WHERE id = ?", (order["id"],))
-        await emit(guild, "shop", "↩️ Role taken back", ui.kv(("🧾 Invoice ID", f"`{order['code']}`"), ("👤 Buyer", member.mention), ("🎭 Role", role.mention), ("🛡️ By", interaction.user.mention)), subject=member.id)
-        await interaction.response.send_message(embed=ui.card("↩️ Role taken back", f"{role.mention} was removed from {member.mention} (order `{order['code']}`).", color=SUCCESS), ephemeral=True)
+        done = []
+        if order["role_id"]:
+            role, member = guild.get_role(order["role_id"]), guild.get_member(order["user_id"])
+            if role is None:
+                done.append("🎭 The role doesn't exist any more")
+            elif member is None:
+                done.append("🎭 The buyer left the server, so they don't have the role")
+            else:
+                try:
+                    await member.remove_roles(role, reason=f"Refund/revoke for {order['code']} by {interaction.user}")
+                    await db.execute("UPDATE orders SET role_status = 'removed' WHERE id = ?", (order["id"],))
+                    done.append(f"🎭 {role.mention} removed")
+                except discord.HTTPException:
+                    done.append("🎭 ❌ Couldn't remove the role. Make sure my role is above it")
+        if await set_active_for_order(order, False):
+            done.append(f"🔑 Key `{order['license_code']}` disabled")
+        await emit(guild, "shop", "↩️ Order revoked", ui.kv(("🧾 Invoice ID", f"`{order['code']}`"), ("👤 Buyer", f"<@{order['user_id']}>"), ("🛡️ By", interaction.user.mention))
+                   + "\n" + "\n".join(done), subject=order["user_id"])
+        await interaction.response.send_message(embed=ui.card("↩️ Order revoked", f"Order `{order['code']}` for <@{order['user_id']}>:\n" + "\n".join(done), color=SUCCESS), ephemeral=True)
 
     @app_commands.command(description="Send an order's receipt and file to the buyer again")
     @app_commands.describe(invoice_id="The order ID, e.g. INV-3F9A1C2E")
@@ -787,6 +816,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         if user is None:
             raise UserError("I can't find that buyer any more, so I can't DM them.")
         product = await db.get_product_by_id(order["product_id"]) if order["product_id"] else None
+        if not order["license_code"] and await issue_for_order(interaction.guild_id, order, product):
+            order = await db.fetch_one("SELECT * FROM orders WHERE id = ?", (order["id"],))
         shop = await db.get_shop(interaction.guild_id)
         role_status = await self.grant_role(interaction.guild, user, order, product)
         delivered, file_status = await self.deliver_order(interaction.guild, user, order, product, shop, role_status)
@@ -886,6 +917,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         delivery_file="A stored file (see /files add) sent to buyers by DM after they pay (or 'none')",
         grant_role="Buyers automatically get this role when they pay (e.g. Premium)",
         remove_role="Stop giving a role with this product",
+        license_days="Give buyers a macro key: 0 = lifetime, 30 = 30 days, -1 = stop giving keys",
     )
     @app_commands.autocomplete(product=product_autocomplete, delivery_file=file_autocomplete)
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -903,9 +935,12 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         delivery_file: Optional[str] = None,
         grant_role: Optional[discord.Role] = None,
         remove_role: bool = False,
+        license_days: Optional[app_commands.Range[int, -1, 3650]] = None,
     ):
         p = await resolve_product(interaction, product)
         updates: dict = {}
+        if license_days is not None:
+            updates["license_days"] = None if license_days < 0 else license_days
         if grant_role is not None:
             check_role_sellable(interaction.guild, grant_role)
             updates["role_id"] = grant_role.id
@@ -1036,7 +1071,8 @@ class BuyCog(commands.Cog):
         tickets_cfg = await db.get_ticket_config(interaction.guild_id)
         channel_id = (shop["ticket_channel_id"] if shop else None) or (tickets_cfg["panel_channel_id"] if tickets_cfg else None)
         ticket = f"Send it in <#{channel_id}>" if channel_id else "Send it to any staff member"
-        lines = [f"`{o['code']}` · **{o['product_name']}** · {o['amount'] or '—'} · {discord.utils.format_dt(discord.utils.parse_time(o['created_at']), 'd')}" for o in rows]
+        lines = [f"`{o['code']}` · **{o['product_name']}** · {o['amount'] or '—'} · {discord.utils.format_dt(discord.utils.parse_time(o['created_at']), 'd')}"
+                 + (f"\n  🔑 `{o['license_code']}`" if o["license_code"] else "") for o in rows]
         embed = ui.card("🧾 Your purchases", "\n".join(lines) + f"\n\n{ui.DIVIDER}\n🎫 **Need help? Just use your ID.** {ticket}, that's all staff need to find your order.", guild=interaction.guild, section="Shop")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

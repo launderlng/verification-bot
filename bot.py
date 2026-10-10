@@ -62,6 +62,7 @@ EXTENSIONS = [
     "cogs.pages", "cogs.verify", "cogs.welcome", "cogs.logs", "cogs.moderation", "cogs.automod", "cogs.shop", "cogs.tickets", "cogs.reviews",
     "cogs.giveaways", "cogs.invites", "cogs.activity", "cogs.pingroles", "cogs.files", "cogs.serverlock", "cogs.copychannel", "cogs.posts",
     "cogs.gifcreator", "cogs.staff", "cogs.cleanup", "cogs.templates", "cogs.setup", "cogs.general", "cogs.autoupload",
+    "cogs.licenses",
 ]
 
 logging.basicConfig(level=logging.INFO)
