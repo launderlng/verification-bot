@@ -249,6 +249,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         app = getattr(self.bot, "web_app", None)
         if app is not None:
             app.router.add_post("/api/activate", self.handle_activate)
+            app.router.add_post("/api/check", self.handle_check)
             app.router.add_post("/api/auth/new", self.handle_auth_new)
             app.router.add_get("/api/auth/status", self.handle_auth_status)
             app.router.add_get("/auth/start", self.handle_auth_start)
@@ -489,6 +490,41 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                 SUCCESS)
         return web.Response(text="OK|LICENSE VALID")
 
+    async def handle_check(self, request: web.Request) -> web.Response:
+        """Asked every minute by a logged-in macro. Quiet: doesn't count as a login or post to the key log unless it logs them out.
+        Answers OK, or REVOKED|reason when the key no longer works (the macro then logs them out).
+        Anything unclear (a bad request, an expired Discord link) answers OK, so nobody is logged out by mistake."""
+        try:
+            form = await request.post()
+        except Exception:
+            return web.Response(text="OK")
+        code = clean_code(form.get("code"))
+        if not code:
+            return web.Response(text="OK")
+        row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (code,))
+        reason = None
+        if not row:
+            reason = "KEY DELETED"
+        elif not row["active"]:
+            reason = "KEY DISABLED"
+        elif (exp := parse_time(row["expires_at"])) is not None and exp <= now():
+            reason = "KEY EXPIRED"
+        else:
+            asked = clean_macro(form.get("product")) or DEFAULT_MACRO
+            if row["macro"] and row["macro"] != asked:
+                reason = f"THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO"
+            elif self.linking_enabled() and row["user_id"]:
+                link = await self.linked_user(clean_session(form.get("session")))
+                if link is not None and link["user_id"] != row["user_id"]:
+                    reason = "THIS KEY BELONGS TO ANOTHER DISCORD ACCOUNT"
+        if reason is None:
+            await db.execute("UPDATE licenses SET last_seen = ? WHERE id = ?", (now().isoformat(), row["id"]))
+            return web.Response(text="OK")
+        if row:
+            await log_event(row["id"], "logged_out", reason)
+            await self.key_log(row, "🔒 Logged out of the macro", row["user_id"], (("❌ Reason", reason.capitalize()),), WARN)
+        return web.Response(text=f"REVOKED|{reason}")
+
     # ---------------------------------------------------------- commands ----
 
     @app_commands.command(description="Make new macro keys")
@@ -579,7 +615,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await find_license(code)
         await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
 
-    @app_commands.command(description="Stop a key from working (e.g. refund or sharing)")
+    @app_commands.command(description="Stop a key from working (e.g. refund or sharing). Anyone using it is logged out within a minute")
     @app_commands.autocomplete(code=key_autocomplete)
     async def disable(self, interaction: discord.Interaction, code: str):
         await self.set_active(interaction, code, False)
