@@ -404,20 +404,6 @@ class Logs(commands.GroupCog, group_name="logs", group_description="Server activ
         embed, on = await self.dashboard_embed(interaction.guild, note)
         await interaction.response.send_message(embed=embed, view=LogsDashboard(self, on), ephemeral=True)
 
-    @app_commands.command(description="Set up ALL logging in one step (creates private log channels)")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def auto(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        made, tested = await self.run_full_setup(interaction.guild, interaction.user)
-        lines = [f"{name.split('・')[0]} <#{made[key].id}> · {topic}" for key, (name, topic, _) in LOG_CHANNELS.items()]
-        embed = ui.card(
-            "⚡ Logging is ready",
-            f"Every log is **on** and sent to its own private channel in **{LOG_CATEGORY_NAME}** (only you, me and your ticket staff can see them). I posted a test message in each.\n\n" + "\n".join(lines)
-            + f"\n\n{ui.DIVIDER}\nChange anything later with `/logs setup`.",
-            guild=interaction.guild, section="Logs",
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
     @app_commands.command(description="Turn a log category on or off")
     @app_commands.describe(category="Start typing to search")
     @app_commands.autocomplete(category=category_autocomplete)

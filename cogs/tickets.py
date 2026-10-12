@@ -1,10 +1,12 @@
 import asyncio
 import io
+import json
 import logging
 import re
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 import discord
@@ -21,14 +23,125 @@ from transcript import render_transcript
 log = logging.getLogger("verification-bot")
 
 PRIORITIES = {"low": ("🟢", "Low"), "normal": ("🔵", "Normal"), "high": ("🟠", "High"), "urgent": ("🔴", "Urgent")}
-MAX_TYPES = 10
+MAX_TYPES = 25  # a Discord dropdown shows 25 options at most
+MAX_OPEN = 25   # most open tickets one member can be allowed (/ticket settings max_open)
+DEFAULT_TZ = "Australia/Sydney"
+AFTER_HOURS_TEXT = ("You've opened this ticket **outside our support hours** ({hours}), so replies may be slower than usual. "
+                    "It's in the queue and staff will get to it as soon as they're back {back}. No need to open another one.")
 MAX_MESSAGES = 5000
 CLOSE_DELAY = 5  # seconds between "closing…" and deleting the channel
 DEFAULT_WELCOME = "Thanks for reaching out! A member of staff will be with you shortly. Please describe your issue in as much detail as you can."
 DEFAULT_TYPES = [
     ("Support", "🛠️", "Get help with anything", "Thanks for reaching out! A member of staff will be with you shortly. Please describe your issue in as much detail as you can.", 0),
     ("Purchase help", "🧾", "Questions about an order (have your Invoice ID ready)", "Thanks for your purchase! Staff will check your Invoice ID and sort out your order.", 1),
+    ("Macro & key help", "🔑", "Problems with the macro or your key", "Tell us what's happening with the macro or your key. Screenshots and your macro.log help a lot.", 0),
+    ("Bug report", "🐞", "Something not working? Tell us", "Thanks for the report! Tell us what's broken and how to make it happen.", 0),
 ]
+MAX_QUESTIONS = 5  # a Discord pop-up holds 5 boxes
+QUESTION_LABEL = 45  # and each box's label is 45 characters at most
+
+# Ready-made ticket types for /ticket addtype preset:... Applications ask their own questions in the pop-up
+# and get Accept / Deny buttons for staff (accept can give a role).
+PRESETS = {
+    "staff": ("Staff application", "📋", "Apply to join the staff team",
+              "Thanks for applying! Staff will read your answers and get back to you here. Feel free to add anything below.",
+              ["How old are you?", "Your timezone + hours free per week?", "Any past staff experience? Where?",
+               "Why do you want to be staff here?", "Anything else we should know?"]),
+    "leaker": ("Leaker application", "📦", "Apply to post for the server",
+               "Thanks for applying! Staff will look over your answers and examples. You can drop more examples below.",
+               ["What will you post? (clothing, cars...)", "How often can you post new stuff?", "Links or examples of your work",
+                "Where have you posted before?", "Why do you want to join the team?"]),
+    "partner": ("Partnership", "🤝", "Partner your server with ours",
+                "Thanks! Staff will review your server and reply here.",
+                ["Server name + invite link", "How many members do you have?", "What is your server about?",
+                 "What are you offering / asking for?"]),
+    "creator": ("Content creator application", "🎥", "Apply for the content creator role",
+                "Thanks for applying! Staff will check out your channel and get back to you here.",
+                ["Your channel link(s)", "How many followers / subscribers?", "What kind of content do you make?",
+                 "How would you show off the server?"]),
+    "report": ("Report a member", "🚨", "Report someone breaking the rules",
+               "Thanks for the report. Staff will look into it. Add any extra screenshots below.",
+               ["Who are you reporting? (name or ID)", "What happened?", "Proof (links to screenshots / clips)"]),
+    "bug": ("Bug report", "🐞", "Something not working? Tell us",
+            "Thanks for the report! Staff will try to reproduce it. Add screenshots or your macro.log below.",
+            ["What's broken?", "How do we make it happen?", "Screenshots / clips (links)"]),
+    "giveaway": ("Claim a prize", "🎉", "Won a giveaway? Claim it here",
+                 "Congrats! Staff will check your win and sort out your prize.",
+                 ["Which giveaway did you win?", "Link to the winner message"]),
+    "keys": ("Macro & key help", "🔑", "Problems with the macro or your key",
+             "Tell us what's happening with the macro or your key. Screenshots and your macro.log help a lot.", []),
+    "purchase": ("Purchase help", "🧾", "Questions about an order (have your Invoice ID ready)",
+                 "Thanks for your purchase! Staff will check your Invoice ID and sort out your order.", []),
+    "refund": ("Refund request", "💸", "Ask for a refund (needs your Invoice ID)",
+               "Staff will check your order and get back to you about the refund.", []),
+    "other": ("Other", "💬", "Anything else", DEFAULT_WELCOME, []),
+}
+APPLICATION_PRESETS = {"staff", "leaker", "partner", "creator"}
+INVOICE_PRESETS = {"purchase", "refund"}
+APP_STATUS = {None: "⏳ Waiting for a decision", "pending": "⏳ Waiting for a decision", "accepted": "✅ Accepted", "denied": "❌ Denied"}
+
+
+def questions_of(ttype) -> list[str]:
+    raw = ttype["questions"] if ttype is not None and "questions" in ttype.keys() else None
+    return [q for q in (raw or "").split("\n") if q.strip()][:MAX_QUESTIONS]
+
+
+def is_application(ttype) -> bool:
+    """A type with questions AND an Accept/Deny decision (forms like Bug report / Report a member have no decision)."""
+    return bool(questions_of(ttype)) and bool(ttype["is_app"] if "is_app" in ttype.keys() else 0)
+
+
+def zone(cfg) -> ZoneInfo:
+    try:
+        return ZoneInfo((cfg["hours_tz"] if cfg is not None else None) or DEFAULT_TZ)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def hour_label(h: int) -> str:
+    h %= 24
+    return "12 AM" if h == 0 else "12 PM" if h == 12 else f"{h} AM" if h < 12 else f"{h - 12} PM"
+
+
+def hours_text(cfg) -> str:
+    tz = zone(cfg)
+    abbrev = datetime.now(tz).strftime("%Z")
+    return f"{hour_label(cfg['hours_start'])} – {hour_label(cfg['hours_end'])} {abbrev}".strip()
+
+
+def after_hours(cfg, now: Optional[datetime] = None) -> Optional[datetime]:
+    """None during support hours (or when the notice is off). Outside them: when support opens next."""
+    if cfg is None or not cfg["after_hours"]:
+        return None
+    start, end = cfg["hours_start"] % 24, cfg["hours_end"] % 24
+    if start == end:
+        return None  # open all day
+    tz = zone(cfg)
+    local = (now or discord.utils.utcnow()).astimezone(tz)
+    h = local.hour
+    is_open = start <= h < end if start < end else (h >= start or h < end)
+    if is_open:
+        return None
+    opens = local.replace(hour=start, minute=0, second=0, microsecond=0)
+    if opens <= local:
+        opens += timedelta(days=1)
+    return opens
+
+
+def after_hours_embed(cfg, opens: datetime) -> discord.Embed:
+    back = discord.utils.format_dt(opens, "R")
+    return ui.card("🌙 After hours", AFTER_HOURS_TEXT.format(hours=hours_text(cfg), back=back), color=WARN, section="Tickets")
+
+
+def qa_pairs(details: Optional[str]) -> Optional[list]:
+    if details and details.startswith("QA:"):
+        try:
+            return json.loads(details[3:])
+        except ValueError:
+            return None
+    return None
+
+
 INVOICE_RE = re.compile(r"^[A-Z0-9]{2,10}-[A-Z0-9]{3,12}$")  # any prefix: INV-3F9A1C2E, 14K-0042 …
 
 
@@ -79,13 +192,26 @@ def parse_iso(value: str):
 
 class TicketModal(discord.ui.Modal):
     def __init__(self, cog: "Tickets", ttype):
-        super().__init__(title=f"{ttype['name']} ticket"[:45])
+        has_questions = bool(questions_of(ttype))
+        super().__init__(title=(ttype['name'] if has_questions else f"{ttype['name']} ticket")[:45])
         self.cog, self.ttype = cog, ttype
         self.subject_input = discord.ui.TextInput(label="Subject", max_length=100, placeholder="A short summary")
         self.details_input = discord.ui.TextInput(
             label="Details", style=discord.TextStyle.paragraph, max_length=1000, placeholder="Tell us what's going on"
         )
         self.invoice_input = None
+        self.question_inputs = []
+        questions = questions_of(ttype)
+        if questions:  # an application / form: its own questions instead of subject + details
+            for i, q in enumerate(questions):
+                short = len(q) <= 34 and not q.lower().startswith(("why", "what happened", "links", "anything", "proof"))
+                box = discord.ui.TextInput(
+                    label=q[:QUESTION_LABEL], style=discord.TextStyle.short if short else discord.TextStyle.paragraph,
+                    max_length=200 if short else 1000, required=not q.lower().startswith("anything else"),
+                )
+                self.question_inputs.append((q, box))
+                self.add_item(box)
+            return
         self.add_item(self.subject_input)
         self.add_item(self.details_input)
         if ttype["needs_invoice"]:
@@ -93,6 +219,10 @@ class TicketModal(discord.ui.Modal):
             self.add_item(self.invoice_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if self.question_inputs:
+            answers = [[q, (box.value or "").strip() or "—"] for q, box in self.question_inputs]
+            await self.cog.safe(interaction, self.cog.create_ticket(interaction, self.ttype, self.ttype["name"], "QA:" + json.dumps(answers), None))
+            return
         invoice = self.invoice_input.value if self.invoice_input else None
         await self.cog.safe(interaction, self.cog.create_ticket(interaction, self.ttype, self.subject_input.value, self.details_input.value, invoice))
 
@@ -130,6 +260,34 @@ class TicketControls(discord.ui.View):
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, emoji="🙋", custom_id="ticket:claim")
     async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.safe(interaction, self.cog.do_claim(interaction))
+
+
+class DenyModal(discord.ui.Modal):
+    def __init__(self, cog: "Tickets"):
+        super().__init__(title="Deny application")
+        self.cog = cog
+        self.reason_input = discord.ui.TextInput(label="Reason (sent to them)", style=discord.TextStyle.paragraph, required=False, max_length=500,
+                                                 placeholder="e.g. Not enough experience yet, try again in a month")
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.safe(interaction, self.cog.decide_application(interaction, False, self.reason_input.value.strip() or None))
+
+
+class ApplicationControls(discord.ui.View):
+    """Persistent Accept / Deny buttons posted under an application ticket (staff only)."""
+
+    def __init__(self, cog: "Tickets"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅", custom_id="ticket:app:accept")
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.safe(interaction, self.cog.decide_application(interaction, True, None))
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="✖️", custom_id="ticket:app:deny")
+    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.safe(interaction, self.cog.open_deny(interaction))
 
 
 class OpenSelect(discord.ui.Select):
@@ -287,6 +445,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         self.bot.add_view(PanelSelectView(self))
         self.bot.add_view(PanelButtonView(self))
         self.bot.add_view(TicketControls(self))
+        self.bot.add_view(ApplicationControls(self))
         self.bot.add_dynamic_items(RateButton, CommentButton)
         rows = await db.fetch_all("SELECT id, channel_id FROM tickets WHERE status = 'open' AND channel_id IS NOT NULL")
         self.channels = {r["channel_id"]: r["id"] for r in rows}
@@ -340,15 +499,21 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         else:
             status = "⏳ Waiting for staff"
         welcome = ttype["welcome"] if ttype and ttype["welcome"] else DEFAULT_WELCOME
+        answers = qa_pairs(t["details"])
+        app = answers is not None and is_application(ttype) if ttype else answers is not None
         info = ui.kv(
             ("👤 Opened by", f"<@{t['user_id']}>"), ("🚦 Priority", f"{p_emoji} {p_label}"), ("📍 Status", status),
-            ("📌 Subject", t["subject"]), ("🧾 Invoice ID", f"`{t['invoice_code']}`" if t["invoice_code"] else None),
+            ("📋 Decision", APP_STATUS.get(t["app_status"], APP_STATUS[None]) if app else None),
+            ("📌 Subject", None if answers is not None else t["subject"]), ("🧾 Invoice ID", f"`{t['invoice_code']}`" if t["invoice_code"] else None),
         )
         embed = ui.card(
             f"🎫 Ticket {number_label(t)} · {emoji}{t['type_name']}", f"{welcome}\n\n{ui.DIVIDER}\n{info}",
             color=DANGER if t["priority"] == "urgent" else ACCENT, footer="Use the buttons below · Staff commands: /ticket claim, priority, add, close",
         )
-        if t["details"]:
+        if answers is not None:  # application / form answers, one per field
+            for i, (q, a) in enumerate(answers[:MAX_QUESTIONS], 1):
+                embed.add_field(name=f"{i}. {q}"[:256], value=(a or "—")[:1024], inline=False)
+        elif t["details"]:
             embed.add_field(name="📝 Details", value=t["details"][:1000], inline=False)
         return embed
 
@@ -538,12 +703,84 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
             allowed_mentions=discord.AllowedMentions(users=[member], roles=staff_roles if cfg["ping_staff"] else []),
         )
         await db.execute("UPDATE tickets SET control_message_id = ? WHERE id = ?", (message.id, t["id"]))
+        if qa_pairs(t["details"]) is not None and is_application(ttype):
+            role_note = f" Accepting gives <@&{ttype['accept_role_id']}>." if ttype["accept_role_id"] else ""
+            await channel.send(embed=simple("📋 Staff decision", f"Read the answers above, then accept or deny. The applicant gets a DM either way.{role_note}", INFO),
+                               view=ApplicationControls(self))
+        opens = after_hours(cfg)
+        if opens is not None:  # opened outside support hours: say replies may be slower
+            await channel.send(embed=after_hours_embed(cfg, opens))
 
         if invoice_code:
             await channel.send(embed=await self.invoice_embed(guild, member, invoice_code))
 
         await emit(guild, "tickets", "🎫 Ticket opened", ui.kv(("👤 Opened by", f"{member.mention} (`{member.id}`)"), ("📍 Channel", channel.mention), ("🎫 Ticket", f"{number_label(t)} · {ttype['name']}"), ("📌 Subject", subject.strip()), ("🧾 Invoice", f"`{invoice_code}`" if invoice_code else None)), COLOR, subject=member.id, ids=(("ticket", number_label(t)), ("channel", channel.id)))
-        await interaction.followup.send(embed=simple("✅ Ticket created", f"Head over to {channel.mention}. A staff member will be with you soon.", COLOR), ephemeral=True)
+        note = (f"\n\n🌙 It's outside support hours ({hours_text(cfg)}), so replies may be slower. Staff are back {discord.utils.format_dt(opens, 'R')}."
+                if opens is not None else "")
+        await interaction.followup.send(embed=simple("✅ Ticket created", f"Head over to {channel.mention}. A staff member will be with you soon.{note}", COLOR), ephemeral=True)
+
+    # ------------------------------------------------------ applications ----
+
+    async def open_deny(self, interaction: discord.Interaction) -> None:
+        cfg, t = await self.staff_ticket(interaction)
+        if t["app_status"] in ("accepted", "denied"):
+            raise UserError(f"This application was already {t['app_status']}.")
+        await interaction.response.send_modal(DenyModal(self))
+
+    async def decide_application(self, interaction: discord.Interaction, accept: bool, reason: Optional[str]) -> None:
+        """Accept or deny the application in this ticket: DM the applicant, give the role, log it, lock the buttons."""
+        cfg, t = await self.staff_ticket(interaction)
+        if t["app_status"] in ("accepted", "denied"):
+            raise UserError(f"This application was already {t['app_status']}.")
+        guild = interaction.guild
+        ttype = await db.fetch_one("SELECT * FROM ticket_types WHERE guild_id = ? AND name = ?", (guild.id, t["type_name"]))
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        status = "accepted" if accept else "denied"
+        await db.execute("UPDATE tickets SET app_status = ? WHERE id = ?", (status, t["id"]))
+        member = guild.get_member(t["user_id"])
+
+        role_line = None
+        if accept and ttype is not None and ttype["accept_role_id"]:
+            role = guild.get_role(ttype["accept_role_id"])
+            if role is None:
+                role_line = "⚠️ The role to give no longer exists."
+            elif member is None:
+                role_line = "⚠️ They've left the server, so no role was given."
+            else:
+                try:
+                    await member.add_roles(role, reason=f"{t['type_name']} accepted by {interaction.user}")
+                    role_line = f"🎭 Given {role.mention}"
+                except discord.HTTPException:
+                    role_line = f"⚠️ Couldn't give {role.mention}. Move my role above it."
+
+        dm_ok = False
+        if member is not None:
+            title = f"✅ Your {t['type_name'].lower()} was accepted!" if accept else f"Your {t['type_name'].lower()} wasn't accepted"
+            text = (f"Welcome aboard, staff will be in touch in your ticket in **{guild.name}**." if accept
+                    else f"Thanks for applying to **{guild.name}**." + (f"\n\n**Reason:** {reason}" if reason else ""))
+            try:
+                await member.send(embed=ui.card(title, text, color=SUCCESS if accept else WARN, guild=guild, section="Applications"))
+                dm_ok = True
+            except discord.HTTPException:
+                pass
+
+        result = ui.card(
+            "✅ Application accepted" if accept else "❌ Application denied",
+            ui.kv(("🛡️ By", interaction.user.mention), ("📝 Reason", reason), ("🎭 Role", role_line), ("📬 DM", "Sent" if dm_ok else "Their DMs are closed")),
+            color=SUCCESS if accept else DANGER, section="Tickets",
+        )
+        if interaction.message is not None:  # lock the buttons on the decision message
+            try:
+                await interaction.message.edit(embed=result, view=None)
+            except discord.HTTPException:
+                await interaction.channel.send(embed=result)
+        else:
+            await interaction.channel.send(embed=result)
+        await self.refresh_controls(guild, await db.fetch_one("SELECT * FROM tickets WHERE id = ?", (t["id"],)))
+        await emit(guild, "tickets", "📋 Application " + status, ui.kv(
+            ("👤 Applicant", f"<@{t['user_id']}> (`{t['user_id']}`)"), ("📋 Type", t["type_name"]), ("🎫 Ticket", number_label(t)),
+            ("🛡️ By", interaction.user.mention), ("📝 Reason", reason), ("🎭 Role", role_line)), SUCCESS if accept else DANGER, subject=t["user_id"])
 
     async def invoice_embed(self, guild: discord.Guild, member: discord.Member, code: str) -> discord.Embed:
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (guild.id, code))
@@ -880,11 +1117,15 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
     @app_commands.describe(
         category="Category where ticket channels are created",
         transcript_channel="Where transcripts of closed tickets are saved",
-        max_open="Open tickets allowed per member (1-10)",
+        max_open=f"Open tickets allowed per member (1-{MAX_OPEN})",
         auto_close_hours="Close tickets after this many idle hours (0 = never)",
         ping_staff="Ping the staff roles when a ticket opens",
         dm_transcript="DM the transcript to the member when their ticket closes",
         ask_rating="Ask the member to rate the support in that DM",
+        after_hours_notice="Tell people when they open a ticket outside support hours",
+        hours_start="Support hours start (hour 0-23, e.g. 8 = 8 AM)",
+        hours_end="Support hours end (hour 0-23, e.g. 18 = 6 PM)",
+        timezone="Timezone for support hours, e.g. Australia/Sydney, Europe/London, America/New_York",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def settings(
@@ -892,11 +1133,15 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         interaction: discord.Interaction,
         category: Optional[discord.CategoryChannel] = None,
         transcript_channel: Optional[discord.TextChannel] = None,
-        max_open: Optional[app_commands.Range[int, 1, 10]] = None,
+        max_open: Optional[app_commands.Range[int, 1, MAX_OPEN]] = None,
         auto_close_hours: Optional[app_commands.Range[int, 0, 720]] = None,
         ping_staff: Optional[bool] = None,
         dm_transcript: Optional[bool] = None,
         ask_rating: Optional[bool] = None,
+        after_hours_notice: Optional[bool] = None,
+        hours_start: Optional[app_commands.Range[int, 0, 23]] = None,
+        hours_end: Optional[app_commands.Range[int, 0, 23]] = None,
+        timezone: Optional[app_commands.Range[str, 2, 50]] = None,
     ):
         guild = interaction.guild
         await self.cfg_or_error(guild.id)
@@ -916,6 +1161,18 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
             updates["dm_transcript"] = int(dm_transcript)
         if ask_rating is not None:
             updates["ask_rating"] = int(ask_rating)
+        if after_hours_notice is not None:
+            updates["after_hours"] = int(after_hours_notice)
+        if hours_start is not None:
+            updates["hours_start"] = hours_start
+        if hours_end is not None:
+            updates["hours_end"] = hours_end
+        if timezone:
+            try:
+                ZoneInfo(timezone.strip())
+            except (ZoneInfoNotFoundError, ValueError):
+                raise UserError("I don't know that timezone. Use a name like `Australia/Sydney`, `Europe/London` or `America/New_York`.") from None
+            updates["hours_tz"] = timezone.strip()
         if updates:
             await db.upsert_ticket_config(guild.id, **updates)
         cfg = await db.get_ticket_config(guild.id)
@@ -934,6 +1191,10 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         embed.add_field(name="Ping staff", value="On" if cfg["ping_staff"] else "Off")
         embed.add_field(name="DM transcript", value="On" if cfg["dm_transcript"] else "Off")
         embed.add_field(name="Ask for rating", value="On" if cfg["ask_rating"] else "Off")
+        opens = after_hours(cfg)
+        embed.add_field(name="🌙 After-hours notice", value=(f"On · open {hours_text(cfg)}\n" + ("Outside hours right now" if opens else "Inside hours right now"))
+                        if cfg["after_hours"] else "Off")
+        embed.add_field(name="Timezone", value=str(zone(cfg)))
         embed.add_field(name="Ticket types", value=", ".join(f"{t['emoji'] or ''}{t['name']}" for t in types) or "None", inline=False)
         embed.add_field(name="Message text in transcripts", value="✅ Included" if self.bot.intents.message_content else "⚠️ Off (needs Message Content Intent)", inline=False)
         await interaction.response.send_message(("✅ Saved.\n" if updates else ""), embed=embed, ephemeral=True)
@@ -960,45 +1221,116 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         await db.upsert_ticket_config(interaction.guild_id, staff_roles=",".join(str(r) for r in sorted(roles)) or None)
         await interaction.response.send_message(f"✅ Removed {role.mention} from ticket staff.", ephemeral=True)
 
-    @app_commands.command(description="Add or edit a ticket type (shown in the panel)")
+    @app_commands.command(description="Add or edit a ticket type, e.g. Support, or a Staff / Leaker application")
     @app_commands.describe(
-        name="Type name, e.g. Support or Report",
+        preset="Ready-made type with its own questions (staff app, leaker app, partnership, report)",
+        name="Type name, e.g. Support or Report (a preset fills this in)",
         emoji="An emoji for it, e.g. 🛠️",
         description="Short description shown in the panel",
         welcome="Message shown at the top of tickets of this type",
         needs_invoice="Ask for an Invoice ID and check it against your shop orders",
+        questions="Your own questions for the pop-up, split with | (up to 5, 45 characters each). 'none' removes them",
+        accept_role="Applications: role given when staff press Accept",
     )
+    @app_commands.choices(preset=[app_commands.Choice(name="⭐ Add ALL of these at once", value="all")] + [
+        app_commands.Choice(name=f"{p[1]} {p[0]}", value=key) for key, p in PRESETS.items()
+    ])
     @app_commands.checks.has_permissions(manage_guild=True)
     async def addtype(
         self,
         interaction: discord.Interaction,
-        name: app_commands.Range[str, 1, 40],
+        preset: Optional[app_commands.Choice[str]] = None,
+        name: Optional[app_commands.Range[str, 1, 40]] = None,
         emoji: Optional[str] = None,
         description: Optional[app_commands.Range[str, 1, 100]] = None,
         welcome: Optional[app_commands.Range[str, 1, 1000]] = None,
         needs_invoice: Optional[bool] = None,
+        questions: Optional[app_commands.Range[str, 1, 300]] = None,
+        accept_role: Optional[discord.Role] = None,
     ):
         await self.cfg_or_error(interaction.guild_id)
-        emoji = clean_emoji(emoji)
-        existing = await db.fetch_one("SELECT * FROM ticket_types WHERE guild_id = ? AND name = ?", (interaction.guild_id, name.strip()))
+        if preset and preset.value == "all":
+            return await self.add_all_presets(interaction)
+        p = PRESETS.get(preset.value) if preset else None
+        if p and needs_invoice is None and preset.value in INVOICE_PRESETS:
+            needs_invoice = True
+        name = (name or (p[0] if p else "")).strip()
+        if not name:
+            raise UserError("Give the type a `name`, or pick a `preset`.")
+        emoji = clean_emoji(emoji) or (p[1] if p else None)
+        description = description or (p[2] if p else None)
+        welcome = welcome or (p[3] if p else None)
+        qs = None  # None = leave as is
+        if questions is not None:
+            qs = [] if questions.strip().lower() == "none" else [q.strip() for q in questions.split("|") if q.strip()]
+            if len(qs) > MAX_QUESTIONS:
+                raise UserError(f"A pop-up fits {MAX_QUESTIONS} questions at most.")
+            too_long = [q for q in qs if len(q) > QUESTION_LABEL]
+            if too_long:
+                raise UserError(f"Questions can be {QUESTION_LABEL} characters at most. This one is too long:\n> {too_long[0]}")
+        elif p:
+            qs = p[4]
+        if accept_role is not None and (accept_role.is_default() or accept_role.managed):
+            raise UserError("Pick a normal role for `accept_role`.")
+        if accept_role is not None and accept_role >= interaction.guild.me.top_role:
+            raise UserError(f"{accept_role.mention} is above my highest role, so I can't give it. Move my role above it first.")
+        if qs and needs_invoice:
+            raise UserError("A type with questions can't also ask for an Invoice ID (the pop-up only fits 5 boxes).")
+        existing = await db.fetch_one("SELECT * FROM ticket_types WHERE guild_id = ? AND name = ?", (interaction.guild_id, name))
         await interaction.response.defer(ephemeral=True)
+        q_text = None if qs is None else ("\n".join(qs) or None)
+        # Accept / Deny buttons: presets say so; custom questions get them when there's a role to give or it's called an application
+        is_app = (preset.value in APPLICATION_PRESETS) if p else (bool(accept_role) or "appl" in name.lower() or None)
         if existing:
             await db.execute(
-                "UPDATE ticket_types SET emoji = ?, description = ?, welcome = ?, needs_invoice = ? WHERE id = ?",
+                "UPDATE ticket_types SET emoji = ?, description = ?, welcome = ?, needs_invoice = ?, questions = ?, accept_role_id = ?, is_app = ? WHERE id = ?",
                 (emoji or existing["emoji"], description or existing["description"], welcome or existing["welcome"],
-                 existing["needs_invoice"] if needs_invoice is None else int(needs_invoice), existing["id"]),
+                 existing["needs_invoice"] if needs_invoice is None else int(needs_invoice),
+                 existing["questions"] if qs is None else q_text,
+                 accept_role.id if accept_role else existing["accept_role_id"],
+                 existing["is_app"] if is_app is None else int(is_app), existing["id"]),
             )
             verb = "Updated"
         else:
             if len(await self.types_for(interaction.guild_id)) >= MAX_TYPES:
                 raise UserError(f"You can have up to {MAX_TYPES} ticket types. Remove one with `/ticket removetype`.")
             await db.execute(
-                "INSERT INTO ticket_types (guild_id, name, emoji, description, welcome, needs_invoice) VALUES (?, ?, ?, ?, ?, ?)",
-                (interaction.guild_id, name.strip(), emoji, description, welcome, int(bool(needs_invoice))),
+                "INSERT INTO ticket_types (guild_id, name, emoji, description, welcome, needs_invoice, questions, accept_role_id, is_app) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (interaction.guild_id, name, emoji, description, welcome, int(bool(needs_invoice)), q_text, accept_role.id if accept_role else None, int(bool(is_app))),
             )
             verb = "Added"
         await self.refresh_panel(interaction.guild)
-        await interaction.followup.send(f"✅ {verb} the **{name.strip()}** ticket type and refreshed the panel.", ephemeral=True)
+        row = await db.fetch_one("SELECT * FROM ticket_types WHERE guild_id = ? AND name = ?", (interaction.guild_id, name))
+        extra = ""
+        if questions_of(row):
+            extra = "\n\n**Pop-up questions:**\n" + "\n".join(f"`{i}.` {q}" for i, q in enumerate(questions_of(row), 1))
+            if is_application(row):
+                extra += "\n\nStaff get **Accept / Deny** buttons in these tickets" + (f", and Accept gives <@&{row['accept_role_id']}>." if row["accept_role_id"] else ". Add `accept_role` to give a role on accept.")
+        await interaction.followup.send(f"✅ {verb} the **{name}** ticket type and refreshed the panel.{extra}", ephemeral=True)
+
+    async def add_all_presets(self, interaction: discord.Interaction) -> None:
+        """/ticket addtype preset:all - every ready-made type the server doesn't have yet, in one go."""
+        await interaction.response.defer(ephemeral=True)
+        have = {t["name"].lower() for t in await self.types_for(interaction.guild_id)}
+        added, skipped = [], []
+        for key, (name, emoji, desc, welcome, qs) in PRESETS.items():
+            if name.lower() in have:
+                continue
+            if len(have) >= MAX_TYPES:
+                skipped.append(name)
+                continue
+            await db.execute(
+                "INSERT INTO ticket_types (guild_id, name, emoji, description, welcome, needs_invoice, questions, accept_role_id, is_app) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                (interaction.guild_id, name, emoji, desc, welcome, int(key in INVOICE_PRESETS), "\n".join(qs) or None, int(key in APPLICATION_PRESETS)),
+            )
+            have.add(name.lower())
+            added.append(f"{emoji} {name}")
+        await self.refresh_panel(interaction.guild)
+        text = ("Added:\n" + "\n".join(added)) if added else "You already have every ready-made type."
+        if skipped:
+            text += f"\n\n⚠️ Skipped (the panel holds {MAX_TYPES} types): " + ", ".join(skipped)
+        text += "\n\nRemove any you don't want with `/ticket removetype`. Give an application a role with `/ticket addtype name:<it> accept_role:<role>`."
+        await interaction.followup.send(embed=simple("✅ Ticket types added", text, SUCCESS), ephemeral=True)
 
     @app_commands.command(description="Remove a ticket type")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -1020,7 +1352,12 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
     async def types(self, interaction: discord.Interaction):
         await self.cfg_or_error(interaction.guild_id)
         types = await self.types_for(interaction.guild_id)
-        lines = [f"{t['emoji'] or '🎫'} **{t['name']}**{' · asks for Invoice ID' if t['needs_invoice'] else ''}\n{t['description'] or ''}" for t in types]
+        def tag(t):
+            if questions_of(t):
+                kind = "application" if is_application(t) else "form"
+                return f" · {kind}, {len(questions_of(t))} questions" + (f" · gives <@&{t['accept_role_id']}>" if t["accept_role_id"] else "")
+            return " · asks for Invoice ID" if t["needs_invoice"] else ""
+        lines = [f"{t['emoji'] or '🎫'} **{t['name']}**{tag(t)}\n{t['description'] or ''}" for t in types]
         await interaction.response.send_message(embed=ui.card("🎫 Ticket types", "\n\n".join(lines), color=INFO, section="Tickets"), ephemeral=True)
 
     @app_commands.command(description="Stop someone from opening tickets")
