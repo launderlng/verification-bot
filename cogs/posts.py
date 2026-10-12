@@ -72,6 +72,7 @@ class Draft:
         self.photo, self.photo_url, self.gif, self.gif_url, self.file, self.button = photo, photo_url, gif, gif_url, file, button
         self.deliver = deliver  # (stored file id, name): a 📥 Get file button that DMs the file
         self.more_photos = list(more_photos or [])  # extra images shown with the main photo as a gallery
+        self.gif_separate = False  # True when the GIF sits in its own message under the file (see publish_draft)
         self.extra_file = extra_file  # (name, bytes, size): a second raw attachment alongside self.file -- e.g.
         # the real deliverable attached straight to the post when it's small enough, on top of a video preview
         # already occupying self.file
@@ -86,12 +87,12 @@ class Draft:
     def gallery(self) -> tuple[list, list]:
         """Splits the extra photos into the ones shown in the post's embeds and the overflow that goes in its
         own message. A message holds at most 10 embeds (main card + GIF + gallery images)."""
-        room = MAX_EMBEDS - 1 - (1 if (self.gif or self.gif_url) else 0)
+        room = MAX_EMBEDS - 1 - (1 if (self.gif or self.gif_url) and not self.gif_separate else 0)
         try:
             cap = int(self.channel.guild.filesize_limit)
         except Exception:
             cap = 10 * 1024 * 1024
-        used = sum(item[2] for item in (self.photo, self.gif, self.file) if item and item[1] is not None)
+        used = sum(item[2] for item in (self.photo, None if self.gif_separate else self.gif, self.file) if item and item[1] is not None)
         shown = []
         for i, item in enumerate(self.more_photos):
             new = item[2] if item[1] is not None else 0  # photos already on the message don't upload again
@@ -103,7 +104,7 @@ class Draft:
 
     def files(self, include_extra: bool = True) -> list[discord.File]:
         shown, _ = self.gallery()
-        items = [self.photo, *shown, self.gif, self.file] + ([self.extra_file] if include_extra else [])
+        items = [self.photo, *shown, None if self.gif_separate else self.gif, self.file] + ([self.extra_file] if include_extra else [])
         return [discord.File(io.BytesIO(item[1]), filename=item[0]) for item in items if item and item[1] is not None]
 
     def file_below(self) -> bool:
@@ -133,10 +134,17 @@ class Draft:
                 if group == 0:
                     embeds[0].url = anchor
                 embeds.append(discord.Embed(url=anchor, color=color).set_image(url=f"attachment://{item[0]}"))
-        gif_image = f"attachment://{self.gif[0]}" if self.gif else self.gif_url
-        if gif_image:
-            embeds.append(ui.card(None, None, color=color, image=gif_image))  # the GIF gets its own spot under the card
+        if not self.gif_separate:
+            gif = self.gif_embed()
+            if gif is not None:
+                embeds.append(gif)  # the GIF gets its own spot under the card
         return embeds
+
+    def gif_embed(self) -> Optional[discord.Embed]:
+        gif_image = f"attachment://{self.gif[0]}" if self.gif else self.gif_url
+        if not gif_image:
+            return None
+        return ui.card(None, None, color=self.color if self.color is not None else COLOR, image=gif_image)
 
     def view(self) -> Optional[discord.ui.View]:
         if not self.button and not self.deliver:
@@ -176,19 +184,21 @@ class Draft:
             "extra_file": [self.extra_file[0], self.extra_file[2]] if self.extra_file else None,
             "more_photos": [[p[0], p[2]] for p in self.more_photos] or None,
             "deliver": list(self.deliver) if self.deliver else None, "ping": self.ping.id if self.ping else None, "pack": self.pack, "mention_all": self.mention_all,
-            "content": self.content,
+            "content": self.content, "gif_separate": self.gif_separate,
         })
 
     @classmethod
     def from_data(cls, channel, raw: str, guild: discord.Guild) -> "Draft":
         d = json.loads(raw)
         ping = guild.get_role(d["ping"]) if d.get("ping") else None
-        return cls(channel, d["title"], d["description"], d["footer"], d["color"], photo=(d["photo"][0], None, d["photo"][1]) if d["photo"] else None, photo_url=d["photo_url"],
+        draft = cls(channel, d["title"], d["description"], d["footer"], d["color"], photo=(d["photo"][0], None, d["photo"][1]) if d["photo"] else None, photo_url=d["photo_url"],
                    gif=(d["gif"][0], None, d["gif"][1]) if d["gif"] else None, gif_url=d["gif_url"], file=(d["file"][0], None, d["file"][1]) if d["file"] else None,
                    extra_file=(d["extra_file"][0], None, d["extra_file"][1]) if d.get("extra_file") else None,
                    more_photos=[(p[0], None, p[1]) for p in (d.get("more_photos") or [])],
                    content=d.get("content"),
                    button=tuple(d["button"]) if d["button"] else None, deliver=tuple(d["deliver"]) if d["deliver"] else None, ping=ping, pack=d.get("pack"), mention_all=d.get("mention_all"))
+        draft.gif_separate = bool(d.get("gif_separate"))
+        return draft
 
 
 def describe_post(draft: Draft) -> list:
@@ -203,6 +213,8 @@ def describe_post(draft: Draft) -> list:
 async def publish_draft(guild: discord.Guild, user, draft: Draft) -> discord.Message:
     """Send a post, record it so it can be edited later, and log it. Used by /post new and /post bulk."""
     below = draft.file_below()
+    # With a file under the post, the order is: card + photos, then the file, then the GIF last.
+    draft.gif_separate = below and bool(draft.gif or draft.gif_url)
     message = await draft.channel.send(**draft.kwargs(include_extra=not below))
     _, overflow = draft.gallery()
     for chunk in (chunk_files(overflow, draft.channel.guild.filesize_limit) if overflow else []):  # photos that didn't fit
@@ -216,6 +228,14 @@ async def publish_draft(guild: discord.Guild, user, draft: Draft) -> discord.Mes
             await draft.channel.send(file=discord.File(io.BytesIO(data), filename=name), allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             log.exception("Couldn't post the file under post %s", message.id)
+    if draft.gif_separate:  # the GIF goes last, under the file
+        try:
+            kw = {"embed": draft.gif_embed(), "allowed_mentions": discord.AllowedMentions.none()}
+            if draft.gif and draft.gif[1] is not None:
+                kw["file"] = discord.File(io.BytesIO(draft.gif[1]), filename=draft.gif[0])
+            await draft.channel.send(**kw)
+        except discord.HTTPException:
+            log.exception("Couldn't post the GIF under post %s", message.id)
     await db.execute(
         "INSERT INTO posts (guild_id, channel_id, message_id, author_id, title, pack_name, file_name, created_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (guild.id, draft.channel.id, message.id, user.id, draft.title, draft.pack, draft.file[0] if draft.file else None, discord.utils.utcnow().isoformat(), draft.data()),
@@ -500,7 +520,9 @@ class Posts(commands.GroupCog, group_name="post", group_description="Posts with 
             file=file or old.file, button=button, deliver=old.deliver, ping=old.ping, pack=old.pack, mention_all=old.mention_all,
             more_photos=old.more_photos,
         )
-        kept = {item[0] for item in (draft.photo, draft.gif, draft.file, *draft.gallery()[0]) if item and item[1] is None}
+        draft.gif_separate = old.gif_separate  # a GIF posted under the file stays in its own message
+        draft.extra_file, draft.content = old.extra_file, old.content
+        kept = {item[0] for item in (draft.photo, None if draft.gif_separate else draft.gif, draft.file, *draft.gallery()[0]) if item and item[1] is None}
         keep = [a for a in message.attachments if a.filename in kept]
         try:
             await message.edit(embeds=draft.embeds(), attachments=keep + draft.files(), view=draft.view())
