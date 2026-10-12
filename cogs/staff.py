@@ -8,7 +8,7 @@ from discord.ext import commands
 
 import db
 import ui
-from common import SUCCESS, WARN, UserError, is_staff, staff_ids
+from common import LINK_RE, SUCCESS, WARN, UserError, is_staff, staff_ids
 from logutil import emit
 
 log = logging.getLogger("verification-bot")
@@ -169,7 +169,7 @@ class Staff(commands.GroupCog, group_name="staff", group_description="Staff tool
         for o in orders[:5]:
             how = "manual" if o["source"] == "manual" else "automatic"
             who = f" by <@{o['processed_by']}>" if o["processed_by"] else ""
-            lines.append(f"`{o['code']}` · {o['product_name']} · {o['amount'] or '—'} · {how}{who} · {discord.utils.format_dt(discord.utils.parse_time(o['created_at']), 'd')}")
+            lines.append(f"`{o['code']}` · {o['product_name']} · {(o['amount'] if o['amount'] and not LINK_RE.search(o['amount']) else '—')} · {how}{who} · {discord.utils.format_dt(discord.utils.parse_time(o['created_at']), 'd')}")
         body = ui.kv(
             ("👤 Member", f"{member.mention} (`{member.id}`)"), ("📅 Joined", discord.utils.format_dt(member.joined_at, "R") if member.joined_at else None),
             ("🧾 Orders", f"**{len(orders)}**"), ("📥 Files received", f"{files:,}" if files else None), ("📨 Valid invites", f"{invites['valid']:,}"), ("💬 Messages", f"{messages:,}"),

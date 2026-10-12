@@ -16,9 +16,24 @@ from discord.ext import commands
 import db
 import ui
 from cogs.files import file_autocomplete, file_payload, record_delivery
-from common import ACCENT, COLOR, INFO, SUCCESS, WARN, UserError, check_can_send, parse_color
+from common import ACCENT, COLOR, INFO, LINK_RE, SUCCESS, WARN, UserError, check_can_send, parse_color
 from fileutil import ATTACH_LIMIT, LINK_SECONDS, human_size
 from logutil import emit
+
+
+
+def money(text) -> Optional[str]:
+    """A price or amount to show, or None. A link pasted into the price box is never shown as the price."""
+    text = (text or "").strip()
+    return None if not text or LINK_RE.search(text) else text
+
+
+def check_price(text: str) -> str:
+    """Stops a Stripe link being saved as the price (it would show up as 'Paid: https://...' on receipts)."""
+    text = text.strip()
+    if LINK_RE.search(text):
+        raise UserError("That's a link, not a price. Put the price in `price` (e.g. `$5` or `$5 AUD`) and the Stripe link in `stripe_link`.")
+    return text
 
 try:
     from cogs.licenses import LENGTHS, issue_for_order, length_label, receipt_line, set_active_for_order
@@ -136,9 +151,9 @@ def build_product(guild: discord.Guild, p, shop, rating=None, options=None) -> d
         image=p["image_url"] or None,
     )
     if options:
-        embed.add_field(name="💰 Options", value="\n".join(f"**{o['label']}** · {o['price'] or 'See checkout'}" for o in options), inline=True)
+        embed.add_field(name="💰 Options", value="\n".join(f"**{o['label']}** · {money(o['price']) or 'See checkout'}" for o in options), inline=True)
     else:
-        embed.add_field(name="💰 Price", value=f"## {p['price'] or 'See checkout'}", inline=True)
+        embed.add_field(name="💰 Price", value=f"## {money(p['price']) or 'See checkout'}", inline=True)
     embed.add_field(name="⭐ Rating", value=ui.rating_line(average, count), inline=True)
     return embed
 
@@ -147,7 +162,7 @@ def buy_item(p, shop, option=None):
     """The Buy button: tracked (personal link) when the webhook is on, otherwise a plain link.
     With a payment option (e.g. 1 Week) the button is for that option and shows its price."""
     if option is not None:
-        label = f"{option['label']} · {option['price']}" if option["price"] else option["label"]
+        label = f"{option['label']} · {money(option['price'])}" if money(option["price"]) else option["label"]
         url = option["buy_url"]
     else:
         label = pick(p["button_label"], shop["button_label"] if shop else None, DEFAULT_BUTTON)
@@ -192,7 +207,7 @@ async def option_autocomplete(interaction: discord.Interaction, current: str) ->
         return []
     rows = await db.fetch_all("SELECT label, price FROM product_options WHERE product_id = ? AND label LIKE ? ORDER BY position, id",
                               (p["id"], f"%{current}%"))
-    return [app_commands.Choice(name=f"{r['label']} · {r['price'] or '—'}"[:100], value=r["label"]) for r in rows[:25]]
+    return [app_commands.Choice(name=f"{r['label']} · {money(r['price']) or '—'}"[:100], value=r["label"]) for r in rows[:25]]
 
 
 async def resolve_option(product, label: Optional[str]):
@@ -240,7 +255,7 @@ def fulfilment_text(o) -> str:
 
 def order_embed(o, title: str = "🧾 Order") -> discord.Embed:
     body = ui.kv(
-        ("🧾 Invoice ID", f"`{o['code']}`"), ("👤 Buyer", f"<@{o['user_id']}>"), ("📦 Product", o["product_name"]), ("💰 Amount", o["amount"] or "—"),
+        ("🧾 Invoice ID", f"`{o['code']}`"), ("👤 Buyer", f"<@{o['user_id']}>"), ("📦 Product", o["product_name"]), ("💰 Amount", money(o["amount"]) or "—"),
         ("📅 Paid", discord.utils.format_dt(discord.utils.parse_time(o["created_at"]), "f")),
         ("📬 Receipt DM", "✅ Delivered" if o["dm_sent"] else "❌ Couldn't DM"),
         ("📥 File", {"delivered": "✅ Delivered", "failed": "❌ Not delivered (use /shop resend)"}.get(o["file_status"])),
@@ -340,10 +355,10 @@ class BuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"shop:buy:(
         known = webhook_secrets()
         url = tracked_url(base_url, make_ref(interaction.guild_id, interaction.user.id, p["id"], known[0], self.option_id)) if known else base_url
         title = f"{p['name']} · {option['label']}" if option is not None else p["name"]
-        price = (option["price"] if option is not None else p["price"]) or ""
+        price = money(option["price"] if option is not None else p["price"]) or ""
         view = discord.ui.View()
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Continue to Stripe", emoji="💳", url=url))
-        embed = ui.card("💳 Ready to check out", f"**{title}** · {price}\n\n"
+        embed = ui.card("💳 Ready to check out", f"**{title}**" + (f" · {price}" if price else "") + "\n\n"
                 "Press the button below to open Stripe's secure checkout page.\n"
                 "After you pay, I'll **DM you your Invoice ID**. Keep your DMs open, and you can always look it up later with `/myorders`.", color=COLOR, section="Shop")
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -373,7 +388,7 @@ async def catalog_embed(guild: discord.Guild, products) -> discord.Embed:
     for p in products:
         average, count = await db.product_rating(guild.id, p["name"])
         status = "🟢 In stock" if p["available"] else "🔴 Sold out"
-        lines.append(f"**{p['name']}** · `{p['price'] or '—'}`\n　{ui.rating_line(average, count)} · {status}")
+        lines.append(f"**{p['name']}** · `{money(p['price']) or '—'}`\n　{ui.rating_line(average, count)} · {status}")
     return ui.card(
         "🛍️ Store", "\n\n".join(lines) if lines else "Nothing for sale yet.", color=ACCENT, guild=guild,
         footer=f"{guild.name} · Pick a product below to see details",
@@ -385,7 +400,7 @@ class StoreSelect(discord.ui.Select):
     def __init__(self, products, selected_id=None):
         options = [
             discord.SelectOption(
-                label=p["name"][:100], value=str(p["id"]), description=(p["price"] or "")[:100] or None,
+                label=p["name"][:100], value=str(p["id"]), description=(money(p["price"]) or "")[:100] or None,
                 emoji="🟢" if p["available"] else "🔴", default=(p["id"] == selected_id),
             )
             for p in products[:25]
@@ -518,7 +533,8 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             footer=guild.name + (" · 🧪 TEST PAYMENT" if not order["livemode"] else ""),
         )
         embed.add_field(name="📦 Product", value=order["product_name"], inline=True)
-        embed.add_field(name="💰 Paid", value=order["amount"] or "—", inline=True)
+        if money(order["amount"]):
+            embed.add_field(name="💰 Paid", value=money(order["amount"]), inline=True)
         if file_problem:
             embed.add_field(name="📥 Your file", value="⚠️ Couldn't attach it. Send your ID to support and we'll send it right away.", inline=True)
         elif file_line:
@@ -648,7 +664,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         await emit(
             guild, "shop", "🧪 Test purchase" if not livemode else "💸 New purchase",
             f"<@{user_id}> bought **{order['product_name']}**\n\n"
-            + ui.kv(("🕒 Ordered", discord.utils.format_dt(discord.utils.utcnow(), "f")), ("💰 Amount", order["amount"]), ("🧾 Invoice ID", f"`{code}`"), ("🆔 Buyer ID", f"`{user_id}`"),
+            + ui.kv(("🕒 Ordered", discord.utils.format_dt(discord.utils.utcnow(), "f")), ("💰 Amount", money(order["amount"])), ("🧾 Invoice ID", f"`{code}`"), ("🆔 Buyer ID", f"`{user_id}`"),
                     ("📧 Email", email), ("🌍 Country", country),
                     ("⚙️ Sent", "🤖 Automatically, no staff involved"), ("📬 Receipt DM", "✅ delivered" if delivered else "❌ couldn't DM, they can use /myorders"),
                     ("📥 File", None if file_status is None else ("✅ delivered with the receipt" if file_status == "delivered" else "❌ not delivered, use /shop resend")),
@@ -833,7 +849,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             raise UserError(f"**{p['name']}** has payment options. Pick which one they bought with the `option` setting.")
         await interaction.response.defer(ephemeral=True)
         code = await self.insert_order(
-            interaction.guild_id, member.id, p, amount or (opt["price"] if opt is not None else None) or p["price"], f"manual-{uuid.uuid4().hex}", None, True,
+            interaction.guild_id, member.id, p, money(amount) or money(opt["price"] if opt is not None else None) or money(p["price"]), f"manual-{uuid.uuid4().hex}", None, True,
             source="manual", note=note, processed_by=interaction.user.id, option=opt,
         )
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (interaction.guild_id, code))
@@ -847,7 +863,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         await emit(
             interaction.guild, "shop", "📝 Manual order",
             f"{member.mention} was given **{p['name']}** by {interaction.user.mention}\n\n"
-            + ui.kv(("🕒 Ordered", discord.utils.format_dt(discord.utils.utcnow(), "f")), ("🧾 Invoice ID", f"`{code}`"), ("🆔 Buyer ID", f"`{member.id}`"), ("💰 Amount", order["amount"]),
+            + ui.kv(("🕒 Ordered", discord.utils.format_dt(discord.utils.utcnow(), "f")), ("🧾 Invoice ID", f"`{code}`"), ("🆔 Buyer ID", f"`{member.id}`"), ("💰 Amount", money(order["amount"])),
                     ("⚙️ Sent", f"✋ Manually by {interaction.user.mention} (`{interaction.user.id}`)"), ("📝 Note", note),
                     ("📬 Receipt DM", ("✅ delivered" if delivered else "❌ couldn't DM, use /shop resend") if send else "Not sent yet"),
                     ("📥 File", None if file_status is None else ("✅ delivered with the receipt" if file_status == "delivered" else "❌ not delivered, use /shop resend")),
@@ -858,7 +874,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             "⚠️ The receipt went out but the file didn't. Use `/shop resend`." if send and delivered else
             ("📪 I couldn't DM them (DMs closed?). Use `/shop resend` once they open DMs." if send else "Nothing was sent yet. Use `/shop resend` when you're ready."))
         await interaction.followup.send(
-            embed=ui.card("🧾 Order created", ui.kv(("🧾 Invoice ID", f"`{code}`"), ("👤 Buyer", member.mention), ("📦 Product", p["name"]), ("💰 Amount", order["amount"] or "—"),
+            embed=ui.card("🧾 Order created", ui.kv(("🧾 Invoice ID", f"`{code}`"), ("👤 Buyer", member.mention), ("📦 Product", p["name"]), ("💰 Amount", money(order["amount"]) or "—"),
                                                    ("📥 File", "Yes" if order["file_id"] else "None attached"),
                                                    ("🔑 Macro key", f"`{order['license_code']}`" if order["license_code"] else None)) + f"\n\n{status}", color=SUCCESS, guild=interaction.guild, section="Shop"),
             ephemeral=True,
@@ -990,7 +1006,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             await db.execute(
                 "INSERT INTO products (guild_id, name, description, price, buy_url, image_url, color, button_label, license_days, license_macro) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (interaction.guild_id, name.strip(), description, price.strip(), link, image, color_hex, button_label, key_days, clean_macro(key_macro)),
+                (interaction.guild_id, name.strip(), description, check_price(price), link, image, color_hex, button_label, key_days, clean_macro(key_macro)),
             )
         except aiosqlite.IntegrityError:
             raise UserError(f"You already have a product called **{name}**. Use `/shop edit` to change it.") from None
@@ -1052,7 +1068,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         if new_name:
             updates["name"] = new_name.strip()
         if price:
-            updates["price"] = price.strip()
+            updates["price"] = check_price(price)
         if stripe_link:
             updates["buy_url"] = stripe_url(stripe_link)
         if image_url:
@@ -1127,10 +1143,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         for p in rows:
             posted = f"posted in <#{p['channel_id']}>" if p["channel_id"] and p["message_id"] else "not posted"
             mode = " · ⚠️ test link" if is_test_link(p["buy_url"]) else ""
-            lines.append(f"{'✅' if p['available'] else '❌'} **{p['name']}** · {p['price'] or '—'} · {posted}{mode}")
+            lines.append(f"{'✅' if p['available'] else '❌'} **{p['name']}** · {money(p['price']) or '⚠️ no price (fix with /shop edit)'} · {posted}{mode}")
             for o in await get_options(p["id"]):
                 key = "" if o["license_days"] is None else f" · 🔑 {length_label(o['license_days'])}"
-                lines.append(f"　↳ {o['label']} · {o['price'] or '—'}{key}{' · ⚠️ test link' if is_test_link(o['buy_url']) else ''}")
+                lines.append(f"　↳ {o['label']} · {money(o['price']) or '⚠️ no price'}{key}{' · ⚠️ test link' if is_test_link(o['buy_url']) else ''}")
         await interaction.response.send_message(embed=ui.card("🛒 Products", "\n".join(lines), guild=interaction.guild, section="Shop"), ephemeral=True)
 
     @app_commands.command(description="Delete a product (and its posted card)")
@@ -1166,18 +1182,18 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         if same is None and len(existing) >= MAX_OPTIONS:
             raise UserError(f"A product can have {MAX_OPTIONS} options at most. Remove one with `/shop removeoption` first.")
         if same is not None:
-            await db.execute("UPDATE product_options SET price = ?, buy_url = ?, license_days = ? WHERE id = ?", (price.strip(), link, days, same["id"]))
+            await db.execute("UPDATE product_options SET price = ?, buy_url = ?, license_days = ? WHERE id = ?", (check_price(price), link, days, same["id"]))
             verb = "Updated"
         else:
             position = max([o["position"] for o in existing], default=-1) + 1
             await db.execute("INSERT INTO product_options (guild_id, product_id, label, price, buy_url, license_days, position) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                             (interaction.guild_id, p["id"], name, price.strip(), link, days, position))
+                             (interaction.guild_id, p["id"], name, check_price(price), link, days, position))
             verb = "Added"
         refreshed = await self.refresh_post(interaction.guild, p)
         embed, view = await product_message(interaction.guild, p)
         key = "no key" if days is None else f"a **{length_label(days)}** key"
         await interaction.response.send_message(
-            f"✅ {verb} option **{name}** ({price.strip()}, gives {key}) on **{p['name']}**."
+            f"✅ {verb} option **{name}** ({check_price(price)}, gives {key}) on **{p['name']}**."
             + (" The posted card was updated." if refreshed else " Publish it with `/shop post`.") + test_note(link),
             embed=embed, view=view, ephemeral=True)
 

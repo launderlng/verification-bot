@@ -548,6 +548,14 @@ async def init() -> None:
                 existing = {row[1] for row in await cur.fetchall()}
             if column not in existing:
                 await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        # A Stripe link typed into a price box: keep it as the buy link (if there isn't one) and clear the price,
+        # so receipts stop saying "Paid: https://buy.stripe.com/...". Safe to run every start.
+        is_link = "(LOWER({c}) LIKE '%http%' OR LOWER({c}) LIKE '%stripe.com%' OR LOWER({c}) LIKE 'www.%')"
+        for table in ("products", "product_options"):
+            await conn.execute(f"UPDATE {table} SET buy_url = TRIM(price) WHERE {is_link.format(c='price')} "
+                               "AND (buy_url IS NULL OR TRIM(buy_url) = '')")
+            await conn.execute(f"UPDATE {table} SET price = NULL WHERE {is_link.format(c='price')}")
+        await conn.execute(f"UPDATE orders SET amount = NULL WHERE {is_link.format(c='amount')}")
         await conn.commit()
 
 

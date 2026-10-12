@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 
 import db
 import ui
-from common import ACCENT, COLOR, DANGER, INFO, SUCCESS, WARN, UserError, check_can_send, is_staff, parse_color, reply, staff_ids, support_button
+from common import ACCENT, COLOR, DANGER, INFO, LINK_RE, SUCCESS, WARN, UserError, check_can_send, is_staff, parse_color, reply, staff_ids, support_button
 from cogs.reviews import add_ticket_review_comment, post_ticket_review
 from logutil import emit
 from macros import MACROS, macro_label, macro_name
@@ -581,7 +581,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
             embed.description = f"This invoice was bought by <@{order['user_id']}>, not the person who opened this ticket."
         embed.add_field(name="Invoice ID", value=f"`{order['code']}`", inline=False)
         embed.add_field(name="Product", value=order["product_name"])
-        embed.add_field(name="Amount", value=order["amount"] or "—")
+        embed.add_field(name="Amount", value=order["amount"] if order["amount"] and not LINK_RE.search(order["amount"]) else "—")
         embed.add_field(name="Paid", value=discord.utils.format_dt(parse_iso(order["created_at"]), "f"))
         if order["source"] == "manual":
             embed.add_field(name="Created by", value="Staff (manual order)")
