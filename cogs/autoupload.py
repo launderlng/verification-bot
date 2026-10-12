@@ -426,7 +426,9 @@ class AutoUpload(commands.Cog):
         # a drop zone with a required role set: attaching directly would hand the file to anyone who can see the
         # channel with no role check at all, so those still go through the gated Get-file/DM flow regardless of
         # size.
-        deliver_inline_limit = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
+        # The server's real upload limit (10 MB, or 50 / 100 MB with boosts). It used to be capped at 25 MB too,
+        # so on a boosted server a 30 MB pack got a Get-file button even though Discord would take it.
+        deliver_inline_limit = post_channel.guild.filesize_limit
         attach_directly = len(data) <= deliver_inline_limit and not required_role
 
         file_row = extra_file = None
@@ -479,7 +481,7 @@ class AutoUpload(commands.Cog):
             # Use the destination server's REAL upload limit (boost-tier aware), not just our static guess -- a
             # file that fits our guess but not this server's actual cap would otherwise fail the whole send with
             # an HTTPException, or (if our guess were too high) silently never get attempted.
-            inline_limit = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
+            inline_limit = post_channel.guild.filesize_limit
             if len(preview_data) <= inline_limit:
                 if ctype.startswith("image/"):
                     photo = (clean_attach_name, preview_data, len(preview_data))
@@ -497,7 +499,7 @@ class AutoUpload(commands.Cog):
         more_photos = []
         if photo:
             base = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file")
-            limit_each = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
+            limit_each = post_channel.guild.filesize_limit
             for n, a in enumerate(more_atts or [], start=2):
                 if a.size > limit_each:
                     log.info("autoupload: skipping gallery image %s (%d bytes, over %d)", a.filename, a.size, limit_each)
@@ -526,7 +528,9 @@ class AutoUpload(commands.Cog):
         await publish_draft(post_channel.guild, message.author, draft)
         log_fields = [
             ("👤 By", message.author.mention), ("📦 Name", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention),
-            ("📎 Delivery", "Attached directly to the post" if attach_directly else "Get-file button"),
+            ("📎 Delivery", "Attached directly to the post" if attach_directly else (
+                f"Get-file button: this drop zone needs {required_role.mention}" if required_role
+                else f"Get-file button: {human_size(len(data))} is over this server's {human_size(deliver_inline_limit)} upload limit")),
         ]
         if too_large_for_preview:
             # Not shown on the public post -- staff can see why a video/image had no inline preview here instead.
