@@ -7,6 +7,8 @@
   (1 Day / 1 Week / 1 Month / Lifetime; timed keys start on their first login). Every Stripe purchase or /shop createorder for that product gets a fresh
   key in the receipt DM.
 * Admins manage keys with /key ..., members see theirs with /mykeys.
+* Every key is for one macro (see macros.py) or for all of them. The macro says which one it is
+  (form field `product`, e.g. `metal` or `altclick`) and a key only works in its own macro.
 * Discord linking (on once DISCORD_CLIENT_SECRET is set): before a key works, the macro must
   link a Discord account. The macro gets a session from POST /api/auth/new, opens
   /auth/start?s=<session> (Discord's Authorize page), and polls GET /api/auth/status?s=<session>.
@@ -35,6 +37,7 @@ import ui
 from common import DANGER, SUCCESS, WARN, UserError
 from fileutil import public_base_url
 from logutil import emit
+from macros import DEFAULT_MACRO, FILTER_MACRO_CHOICES, KEY_MACRO_CHOICES, MACROS, clean_macro, macro_label, macro_name
 
 log = logging.getLogger("verification-bot")
 
@@ -114,7 +117,7 @@ async def log_event(license_id: Optional[int], event_type: str, detail: str = ""
 
 
 async def create_license(guild_id: Optional[int], days: Optional[int], *, user_id: Optional[int] = None, order_code: Optional[str] = None,
-                         created_by: Optional[int] = None, note: Optional[str] = None) -> str:
+                         created_by: Optional[int] = None, note: Optional[str] = None, macro: Optional[str] = None) -> str:
     """Make a new unique key. days None/0 = lifetime; otherwise the clock starts on its first login."""
     created = now()
     for _ in range(40):
@@ -122,9 +125,9 @@ async def create_license(guild_id: Optional[int], days: Optional[int], *, user_i
         if await db.fetch_one("SELECT 1 FROM licenses WHERE code = ?", (code,)):
             continue
         await db.execute(
-            "INSERT INTO licenses (code, active, created_at, expires_at, duration_days, activations, guild_id, user_id, order_code, created_by, note) "
-            "VALUES (?, 1, ?, NULL, ?, 0, ?, ?, ?, ?, ?)",
-            (code, created.isoformat(), days or None, guild_id, user_id, order_code, created_by, note),
+            "INSERT INTO licenses (code, active, created_at, expires_at, duration_days, activations, guild_id, user_id, order_code, created_by, note, macro) "
+            "VALUES (?, 1, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?)",
+            (code, created.isoformat(), days or None, guild_id, user_id, order_code, created_by, note, clean_macro(macro)),
         )
         row = await db.fetch_one("SELECT id FROM licenses WHERE code = ?", (code,))
         await log_event(row["id"] if row else None, "created", f"order {order_code}" if order_code else (note or "manual"))
@@ -147,8 +150,9 @@ async def issue_for_order(guild_id: int, order, product) -> Optional[str]:
             days = option["license_days"]
     if days is None:
         return None
+    macro = product["license_macro"] if "license_macro" in product.keys() else None
     code = await create_license(guild_id, days or None, user_id=order["user_id"], order_code=order["code"],
-                                note=f"Purchase of {order['product_name']}")
+                                note=f"Purchase of {order['product_name']}", macro=macro)
     await db.execute("UPDATE orders SET license_code = ? WHERE id = ?", (code, order["id"]))
     return code
 
@@ -159,7 +163,9 @@ async def receipt_line(order) -> Optional[str]:
         return None
     row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (order["license_code"],))
     length = expiry_text(row) if row else "Lifetime"
-    return f"```{order['license_code']}```**Valid** · {length}\nPaste it into the macro's login screen. `/mykeys` shows it any time."
+    macro = macro_label(row["macro"]) if row else macro_label(None)
+    return (f"```{order['license_code']}```**For** · {macro}\n**Valid** · {length}\n"
+            f"Paste it into the {macro_name(row['macro'] if row else None)} macro's login screen. `/mykeys` shows it any time.")
 
 
 async def set_active_for_order(order, active: bool) -> bool:
@@ -182,6 +188,7 @@ def license_embed(row, guild: Optional[discord.Guild] = None) -> discord.Embed:
     embed = ui.card(f"🔑 {row['code']}", color=SUCCESS if status_text(row).startswith("✅") else WARN, guild=guild, section="Keys")
     last = parse_time(row["last_seen"])
     embed.description = ui.kv(
+        ("Macro", macro_label(row["macro"])),
         ("Status", status_text(row)),
         ("Expires", expiry_text(row)),
         ("Owner", f"<@{row['user_id']}>" if row["user_id"] else (row["owner_name"] or None)),
@@ -435,6 +442,13 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             await log_event(row["id"], "activation_denied", "Expired")
             await self.key_log(row, "⌛ Expired key tried", who, (("❌ Refused", f"Expired {discord.utils.format_dt(exp, 'R')}"),), WARN)
             return web.Response(text="DENIED|KEY EXPIRED")
+        asked = clean_macro(form.get("product")) or DEFAULT_MACRO   # which macro is asking
+        if row["macro"] and row["macro"] != asked:
+            await log_event(row["id"], "activation_denied", f"wrong macro: {asked}")
+            await self.key_log(row, "🎮 Key used in the wrong macro", who,
+                               (("🔑 Key is for", macro_label(row["macro"])), ("🖥️ Tried in", macro_label(asked)),
+                                ("❌ Refused", "Wrong macro")), WARN)
+            return web.Response(text=f"DENIED|THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO")
         owner = row["user_id"]
         first_link = False
         if self.linking_enabled():
@@ -469,7 +483,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             fresh = await db.fetch_one("SELECT * FROM licenses WHERE id = ?", (row["id"],))
             await self.key_log(
                 fresh, "🟢 Key activated (first login)" if first else "🔓 Macro login", who,
-                (("⏳ Length", expiry_text(fresh)), ("🔢 Logins", f"{fresh['activations']:,}"),
+                (("🎮 Macro", macro_label(asked)), ("⏳ Length", expiry_text(fresh)), ("🔢 Logins", f"{fresh['activations']:,}"),
                  ("🔗 Locked to", "this account (first use)" if first_link else None),
                  ("🧾 Order", f"`{fresh['order_code']}`" if fresh["order_code"] else None)),
                 SUCCESS)
@@ -479,36 +493,40 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
 
     @app_commands.command(description="Make new macro keys")
     @app_commands.describe(
+        macro="Which macro the key is for (it won't work in the others)",
         length="How long the key lasts (starts on its first login)",
         count="How many keys (1-25)",
         member="Give the key(s) to this member and DM them",
         note="A private note for staff",
         custom_days="Any other length in days (overrides length)",
     )
-    @app_commands.choices(length=LENGTH_CHOICES)
-    async def generate(self, interaction: discord.Interaction, length: str = "lifetime", count: app_commands.Range[int, 1, 25] = 1,
+    @app_commands.choices(length=LENGTH_CHOICES, macro=KEY_MACRO_CHOICES)
+    async def generate(self, interaction: discord.Interaction, macro: str, length: str = "lifetime", count: app_commands.Range[int, 1, 25] = 1,
                        member: Optional[discord.Member] = None, note: Optional[app_commands.Range[str, 1, 200]] = None,
                        custom_days: Optional[app_commands.Range[int, 1, 3650]] = None):
         days = custom_days or LENGTHS.get(length, 0) or None
         await interaction.response.defer(ephemeral=True)
+        macro = clean_macro(macro)   # "all" -> None = works in every macro
         codes = [await create_license(interaction.guild_id, days, user_id=member.id if member else None,
-                                      created_by=interaction.user.id, note=note) for _ in range(count)]
+                                      created_by=interaction.user.id, note=note, macro=macro) for _ in range(count)]
         length = length_label(days) + (" (starts on first login)" if days else "")
+        which = macro_label(macro)
         dm = ""
         if member:
             try:
                 embed = ui.card("🔑 Your macro key" + ("s" if count > 1 else ""),
-                                "\n".join(f"```{c}```" for c in codes) + f"\n**Length** · {length}\nPaste it into the macro's login screen.",
+                                "\n".join(f"```{c}```" for c in codes) + f"\n**For** · {which}\n**Length** · {length}\n"
+                                f"Paste it into the {macro_name(macro)} macro's login screen.",
                                 color=SUCCESS, guild=interaction.guild, section="Keys")
                 await member.send(embed=embed)
                 dm = f"\n📬 Sent to {member.mention} by DM."
             except discord.HTTPException:
                 dm = f"\n📪 Couldn't DM {member.mention} (DMs closed). Give them the key yourself."
         await emit(interaction.guild, "keys", "🔑 Keys generated",
-                   ui.kv(("Count", str(count)), ("Length", length), ("For", member.mention if member else None), ("By", interaction.user.mention), ("Note", note)),
+                   ui.kv(("Macro", which), ("Count", str(count)), ("Length", length), ("For", member.mention if member else None), ("By", interaction.user.mention), ("Note", note)),
                    SUCCESS, subject=member.id if member else None)
         body = "\n".join(f"`{c}`" for c in codes)
-        await interaction.followup.send(embed=ui.card(f"🔑 {count} key{'s' if count > 1 else ''} made · {length}", body + dm, color=SUCCESS,
+        await interaction.followup.send(embed=ui.card(f"🔑 {count} {macro_name(macro)} key{'s' if count > 1 else ''} made · {length}", body + dm, color=SUCCESS,
                                                       guild=interaction.guild, section="Keys"), ephemeral=True)
 
     @app_commands.command(description="Look up a key")
@@ -517,14 +535,23 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await find_license(code)
         await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
 
-    @app_commands.command(description="Recent keys (optionally one member's)")
-    @app_commands.describe(member="Only this member's keys", status="Filter by status")
-    @app_commands.choices(status=[app_commands.Choice(name=n, value=n) for n in ("all", "active", "disabled", "expired")])
-    async def list(self, interaction: discord.Interaction, member: Optional[discord.Member] = None, status: str = "all"):
-        sql, params = "SELECT * FROM licenses", []
+    @app_commands.command(description="Recent keys and which macro each is for")
+    @app_commands.describe(member="Only this member's keys", status="Filter by status", macro="Only keys for this macro")
+    @app_commands.choices(status=[app_commands.Choice(name=n, value=n) for n in ("all", "active", "disabled", "expired")],
+                          macro=FILTER_MACRO_CHOICES)
+    async def list(self, interaction: discord.Interaction, member: Optional[discord.Member] = None, status: str = "all",
+                   macro: Optional[str] = None):
+        sql, where, params = "SELECT * FROM licenses", [], []
         if member:
-            sql += " WHERE user_id = ?"
+            where.append("user_id = ?")
             params.append(member.id)
+        if macro == "all":
+            where.append("macro IS NULL")
+        elif clean_macro(macro):
+            where.append("macro = ?")
+            params.append(clean_macro(macro))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         rows = await db.fetch_all(sql + " ORDER BY id DESC LIMIT 200", tuple(params))
         wanted = {"active": "✅", "disabled": "⛔", "expired": "⌛"}.get(status)
         if wanted:
@@ -532,12 +559,15 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if not rows:
             raise UserError("No keys match that.")
         total = (await db.fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(active), 0) AS a FROM licenses"))
-        lines = [f"{status_text(r)[:1]} `{r['code']}` · {('<@' + str(r['user_id']) + '>') if r['user_id'] else (r['owner_name'] or 'unassigned')} · "
-                 f"{expiry_text(r)}" for r in rows[:20]]
+        counts = await db.fetch_all("SELECT macro, COUNT(*) AS c FROM licenses GROUP BY macro")
+        per_macro = " · ".join(f"{macro_name(c['macro'])}: {c['c']:,}" for c in counts)
+        lines = [f"{status_text(r)[:1]} `{r['code']}` · **{macro_label(r['macro'])}** · "
+                 f"{('<@' + str(r['user_id']) + '>') if r['user_id'] else (r['owner_name'] or 'unassigned')} · {expiry_text(r)}" for r in rows[:20]]
         more = f"\n…and {len(rows) - 20} more" if len(rows) > 20 else ""
         await interaction.response.send_message(
             embed=ui.card("🔑 Keys", "\n".join(lines) + more, guild=interaction.guild,
-                          footer=f"{total['c']:,} keys in total · {total['a']:,} enabled"), ephemeral=True)
+                          footer=f"{total['c']:,} keys in total · {total['a']:,} enabled" + (f"\n{per_macro}" if per_macro else "")),
+            ephemeral=True)
 
     async def set_active(self, interaction: discord.Interaction, code: str, active: bool):
         row = await find_license(code)
@@ -577,6 +607,20 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         else:
             raise UserError("Fill in `days` or set `lifetime` to True.")
         await log_event(row["id"], "extended", "lifetime" if lifetime else f"+{days}d")
+        row = await find_license(code)
+        await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
+
+    @app_commands.command(description="Change which macro a key is for")
+    @app_commands.describe(macro="The macro this key should work in")
+    @app_commands.choices(macro=KEY_MACRO_CHOICES)
+    @app_commands.autocomplete(code=key_autocomplete)
+    async def setmacro(self, interaction: discord.Interaction, code: str, macro: str):
+        row = await find_license(code)
+        await db.execute("UPDATE licenses SET macro = ? WHERE id = ?", (clean_macro(macro), row["id"]))
+        await log_event(row["id"], "macro", macro_name(clean_macro(macro)))
+        await emit(interaction.guild, "keys", "🎮 Key macro changed",
+                   ui.kv(("Key", f"`{row['code']}`"), ("From", macro_label(row["macro"])), ("To", macro_label(clean_macro(macro))),
+                         ("By", interaction.user.mention)), subject=row["user_id"])
         row = await find_license(code)
         await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
 
@@ -643,18 +687,19 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
     async def setup(self, interaction: discord.Interaction):
         base = public_base_url()
         total = await db.fetch_one("SELECT COUNT(*) AS c FROM licenses")
-        selling = await db.fetch_all("SELECT name, license_days FROM products WHERE guild_id = ? AND license_days IS NOT NULL", (interaction.guild_id,))
+        selling = await db.fetch_all("SELECT name, license_days, license_macro FROM products WHERE guild_id = ? AND license_days IS NOT NULL", (interaction.guild_id,))
         if base:
             where = (f"The macro checks keys at:\n```{base}```\nIn the macro script set:\n"
                      f"```global LICENSE_API_URL := \"{base}\"```")
         else:
             where = ("⚠️ I don't know my public web address yet. In Railway open this bot's service → **Settings → Networking → "
                      "Generate Domain**, redeploy, then run this again.")
-        products = "\n".join(f"• **{p['name']}** · {length_label(p['license_days'])} key" for p in selling) \
+        products = "\n".join(f"• **{p['name']}** · {length_label(p['license_days'])} key · {macro_label(p['license_macro'])}" for p in selling) \
             or "None yet. Use `/shop edit product:<name> license_key:<length>`."
         embed = ui.card("🔑 Key system", where, guild=interaction.guild, section="Keys")
         embed.add_field(name="Products that give a key", value=products, inline=False)
         embed.add_field(name="Keys stored", value=f"{total['c']:,}", inline=True)
+        embed.add_field(name="🎮 Macros", value="\n".join(f"{macro_label(m)} · `product={m}`" for m in MACROS), inline=True)
         if self.linking_enabled():
             linking = f"✅ On. People must link their Discord before a key works (remembered {LINK_DAYS} days)."
         else:
@@ -675,7 +720,7 @@ class MyKeys(commands.Cog):
         rows = await db.fetch_all("SELECT * FROM licenses WHERE user_id = ? ORDER BY id DESC LIMIT 10", (interaction.user.id,))
         if not rows:
             raise UserError("You don't have any keys yet. Buy one from the shop with `/store`.")
-        lines = [f"```{r['code']}```{status_text(r)} · {expiry_text(r)}" for r in rows]
+        lines = [f"```{r['code']}```**{macro_label(r['macro'])}** · {status_text(r)} · {expiry_text(r)}" for r in rows]
         await interaction.response.send_message(
             embed=ui.card("🔑 Your keys", "\n".join(lines) + "\nPaste a key into the macro's login screen.", guild=interaction.guild, section="Keys"),
             ephemeral=True)

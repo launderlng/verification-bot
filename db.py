@@ -532,6 +532,9 @@ MIGRATIONS = [
     ("orders", "license_code", "TEXT"),
     ("licenses", "duration_days", "INTEGER"),
     ("orders", "option_id", "INTEGER"),
+    ("licenses", "macro", "TEXT"),          # which macro a key is for (NULL = every macro)
+    ("products", "license_macro", "TEXT"),  # which macro a product's keys are for
+    ("tickets", "macro", "TEXT"),           # which macro a support ticket is about
 ]
 
 
@@ -599,7 +602,7 @@ async def upsert_welcome(guild_id: int, **fields) -> None:
 
 PRODUCT_COLUMNS = {
     "name", "description", "price", "buy_url", "image_url", "color", "button_label", "available", "channel_id", "message_id", "file_id", "role_id",
-    "license_days",
+    "license_days", "license_macro",
 }
 SHOP_COLUMNS = {"default_channel_id", "color", "button_label", "footer", "ticket_channel_id", "receipt_note", "order_prefix", "order_style", "order_counter"}
 
