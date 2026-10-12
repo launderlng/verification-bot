@@ -67,11 +67,12 @@ class Draft:
 
     def __init__(self, channel, title: str, description: Optional[str], footer: Optional[str], color: Optional[int], photo=None, photo_url=None,
                  gif=None, gif_url=None, file=None, button=None, deliver=None, ping=None, pack: Optional[str] = None, mention_all: Optional[str] = None,
-                 show_file_field: bool = True, content: Optional[str] = None, extra_file=None, more_photos=None):
+                 show_file_field: bool = True, content: Optional[str] = None, extra_file=None, more_photos=None, extra_parts=None):
         self.channel, self.title, self.description, self.footer, self.color = channel, title, description, footer, color
         self.photo, self.photo_url, self.gif, self.gif_url, self.file, self.button = photo, photo_url, gif, gif_url, file, button
         self.deliver = deliver  # (stored file id, name): a 📥 Get file button that DMs the file
         self.more_photos = list(more_photos or [])  # extra images shown with the main photo as a gallery
+        self.extra_parts = list(extra_parts or [])  # a too-big file split into pack.zip.001, .002 ... (posted under the card)
         self.gif_separate = False  # True when the GIF sits in its own message under the file (see publish_draft)
         self.extra_file = extra_file  # (name, bytes, size): a second raw attachment alongside self.file -- e.g.
         # the real deliverable attached straight to the post when it's small enough, on top of a video preview
@@ -110,7 +111,7 @@ class Draft:
     def file_below(self) -> bool:
         """The deliverable (extra_file) goes in its own message right under the post. Discord always draws a
         message's attachments ABOVE its embeds, so sending it separately is the only way to get the file at the bottom."""
-        return bool(self.extra_file and self.extra_file[1] is not None)
+        return bool((self.extra_file and self.extra_file[1] is not None) or self.extra_parts)
 
     def embeds(self) -> list[discord.Embed]:
         color = self.color if self.color is not None else COLOR
@@ -182,6 +183,7 @@ class Draft:
             "gif": [self.gif[0], self.gif[2]] if self.gif else None, "gif_url": self.gif_url,
             "file": [self.file[0], self.file[2]] if self.file else None, "button": list(self.button) if self.button else None,
             "extra_file": [self.extra_file[0], self.extra_file[2]] if self.extra_file else None,
+            "extra_parts": [[p[0], p[2]] for p in self.extra_parts] or None,
             "more_photos": [[p[0], p[2]] for p in self.more_photos] or None,
             "deliver": list(self.deliver) if self.deliver else None, "ping": self.ping.id if self.ping else None, "pack": self.pack, "mention_all": self.mention_all,
             "content": self.content, "gif_separate": self.gif_separate,
@@ -222,7 +224,16 @@ async def publish_draft(guild: discord.Guild, user, draft: Draft) -> discord.Mes
             await draft.channel.send(files=[discord.File(io.BytesIO(d), filename=n) for n, d, _ in chunk], allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             log.exception("Couldn't post extra photos under post %s", message.id)
-    if below:  # the file goes underneath the card, image and GIF
+    if below and draft.extra_parts:  # a big file in parts, one message each, with a how-to on the first
+        total = len(draft.extra_parts)
+        for i, (name, data, _) in enumerate(draft.extra_parts, 1):
+            note = (f"📦 **Split into {total} parts.** Download all {total}, keep them in one folder, then open "
+                    f"`{draft.extra_parts[0][0]}` with **7-Zip** or **WinRAR** to join them.") if i == 1 else None
+            try:
+                await draft.channel.send(content=note, file=discord.File(io.BytesIO(data), filename=name), allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                log.exception("Couldn't post part %s/%s under post %s", i, total, message.id)
+    elif below:  # the file goes underneath the card, image and GIF
         name, data, _ = draft.extra_file
         try:
             await draft.channel.send(file=discord.File(io.BytesIO(data), filename=name), allowed_mentions=discord.AllowedMentions.none())
