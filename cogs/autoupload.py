@@ -352,11 +352,15 @@ class AutoUpload(commands.Cog):
 
         media = [a for a in attachments if ctype_of(a).startswith(("image/", "video/", "audio/"))]
         non_media = [a for a in attachments if a not in media]
-        preview_att = media[0] if media else None
+        # Every image is shown on the post (first one big, the rest as a gallery); with no image, the first
+        # video/audio clip is the preview instead.
+        images = [a for a in media if ctype_of(a).startswith("image/")]
+        preview_att = images[0] if images else (media[0] if media else None)
+        more_atts = images[1:]
         deliver_atts = non_media if non_media else ([preview_att] if preview_att else [])
         if len(media) > 1:
-            log.info("autoupload: message %s has %d media attachment(s) -- using %s as the preview, ignoring the rest",
-                      message.id, len(media), preview_att.filename if preview_att else None)
+            log.info("autoupload: message %s has %d media attachment(s) -- preview %s, %d more image(s) in the gallery",
+                      message.id, len(media), preview_att.filename if preview_att else None, len(more_atts))
 
         posted, failed = [], []
         if deliver_atts:
@@ -373,7 +377,7 @@ class AutoUpload(commands.Cog):
             log.info("autoupload: claim attempt message %s (%d deliverable file(s): %s) -> %s", message.id, len(deliver_atts), names, "claimed" if claimed else "already processed, skipping")
             if claimed:
                 try:
-                    await self.ingest(message, preview_att, deliver_atts, row, post_channel, required_role, taken, store_guild_id)
+                    await self.ingest(message, preview_att, deliver_atts, row, post_channel, required_role, taken, store_guild_id, more_atts)
                     posted.append(names)
                 except UserError as e:
                     failed.append(f"**{names}:** {e}")
@@ -386,7 +390,7 @@ class AutoUpload(commands.Cog):
             await message.reply(embed=ui.card("⚠️ Some files didn't make it", "\n".join(failed), color=WARN), mention_author=False)
 
     async def ingest(self, message: discord.Message, preview_att: Optional[discord.Attachment], deliver_atts: list[discord.Attachment], row, post_channel: discord.TextChannel,
-                      required_role: Optional[discord.Role], taken: set, store_guild_id: int) -> None:
+                      required_role: Optional[discord.Role], taken: set, store_guild_id: int, more_atts: Optional[list] = None) -> None:
         for a in deliver_atts:
             check_filename(a.filename)
         total_declared = sum(a.size for a in deliver_atts)
@@ -489,6 +493,17 @@ class AutoUpload(commands.Cog):
                 preview_att.filename, out_filename, preview_att.content_type, ctype, len(preview_data), inline_limit, bool(photo), bool(file_attach), too_large_for_preview,
             )
 
+        # The other images go in a gallery with the main photo (only when there's a main photo to anchor it).
+        more_photos = []
+        if photo:
+            base = (re.sub(r"[^A-Za-z0-9_\-]+", "_", row["pack_name"]).strip("_") or "file")
+            limit_each = min(ATTACH_LIMIT, post_channel.guild.filesize_limit)
+            for n, a in enumerate(more_atts or [], start=2):
+                if a.size > limit_each:
+                    log.info("autoupload: skipping gallery image %s (%d bytes, over %d)", a.filename, a.size, limit_each)
+                    continue
+                more_photos.append((f"{base}_{n}{Path(a.filename).suffix.lower()}", await a.read(), a.size))
+
         # Title the post after the pack/source channel, not the raw filename (which is often a meaningless name
         # like "V1" or "Cielo_15") -- no filename and no "Uploaded in #..." text shown anywhere in the public
         # post, just the pack name, the preview, and the Get-file button. gif_url is an optional per-channel
@@ -506,7 +521,7 @@ class AutoUpload(commands.Cog):
         # the public post. deliver is only set when the file went through the stored/Get-file path above --
         # when it's attached directly (extra_file), there's nothing to deliver, so no button.
         draft = Draft(post_channel, title, None, None, None,
-                       photo=photo, file=file_attach, extra_file=extra_file, gif_url=row["gif_url"],
+                       photo=photo, file=file_attach, extra_file=extra_file, gif_url=row["gif_url"], more_photos=more_photos,
                        deliver=(file_row["id"], name) if file_row else None, pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
         log_fields = [

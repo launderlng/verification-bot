@@ -42,15 +42,36 @@ def unique_name(wanted: str, taken: set) -> str:
     return name
 
 
+MAX_EMBEDS = 10  # Discord's limit per message
+GALLERY_URL = "https://discord.com/"  # any fixed link: embeds sharing it render as one image grid
+
+
+def chunk_files(items: list, size_limit: int, per_message: int = 10) -> list[list]:
+    """Groups (name, bytes, size) items into messages of at most 10 files that stay under the upload limit."""
+    chunks, cur, cur_size = [], [], 0
+    for item in items:
+        if item[1] is None:
+            continue
+        if cur and (len(cur) >= per_message or cur_size + item[2] > size_limit):
+            chunks.append(cur)
+            cur, cur_size = [], 0
+        cur.append(item)
+        cur_size += item[2]
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 class Draft:
     """Everything a post is made of. New media is kept as bytes; media already on a posted message is kept by name only."""
 
     def __init__(self, channel, title: str, description: Optional[str], footer: Optional[str], color: Optional[int], photo=None, photo_url=None,
                  gif=None, gif_url=None, file=None, button=None, deliver=None, ping=None, pack: Optional[str] = None, mention_all: Optional[str] = None,
-                 show_file_field: bool = True, content: Optional[str] = None, extra_file=None):
+                 show_file_field: bool = True, content: Optional[str] = None, extra_file=None, more_photos=None):
         self.channel, self.title, self.description, self.footer, self.color = channel, title, description, footer, color
         self.photo, self.photo_url, self.gif, self.gif_url, self.file, self.button = photo, photo_url, gif, gif_url, file, button
         self.deliver = deliver  # (stored file id, name): a 📥 Get file button that DMs the file
+        self.more_photos = list(more_photos or [])  # extra images shown with the main photo as a gallery
         self.extra_file = extra_file  # (name, bytes, size): a second raw attachment alongside self.file -- e.g.
         # the real deliverable attached straight to the post when it's small enough, on top of a video preview
         # already occupying self.file
@@ -62,8 +83,27 @@ class Draft:
         # title-like line ahead of a raw video/audio attachment instead of it looking stuck below one
 
     # photo / gif / file / extra_file are (name, bytes-or-None, size)
+    def gallery(self) -> tuple[list, list]:
+        """Splits the extra photos into the ones shown in the post's embeds and the overflow that goes in its
+        own message. A message holds at most 10 embeds (main card + GIF + gallery images)."""
+        room = MAX_EMBEDS - 1 - (1 if (self.gif or self.gif_url) else 0)
+        try:
+            cap = int(self.channel.guild.filesize_limit)
+        except Exception:
+            cap = 10 * 1024 * 1024
+        used = sum(item[2] for item in (self.photo, self.gif, self.file) if item and item[1] is not None)
+        shown = []
+        for i, item in enumerate(self.more_photos):
+            new = item[2] if item[1] is not None else 0  # photos already on the message don't upload again
+            if len(shown) >= room or used + new > cap:
+                return shown, self.more_photos[i:]
+            shown.append(item)
+            used += new
+        return shown, []
+
     def files(self, include_extra: bool = True) -> list[discord.File]:
-        items = (self.photo, self.gif, self.file, self.extra_file) if include_extra else (self.photo, self.gif, self.file)
+        shown, _ = self.gallery()
+        items = [self.photo, *shown, self.gif, self.file] + ([self.extra_file] if include_extra else [])
         return [discord.File(io.BytesIO(item[1]), filename=item[0]) for item in items if item and item[1] is not None]
 
     def file_below(self) -> bool:
@@ -83,6 +123,16 @@ class Draft:
             if has_file_field:
                 main.add_field(name="📎 File", value=f"`{self.file[0]}` · {human_size(self.file[2])}\nAttached to this post ⬇️", inline=False)
             embeds.append(main)
+        shown, _ = self.gallery()
+        if shown and embeds and main_image:
+            # Embeds sharing one url are drawn by Discord as a single image grid (up to 4 per grid), so the
+            # extra photos sit together with the main one instead of as a stack of separate cards.
+            for i, item in enumerate(shown):
+                group = (i + 1) // 4  # the main photo is image 0 of grid 0
+                anchor = f"{GALLERY_URL}?g={group}"
+                if group == 0:
+                    embeds[0].url = anchor
+                embeds.append(discord.Embed(url=anchor, color=color).set_image(url=f"attachment://{item[0]}"))
         gif_image = f"attachment://{self.gif[0]}" if self.gif else self.gif_url
         if gif_image:
             embeds.append(ui.card(None, None, color=color, image=gif_image))  # the GIF gets its own spot under the card
@@ -124,6 +174,7 @@ class Draft:
             "gif": [self.gif[0], self.gif[2]] if self.gif else None, "gif_url": self.gif_url,
             "file": [self.file[0], self.file[2]] if self.file else None, "button": list(self.button) if self.button else None,
             "extra_file": [self.extra_file[0], self.extra_file[2]] if self.extra_file else None,
+            "more_photos": [[p[0], p[2]] for p in self.more_photos] or None,
             "deliver": list(self.deliver) if self.deliver else None, "ping": self.ping.id if self.ping else None, "pack": self.pack, "mention_all": self.mention_all,
             "content": self.content,
         })
@@ -135,13 +186,15 @@ class Draft:
         return cls(channel, d["title"], d["description"], d["footer"], d["color"], photo=(d["photo"][0], None, d["photo"][1]) if d["photo"] else None, photo_url=d["photo_url"],
                    gif=(d["gif"][0], None, d["gif"][1]) if d["gif"] else None, gif_url=d["gif_url"], file=(d["file"][0], None, d["file"][1]) if d["file"] else None,
                    extra_file=(d["extra_file"][0], None, d["extra_file"][1]) if d.get("extra_file") else None,
+                   more_photos=[(p[0], None, p[1]) for p in (d.get("more_photos") or [])],
                    content=d.get("content"),
                    button=tuple(d["button"]) if d["button"] else None, deliver=tuple(d["deliver"]) if d["deliver"] else None, ping=ping, pack=d.get("pack"), mention_all=d.get("mention_all"))
 
 
 def describe_post(draft: Draft) -> list:
     return [
-        ("📝 Title", draft.title), ("📦 Pack", draft.pack), ("🖼️ Photo", draft.photo[0] if draft.photo else draft.photo_url), ("🎞️ GIF", draft.gif[0] if draft.gif else draft.gif_url),
+        ("📝 Title", draft.title), ("📦 Pack", draft.pack), ("🖼️ Photo", draft.photo[0] if draft.photo else draft.photo_url),
+        ("🖼️ More photos", str(len(draft.more_photos)) if draft.more_photos else None), ("🎞️ GIF", draft.gif[0] if draft.gif else draft.gif_url),
         ("📎 File", f"{draft.file[0]} ({human_size(draft.file[2])})" if draft.file else None), ("📥 Get-file button", draft.deliver[1] if draft.deliver else None),
         ("🔗 Button", f"{draft.button[0]} → {draft.button[1]}" if draft.button else None), ("🔔 Pinged", " ".join(x for x in ({"everyone": "@everyone", "here": "@here"}.get(draft.mention_all), draft.ping.mention if draft.ping else None) if x) or None),
     ]
@@ -151,6 +204,12 @@ async def publish_draft(guild: discord.Guild, user, draft: Draft) -> discord.Mes
     """Send a post, record it so it can be edited later, and log it. Used by /post new and /post bulk."""
     below = draft.file_below()
     message = await draft.channel.send(**draft.kwargs(include_extra=not below))
+    _, overflow = draft.gallery()
+    for chunk in (chunk_files(overflow, draft.channel.guild.filesize_limit) if overflow else []):  # photos that didn't fit
+        try:
+            await draft.channel.send(files=[discord.File(io.BytesIO(d), filename=n) for n, d, _ in chunk], allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Couldn't post extra photos under post %s", message.id)
     if below:  # the file goes underneath the card, image and GIF
         name, data, _ = draft.extra_file
         try:
@@ -439,8 +498,9 @@ class Posts(commands.GroupCog, group_name="post", group_description="Posts with 
             photo=photo or (old.photo if not m.photo_url else None), photo_url=m.photo_url if m.photo_url and not photo else (None if photo else old.photo_url),
             gif=gif or (old.gif if not m.gif_url else None), gif_url=m.gif_url if m.gif_url and not gif else (None if gif else old.gif_url),
             file=file or old.file, button=button, deliver=old.deliver, ping=old.ping, pack=old.pack, mention_all=old.mention_all,
+            more_photos=old.more_photos,
         )
-        kept = {item[0] for item in (draft.photo, draft.gif, draft.file) if item and item[1] is None}
+        kept = {item[0] for item in (draft.photo, draft.gif, draft.file, *draft.gallery()[0]) if item and item[1] is None}
         keep = [a for a in message.attachments if a.filename in kept]
         try:
             await message.edit(embeds=draft.embeds(), attachments=keep + draft.files(), view=draft.view())
