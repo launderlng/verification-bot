@@ -19,6 +19,7 @@ from common import SUCCESS, WARN, UserError, check_can_send
 from fileutil import ATTACH_LIMIT, human_size, max_file_bytes, public_base_url, storage_cap_bytes
 from logutil import emit
 
+MAX_PARTS = 20  # most pieces a too-big file is split into before falling back to the Get-file button
 log = logging.getLogger("verification-bot")
 
 NEEDS_WEB = "Files over 25 MB need a public web address to deliver as a link. In Railway: Settings → Networking → Generate Domain."
@@ -429,11 +430,21 @@ class AutoUpload(commands.Cog):
         # The server's real upload limit (10 MB, or 50 / 100 MB with boosts). It used to be capped at 25 MB too,
         # so on a boosted server a 30 MB pack got a Get-file button even though Discord would take it.
         deliver_inline_limit = post_channel.guild.filesize_limit
-        attach_directly = len(data) <= deliver_inline_limit and not required_role
+        # Too big for one upload? Split it into numbered parts (pack.zip.001, .002 ...) that each fit, and post
+        # those instead of a Get-file button. Opening .001 in 7-Zip / WinRAR joins them back. Capped at
+        # MAX_PARTS so a huge file on an unboosted server doesn't flood the channel.
+        part_size = max(1024 * 1024, deliver_inline_limit - 512 * 1024)
+        parts_needed = -(-len(data) // part_size)
+        split = not required_role and len(data) > deliver_inline_limit and parts_needed <= MAX_PARTS
+        attach_directly = (len(data) <= deliver_inline_limit or split) and not required_role
 
         file_row = extra_file = None
+        extra_parts = []
         name = out_filename
-        if attach_directly:
+        if split:
+            extra_parts = [(f"{out_filename}.{i + 1:03d}", data[i * part_size:(i + 1) * part_size], len(data[i * part_size:(i + 1) * part_size]))
+                           for i in range(parts_needed)]
+        elif attach_directly:
             extra_file = (out_filename, data, len(data))
         else:
             if total_declared > await self.room_left(store_guild_id):
@@ -523,14 +534,14 @@ class AutoUpload(commands.Cog):
         # the public post. deliver is only set when the file went through the stored/Get-file path above --
         # when it's attached directly (extra_file), there's nothing to deliver, so no button.
         draft = Draft(post_channel, title, None, None, None,
-                       photo=photo, file=file_attach, extra_file=extra_file, gif_url=row["gif_url"], more_photos=more_photos,
+                       photo=photo, file=file_attach, extra_file=extra_file, gif_url=row["gif_url"], more_photos=more_photos, extra_parts=extra_parts,
                        deliver=(file_row["id"], name) if file_row else None, pack=row["pack_name"], show_file_field=False, content=content)
         await publish_draft(post_channel.guild, message.author, draft)
         log_fields = [
             ("👤 By", message.author.mention), ("📦 Name", name), ("📍 Dropped in", f"#{message.channel.name} ({message.guild.name})"), ("📬 Posted in", post_channel.mention),
-            ("📎 Delivery", "Attached directly to the post" if attach_directly else (
+            ("📎 Delivery", f"Split into {len(extra_parts)} parts of up to {human_size(part_size)}" if extra_parts else "Attached directly to the post" if attach_directly else (
                 f"Get-file button: this drop zone needs {required_role.mention}" if required_role
-                else f"Get-file button: {human_size(len(data))} is over this server's {human_size(deliver_inline_limit)} upload limit")),
+                else f"Get-file button: {human_size(len(data))} would need more than {MAX_PARTS} parts at this server's {human_size(deliver_inline_limit)} limit")),
         ]
         if too_large_for_preview:
             # Not shown on the public post -- staff can see why a video/image had no inline preview here instead.
