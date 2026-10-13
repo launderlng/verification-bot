@@ -533,6 +533,7 @@ MIGRATIONS = [
     ("licenses", "duration_days", "INTEGER"),
     ("orders", "option_id", "INTEGER"),
     ("licenses", "macro", "TEXT"),          # which macro a key is for (NULL = every macro)
+    ("licenses", "hwid", "TEXT"),           # device the key is locked to (NULL = not locked yet)
     ("products", "license_macro", "TEXT"),  # which macro a product's keys are for
     ("tickets", "macro", "TEXT"),           # which macro a support ticket is about
     ("review_settings", "staff_channel_id", "INTEGER"),  # where staff/support reviews go (NULL = the reviews channel)

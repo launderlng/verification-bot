@@ -451,6 +451,23 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                                (("🔑 Key is for", macro_label(row["macro"])), ("🖥️ Tried in", macro_label(asked)),
                                 ("❌ Refused", "Wrong macro")), WARN)
             return web.Response(text=f"DENIED|THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO")
+        # Device lock: the first PC to log in binds the key to its hardware ID. Any other PC is refused
+        # (and the macro there self-destructs). Staff can clear it with /key resethwid.
+        dev = (form.get("hwid") or "").strip()[:120]
+        first_device = False
+        if dev:
+            if not row["hwid"]:
+                await db.execute("UPDATE licenses SET hwid = ? WHERE id = ? AND hwid IS NULL", (dev, row["id"]))
+                await log_event(row["id"], "device_bound", dev[:60])
+                first_device = True
+                row = await db.fetch_one("SELECT * FROM licenses WHERE id = ?", (row["id"],))
+            elif row["hwid"] != dev:
+                await log_event(row["id"], "activation_denied", f"wrong device {dev[:60]}")
+                await self.key_log(row, "🖥️ Key used on a different device", who,
+                                   (("🔒 Locked to", f"`{row['hwid']}`"), ("🕵️ Tried from", f"`{dev}`"),
+                                    ("❌ Refused", "Different device — the copy there will self-destruct"),
+                                    ("🔎 Reset", "`/key resethwid` if this member got a new PC")), DANGER)
+                return web.Response(text="DENIED|KEY LOCKED TO ANOTHER DEVICE")
         owner = row["user_id"]
         first_link = False
         if self.linking_enabled():
@@ -487,6 +504,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                 fresh, "🟢 Key activated (first login)" if first else "🔓 Macro login", who,
                 (("🎮 Macro", macro_label(asked)), ("⏳ Length", expiry_text(fresh)), ("🔢 Logins", f"{fresh['activations']:,}"),
                  ("🔗 Locked to", "this account (first use)" if first_link else None),
+                 ("🖥️ Device locked", f"`{fresh['hwid']}`" if first_device else None),
                  ("🧾 Order", f"`{fresh['order_code']}`" if fresh["order_code"] else None)),
                 SUCCESS)
         return web.Response(text="OK|LICENSE VALID")
@@ -512,8 +530,11 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             reason = "KEY EXPIRED"
         else:
             asked = clean_macro(form.get("product")) or DEFAULT_MACRO
+            dev = (form.get("hwid") or "").strip()[:120]
             if row["macro"] and row["macro"] != asked:
                 reason = f"THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO"
+            elif row["hwid"] and dev and row["hwid"] != dev:
+                reason = "KEY LOCKED TO ANOTHER DEVICE"
             elif self.linking_enabled() and row["user_id"]:
                 link = await self.linked_user(clean_session(form.get("session")))
                 if link is not None and link["user_id"] != row["user_id"]:
@@ -669,6 +690,21 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
     @app_commands.autocomplete(code=key_autocomplete)
     async def enable(self, interaction: discord.Interaction, code: str):
         await self.set_active(interaction, code, True)
+
+    @app_commands.command(description="Unlock a key from its device (e.g. the member got a new PC)")
+    @app_commands.autocomplete(code=key_autocomplete)
+    async def resethwid(self, interaction: discord.Interaction, code: str):
+        row = await find_license(code)
+        old = row["hwid"]
+        await db.execute("UPDATE licenses SET hwid = NULL WHERE id = ?", (row["id"],))
+        await log_event(row["id"], "device_reset", f"by {interaction.user.id}")
+        await emit(interaction.guild, "keys", "🖥️ Key unlocked from its device",
+                   ui.kv(("Key", f"`{row['code']}`"), ("Was locked to", f"`{old}`" if old else "Not locked"), ("By", interaction.user.mention)),
+                   subject=row["user_id"])
+        row = await find_license(code)
+        await interaction.response.send_message(
+            embed=ui.card("🖥️ Device unlocked", f"`{row['code']}` can now be used on a new device. The next PC to log in will lock it.",
+                          color=SUCCESS, guild=interaction.guild, section="Keys"), ephemeral=True)
 
     @app_commands.command(description="Add days to a key (or make it lifetime)")
     @app_commands.describe(days="Days to add (from today if it already expired)", lifetime="Make it never expire")
