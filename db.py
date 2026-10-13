@@ -535,6 +535,7 @@ MIGRATIONS = [
     ("licenses", "macro", "TEXT"),          # which macro a key is for (NULL = every macro)
     ("products", "license_macro", "TEXT"),  # which macro a product's keys are for
     ("tickets", "macro", "TEXT"),           # which macro a support ticket is about
+    ("review_settings", "staff_channel_id", "INTEGER"),  # where staff/support reviews go (NULL = the reviews channel)
 ]
 
 
@@ -650,7 +651,7 @@ async def upsert_ticket_config(guild_id: int, **fields) -> None:
     await _upsert("ticket_config", TICKET_COLUMNS, guild_id, fields)
 
 
-REVIEW_SETTING_COLUMNS = {"channel_id", "require_purchase"}
+REVIEW_SETTING_COLUMNS = {"channel_id", "require_purchase", "staff_channel_id"}
 
 
 async def get_review_settings(guild_id: int) -> aiosqlite.Row | None:

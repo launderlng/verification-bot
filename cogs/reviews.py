@@ -36,11 +36,23 @@ def review_embed(guild: discord.Guild, user: discord.abc.User, r) -> discord.Emb
     )
 
 
+def staff_channel_id(settings) -> Optional[int]:
+    """Where staff (support) reviews go: the staff reviews channel, or the product reviews channel if that isn't set."""
+    if not settings:
+        return None
+    return settings["staff_channel_id"] or settings["channel_id"]
+
+
+def product_channel_id(settings) -> Optional[int]:
+    return settings["channel_id"] if settings else None
+
+
 async def post_ticket_review(guild: discord.Guild, user: discord.abc.User, ticket, stars: int, comment: Optional[str] = None):
-    """Called when someone rates a ticket in their DMs: posts the review card, crediting the staff member who claimed it.
-    Returns (review row, message), or None if no reviews channel is set up."""
+    """Called when someone rates a ticket in their DMs: posts the review card in the staff reviews channel,
+    crediting the staff member who claimed it. Returns (review row, message), or None if no channel is set up."""
     settings = await db.get_review_settings(guild.id)
-    channel = guild.get_channel(settings["channel_id"]) if settings and settings["channel_id"] else None
+    cid = staff_channel_id(settings)
+    channel = guild.get_channel(cid) if cid else None
     if channel is None:
         return None
     name = f"Ticket #{ticket['number']:04d} · {ticket['type_name']}"
@@ -90,6 +102,158 @@ async def refresh_product_card(bot: commands.Bot, guild: discord.Guild, product_
         await shop.refresh_post(guild, product)
 
 
+async def save_product_review(bot: commands.Bot, guild: discord.Guild, user: discord.abc.User, p, stars: int,
+                              comment: Optional[str] = None, staff_id: Optional[int] = None):
+    """Saves a product review and posts (or updates) its card in the product reviews channel.
+    Used by /review and by 'Review a product' in the DM sent when a ticket closes.
+    Returns (review row, message, existing row or None, order code or None, channel). Raises UserError if it can't."""
+    settings = await db.get_review_settings(guild.id)
+    cid = product_channel_id(settings)
+    if not cid:
+        raise UserError("Product reviews aren't set up yet. An admin can run `/reviews channel`.")
+    channel = guild.get_channel(cid)
+    if channel is None:
+        raise UserError("The product reviews channel no longer exists. An admin needs to run `/reviews channel` again.")
+    order = await db.fetch_one(
+        "SELECT code FROM orders WHERE guild_id = ? AND user_id = ? AND lower(product_name) = lower(?) ORDER BY id DESC LIMIT 1",
+        (guild.id, user.id, p["name"]),
+    )
+    if settings["require_purchase"] and not order:
+        raise UserError("Only verified buyers can review this product. Buy it through the shop first.")
+    code = order["code"] if order else None
+    existing = await db.fetch_one("SELECT * FROM reviews WHERE guild_id = ? AND user_id = ? AND product_name = ?", (guild.id, user.id, p["name"]))
+    if existing:
+        await db.execute("UPDATE reviews SET stars = ?, comment = ?, order_code = ?, staff_id = ? WHERE id = ?",
+                         (stars, comment, code, staff_id or existing["staff_id"], existing["id"]))
+        review_id = existing["id"]
+    else:
+        await db.execute(
+            "INSERT INTO reviews (guild_id, user_id, product_name, stars, comment, order_code, created_at, staff_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild.id, user.id, p["name"], stars, comment, code, discord.utils.utcnow().isoformat(), staff_id),
+        )
+        review_id = (await db.fetch_one("SELECT id FROM reviews WHERE guild_id = ? AND user_id = ? AND product_name = ?", (guild.id, user.id, p["name"])))["id"]
+    r = await db.fetch_one("SELECT * FROM reviews WHERE id = ?", (review_id,))
+    embed = review_embed(guild, user, r)
+
+    message = None
+    # Edit the old card if it's still in the product reviews channel; otherwise post a new one there.
+    if existing and existing["message_id"] and existing["channel_id"] == channel.id:
+        try:
+            message = await channel.fetch_message(existing["message_id"])
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            message = None
+    if message is None:
+        try:
+            message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            raise UserError("I couldn't post in the product reviews channel. An admin needs to check my permissions there.") from None
+    await db.execute("UPDATE reviews SET channel_id = ?, message_id = ? WHERE id = ?", (channel.id, message.id, review_id))
+    await refresh_product_card(bot, guild, p["name"])
+    await emit(
+        guild, "shop", "Product review posted" if existing is None else "Product review updated",
+        ui.kv(("👤 Reviewer", f"{user.mention} (`{user.id}`)"), ("📦 Product", p["name"]), ("⭐ Rating", f"{ui.stars(stars)} {stars}/5"),
+              ("✅ Purchase", f"Verified buyer, order `{code}`" if code else "Not a verified buyer"), ("🛡️ Staff tagged", f"<@{staff_id}>" if staff_id else None)),
+        subject=user.id, ids=(("product", p["name"]), ("order", code)),
+    )
+    return r, message, existing, code, channel
+
+
+# ------------------------------------------------ 'Review a product' (ticket close DM) ----
+
+async def reviewable_products(guild_id: int, user_id: int) -> list:
+    """Products this member can review: ones they bought first, then (unless buyers-only) the rest of the shop."""
+    settings = await db.get_review_settings(guild_id)
+    bought = await db.fetch_all(
+        "SELECT p.* FROM products p WHERE p.guild_id = ? AND EXISTS (SELECT 1 FROM orders o WHERE o.guild_id = p.guild_id AND o.user_id = ? "
+        "AND lower(o.product_name) = lower(p.name)) ORDER BY p.name", (guild_id, user_id))
+    if settings and settings["require_purchase"]:
+        return bought
+    seen = {p["id"] for p in bought}
+    rest = await db.fetch_all("SELECT * FROM products WHERE guild_id = ? AND available = 1 ORDER BY name", (guild_id,))
+    return bought + [p for p in rest if p["id"] not in seen]
+
+
+class ProductReviewButton(discord.ui.DynamicItem[discord.ui.Button], template=r"review:product:(?P<gid>[0-9]+)"):
+    """'Review a product' button (keeps working after restarts). Opens a product picker, then stars, then an optional comment."""
+
+    def __init__(self, guild_id: int):
+        super().__init__(discord.ui.Button(label="Review a product", emoji="🛍️", style=discord.ButtonStyle.success, custom_id=f"review:product:{guild_id}"))
+        self.guild_id = guild_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(int(match["gid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.client.get_guild(self.guild_id)
+        settings = await db.get_review_settings(self.guild_id)
+        if guild is None or not product_channel_id(settings):
+            return await interaction.response.send_message("Product reviews aren't set up right now.", ephemeral=True)
+        products = await reviewable_products(self.guild_id, interaction.user.id)
+        if not products:
+            msg = "Only buyers can review products, and I can't find a purchase on your account." if settings["require_purchase"] else "There are no products to review yet."
+            return await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(
+            embed=ui.card("🛍️ Review a product", "Which product do you want to review?", color=COLOR, guild=guild, section="Reviews"),
+            view=ProductPickView(interaction.client, guild, products[:25]), ephemeral=True,
+        )
+
+
+class ProductPickView(discord.ui.View):
+    def __init__(self, bot, guild: discord.Guild, products: list):
+        super().__init__(timeout=600)
+        self.bot, self.guild = bot, guild
+        select = discord.ui.Select(placeholder="Pick a product", options=[
+            discord.SelectOption(label=p["name"][:100], value=str(p["id"]), emoji="📦") for p in products])
+
+        async def picked(interaction: discord.Interaction):
+            p = await db.fetch_one("SELECT * FROM products WHERE id = ? AND guild_id = ?", (int(select.values[0]), guild.id))
+            if not p:
+                return await interaction.response.send_message("That product doesn't exist any more.", ephemeral=True)
+            await interaction.response.edit_message(
+                embed=ui.card(f"🛍️ {p['name']}", "How many stars do you give it?", color=COLOR, guild=guild, section="Reviews"),
+                view=StarPickView(bot, guild, p))
+
+        select.callback = picked
+        self.add_item(select)
+
+
+class StarPickView(discord.ui.View):
+    def __init__(self, bot, guild: discord.Guild, p):
+        super().__init__(timeout=600)
+        for n in (1, 2, 3, 4, 5):
+            button = discord.ui.Button(label=str(n), emoji="⭐", style=discord.ButtonStyle.secondary)
+
+            async def clicked(interaction: discord.Interaction, n=n):
+                await interaction.response.send_modal(ProductReviewModal(bot, guild, p, n))
+
+            button.callback = clicked
+            self.add_item(button)
+
+
+class ProductReviewModal(discord.ui.Modal):
+    def __init__(self, bot, guild: discord.Guild, p, stars: int):
+        super().__init__(title=f"{stars}/5 for {p['name']}"[:45])
+        self.bot, self.guild, self.p, self.stars = bot, guild, p, stars
+        self.text = discord.ui.TextInput(label="Comment (optional)", style=discord.TextStyle.paragraph, max_length=500, required=False,
+                                         placeholder="What did you think of it?")
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            r, message, existing, code, channel = await save_product_review(
+                self.bot, self.guild, interaction.user, self.p, self.stars, self.text.value.strip() or None)
+        except UserError as e:
+            return await interaction.response.edit_message(embed=ui.card("Couldn't post your review", str(e), color=DANGER, guild=self.guild, section="Reviews"), view=None)
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="See your review", emoji="⭐", url=message.jump_url))
+        await interaction.response.edit_message(embed=ui.card(
+            "✅ Review updated" if existing else "✅ Thanks for your review!",
+            f"{ui.stars(self.stars)}  **{self.stars}/5** for **{self.p['name']}**" + ("\n✅ Verified buyer" if code else ""),
+            color=SUCCESS, guild=self.guild, section="Reviews"), view=view)
+
+
 @app_commands.guild_only()
 class ReviewCog(commands.Cog):
     """The member-facing /review command."""
@@ -116,62 +280,16 @@ class ReviewCog(commands.Cog):
                 raise UserError("Tag a real staff member who helped you, not yourself or a bot.")
             if tickets_cfg and not is_staff(staff, tickets_cfg):
                 raise UserError(f"{staff.mention} isn't on the staff team. Tag the staff member who helped you.")
-        settings = await db.get_review_settings(guild.id)
-        if not settings or not settings["channel_id"]:
-            raise UserError("Reviews aren't set up yet. An admin can run `/reviews channel`.")
-        channel = guild.get_channel(settings["channel_id"])
-        if channel is None:
-            raise UserError("The reviews channel no longer exists. An admin needs to run `/reviews channel` again.")
         p = await db.fetch_one("SELECT * FROM products WHERE guild_id = ? AND name = ?", (guild.id, product.strip()))
         if not p:
             raise UserError("I can't find that product. Start typing its name and pick one from the list.")
-        order = await db.fetch_one(
-            "SELECT code FROM orders WHERE guild_id = ? AND user_id = ? AND lower(product_name) = lower(?) ORDER BY id DESC LIMIT 1",
-            (guild.id, user.id, p["name"]),
-        )
-        if settings["require_purchase"] and not order:
-            raise UserError("Only verified buyers can review this product. Buy it through the shop first.")
-
         await interaction.response.defer(ephemeral=True)
-        code = order["code"] if order else None
-        existing = await db.fetch_one("SELECT * FROM reviews WHERE guild_id = ? AND user_id = ? AND product_name = ?", (guild.id, user.id, p["name"]))
-        if existing:
-            await db.execute("UPDATE reviews SET stars = ?, comment = ?, order_code = ?, staff_id = ? WHERE id = ?", (stars.value, comment, code, staff.id if staff else existing["staff_id"], existing["id"]))
-            review_id = existing["id"]
-        else:
-            await db.execute(
-                "INSERT INTO reviews (guild_id, user_id, product_name, stars, comment, order_code, created_at, staff_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (guild.id, user.id, p["name"], stars.value, comment, code, discord.utils.utcnow().isoformat(), staff.id if staff else None),
-            )
-            review_id = (await db.fetch_one("SELECT id FROM reviews WHERE guild_id = ? AND user_id = ? AND product_name = ?", (guild.id, user.id, p["name"])))["id"]
-        r = await db.fetch_one("SELECT * FROM reviews WHERE id = ?", (review_id,))
-        embed = review_embed(guild, user, r)
-
-        message = None
-        if existing and existing["message_id"]:
-            try:
-                message = await channel.fetch_message(existing["message_id"])
-                await message.edit(embed=embed)
-            except discord.HTTPException:
-                message = None
-        if message is None:
-            try:
-                message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-            except discord.HTTPException:
-                raise UserError("I couldn't post in the reviews channel. An admin needs to check my permissions there.") from None
-        await db.execute("UPDATE reviews SET channel_id = ?, message_id = ? WHERE id = ?", (channel.id, message.id, review_id))
-        await refresh_product_card(self.bot, guild, p["name"])
+        r, message, existing, code, channel = await save_product_review(self.bot, guild, user, p, stars.value, comment, staff.id if staff else None)
 
         done = ui.card(
             "✅ Review updated" if existing else "✅ Thanks for your review!",
             f"{ui.stars(stars.value)}  **{stars.value}/5** for **{p['name']}**" + (f"\n🛡️ Thanks to {staff.mention}" if staff else "") + f"\n\n[See it in {channel.mention}]({message.jump_url})",
             color=SUCCESS, guild=guild, section="Reviews",
-        )
-        await emit(
-            guild, "shop", "Product review posted" if existing is None else "Product review updated",
-            ui.kv(("👤 Reviewer", f"{user.mention} (`{user.id}`)"), ("📦 Product", p["name"]), ("⭐ Rating", f"{ui.stars(stars.value)} {stars.value}/5"),
-                  ("✅ Purchase", f"Verified buyer, order `{code}`" if code else "Not a verified buyer"), ("🛡️ Staff tagged", staff.mention if staff else None)),
-            subject=user.id, ids=(("product", p["name"]), ("order", code)),
         )
         await interaction.followup.send(embed=done, ephemeral=True)
 
@@ -183,19 +301,27 @@ class Reviews(commands.GroupCog, group_name="reviews", group_description="Review
         self.bot = bot
         super().__init__()
 
-    @app_commands.command(description="Choose where reviews are posted (and whether buyers only)")
-    @app_commands.describe(channel="Where new reviews appear", require_purchase="Only members who bought the product can review it")
+    @app_commands.command(description="Choose where product reviews and staff reviews are posted (and whether buyers only)")
+    @app_commands.describe(
+        channel="Where product reviews appear",
+        staff_channel="Where staff / support reviews appear (from the stars after a ticket closes)",
+        require_purchase="Only members who bought the product can review it",
+    )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def channel(
         self,
         interaction: discord.Interaction,
         channel: Optional[discord.TextChannel] = None,
+        staff_channel: Optional[discord.TextChannel] = None,
         require_purchase: Optional[bool] = None,
     ):
         updates: dict = {}
         if channel:
             check_can_send(channel, interaction.guild.me)
             updates["channel_id"] = channel.id
+        if staff_channel:
+            check_can_send(staff_channel, interaction.guild.me)
+            updates["staff_channel_id"] = staff_channel.id
         if require_purchase is not None:
             updates["require_purchase"] = int(require_purchase)
         if updates:
@@ -204,7 +330,9 @@ class Reviews(commands.GroupCog, group_name="reviews", group_description="Review
         embed = ui.card(
             "⭐ Review settings" if not updates else "✅ Review settings saved",
             ui.kv(
-                ("Reviews channel", f"<#{s['channel_id']}>" if s and s["channel_id"] else "Not set"),
+                ("🛍️ Product reviews", f"<#{s['channel_id']}>" if s and s["channel_id"] else "Not set"),
+                ("🛡️ Staff reviews", f"<#{s['staff_channel_id']}>" if s and s["staff_channel_id"]
+                 else (f"<#{s['channel_id']}> (same as products, set `staff_channel` to split them)" if s and s["channel_id"] else "Not set")),
                 ("Buyers only", "Yes" if s and s["require_purchase"] else "No"),
             ),
             guild=interaction.guild, section="Reviews", color=SUCCESS if updates else COLOR,

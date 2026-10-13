@@ -14,7 +14,7 @@ from discord.ext import commands, tasks
 import db
 import ui
 from common import ACCENT, COLOR, DANGER, INFO, LINK_RE, SUCCESS, WARN, UserError, check_can_send, is_staff, parse_color, reply, staff_ids, support_button
-from cogs.reviews import add_ticket_review_comment, post_ticket_review
+from cogs.reviews import ProductReviewButton, add_ticket_review_comment, post_ticket_review, product_channel_id, staff_channel_id
 from logutil import emit
 from macros import MACROS, macro_label, macro_name
 from transcript import render_transcript
@@ -226,6 +226,9 @@ class RateButton(discord.ui.DynamicItem[discord.ui.Button], template=r"ticket:ra
         if review:
             view.add_item(CommentButton(self.ticket_id))
             view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="See your review", emoji="⭐", url=message.jump_url))
+        if guild and product_channel_id(await db.get_review_settings(guild.id)):
+            view.add_item(ProductReviewButton(guild.id))
+            body += "\n\n🛍️ **Bought something from us?** Tap **Review a product** to review it too."
         button = support_button(guild, cfg) if guild else None
         if button:
             view.add_item(button)
@@ -275,6 +278,8 @@ class CommentModal(discord.ui.Modal):
         view = discord.ui.View(timeout=None)
         if message:
             view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="See your review", emoji="⭐", url=message.jump_url))
+        if product_channel_id(await db.get_review_settings(guild.id)):
+            view.add_item(ProductReviewButton(guild.id))
         button = support_button(guild, cfg)
         if button:
             view.add_item(button)
@@ -283,10 +288,15 @@ class CommentModal(discord.ui.Modal):
         )
 
 
-def rating_view(ticket_id: int, guild: Optional[discord.Guild] = None, cfg=None) -> discord.ui.View:
+def rating_view(ticket_id: int, guild: Optional[discord.Guild] = None, cfg=None, rate_staff: bool = True,
+                review_products: bool = False) -> discord.ui.View:
+    """The buttons in the ticket-closed DM: stars for the staff review (row 1), then 'Review a product' and Support."""
     view = discord.ui.View(timeout=None)
-    for n in range(1, 6):
-        view.add_item(RateButton(ticket_id, n))
+    if rate_staff:
+        for n in range(1, 6):
+            view.add_item(RateButton(ticket_id, n))
+    if review_products and guild:
+        view.add_item(ProductReviewButton(guild.id))
     button = support_button(guild, cfg) if guild else None
     if button:
         view.add_item(button)
@@ -306,7 +316,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         self.bot.add_view(PanelSelectView(self))
         self.bot.add_view(PanelButtonView(self))
         self.bot.add_view(TicketControls(self))
-        self.bot.add_dynamic_items(RateButton, CommentButton)
+        self.bot.add_dynamic_items(RateButton, CommentButton, ProductReviewButton)
         rows = await db.fetch_all("SELECT id, channel_id FROM tickets WHERE status = 'open' AND channel_id IS NOT NULL")
         self.channels = {r["channel_id"]: r["id"] for r in rows}
         self.sweeper.start()
@@ -314,7 +324,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
     async def cog_unload(self):
         self.sweeper.cancel()
         try:
-            self.bot.remove_dynamic_items(RateButton, CommentButton)
+            self.bot.remove_dynamic_items(RateButton, CommentButton, ProductReviewButton)
         except Exception:
             pass
 
@@ -707,8 +717,13 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
                     ("⏱️ Open for", fmt_duration((now - parse_iso(ticket["created_at"])).total_seconds())),
                     ("📝 Reason", reason),
                 )
+                staff_cid, product_cid = staff_channel_id(rs), product_channel_id(rs)
                 if cfg["ask_rating"]:
-                    body += f"\n\n{ui.DIVIDER}\n**How was our support?** Tap a star below." + (" Your rating is posted in our reviews channel." if rs and rs["channel_id"] else "")
+                    body += (f"\n\n{ui.DIVIDER}\n🛡️ **Staff review** · How was our support? Tap a star below."
+                             + (f" It's posted in <#{staff_cid}>." if staff_cid else ""))
+                if product_cid:
+                    body += (("\n\n" if cfg["ask_rating"] else f"\n\n{ui.DIVIDER}\n")
+                             + f"🛍️ **Product review** · Bought something? Tap **Review a product** to rate it. It's posted in <#{product_cid}>.")
                 dm = ui.card(
                     f"Your ticket {number} was closed", body, color=WARN, thumbnail=guild.icon.url if guild.icon else None,
                     footer="Your transcript is attached. Open it in a web browser." if data else guild.name,
@@ -716,8 +731,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
                 kwargs = {"embed": dm}
                 if data:
                     kwargs["file"] = discord.File(io.BytesIO(data), filename=filename)
-                if cfg["ask_rating"]:
-                    kwargs["view"] = rating_view(ticket["id"], guild, cfg)
+                if cfg["ask_rating"] or product_cid:
+                    kwargs["view"] = rating_view(ticket["id"], guild, cfg, rate_staff=bool(cfg["ask_rating"]), review_products=bool(product_cid))
                 else:
                     link = support_button(guild, cfg)
                     if link:
