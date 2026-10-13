@@ -539,11 +539,14 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (code,))
         if not row:
             return web.Response(text="OK")
-        try:
-            count = max(0, min(999, int(form.get("count", "0"))))
-        except (TypeError, ValueError):
-            count = 0
-        if count < 1:
+        def as_int(field):
+            try:
+                return max(0, min(9999, int(form.get(field, "0"))))
+            except (TypeError, ValueError):
+                return 0
+        count = as_int("count")        # copies on disk, beyond the running one
+        bin_count = as_int("bin")      # copies sitting in the Recycle Bin
+        if count < 1 and bin_count < 1:
             return web.Response(text="OK")
         # rate-limit: reuse the per-key login throttle so relaunches don't spam the log
         if not self.should_log_login(("copies", row["id"]), None):
@@ -551,12 +554,17 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         link = await self.linked_user(clean_session(form.get("session"))) if self.linking_enabled() else None
         who = link["user_id"] if link else row["user_id"]
         asked = clean_macro(form.get("product")) or DEFAULT_MACRO
-        where = (form.get("paths") or "").strip()[:900] or "Unknown"
-        await log_event(row["id"], "copies_found", f"{count} copies ({asked})")
+        hwid = (form.get("hwid") or "").strip()[:120] or "Unknown"
+        paths = (form.get("paths") or "").strip()
+        where = "\n".join(f"`{p}`" for p in paths.splitlines() if p.strip())[:950] or "Unknown"
+        await log_event(row["id"], "copies_found", f"{count} copies, {bin_count} in bin ({asked}) hwid={hwid[:60]}")
         await self.key_log(
             row, "📑 Extra copies of the file found on a PC", who,
-            (("🎮 Macro", macro_label(asked)), ("🔢 Copies", f"{count:,} beyond the running one"),
-             ("📂 Where", where),
+            (("🎮 Macro", macro_label(asked)),
+             ("🖥️ Device (HWID)", f"`{hwid}`"),
+             ("🔢 Copies on disk", f"{count:,} beyond the running one"),
+             ("🗑️ In the Recycle Bin", f"{bin_count:,}" if bin_count else None),
+             ("📂 Every copy", where),
              ("ℹ️ Note", "The macro found more than one copy of its file. Possible key sharing — "
               "`/key disable` removes every copy on that PC the next time it checks.")),
             WARN)
