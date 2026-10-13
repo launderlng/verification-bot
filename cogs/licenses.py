@@ -250,6 +250,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if app is not None:
             app.router.add_post("/api/activate", self.handle_activate)
             app.router.add_post("/api/check", self.handle_check)
+            app.router.add_post("/api/report", self.handle_report)
             app.router.add_post("/api/auth/new", self.handle_auth_new)
             app.router.add_get("/api/auth/status", self.handle_auth_status)
             app.router.add_get("/auth/start", self.handle_auth_start)
@@ -524,6 +525,42 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             await log_event(row["id"], "logged_out", reason)
             await self.key_log(row, "🔒 Logged out of the macro", row["user_id"], (("❌ Reason", reason.capitalize()),), WARN)
         return web.Response(text=f"REVOKED|{reason}")
+
+    async def handle_report(self, request: web.Request) -> web.Response:
+        """The macro reports here when it finds extra copies of its file on the PC. Posts a warning to the key log.
+        At most one warning per key every 10 minutes, so it can't be used to spam. Always answers OK."""
+        try:
+            form = await request.post()
+        except Exception:
+            return web.Response(text="OK")
+        code = clean_code(form.get("code"))
+        if not code:
+            return web.Response(text="OK")
+        row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (code,))
+        if not row:
+            return web.Response(text="OK")
+        try:
+            count = max(0, min(999, int(form.get("count", "0"))))
+        except (TypeError, ValueError):
+            count = 0
+        if count < 1:
+            return web.Response(text="OK")
+        # rate-limit: reuse the per-key login throttle so relaunches don't spam the log
+        if not self.should_log_login(("copies", row["id"]), None):
+            return web.Response(text="OK")
+        link = await self.linked_user(clean_session(form.get("session"))) if self.linking_enabled() else None
+        who = link["user_id"] if link else row["user_id"]
+        asked = clean_macro(form.get("product")) or DEFAULT_MACRO
+        where = (form.get("paths") or "").strip()[:900] or "Unknown"
+        await log_event(row["id"], "copies_found", f"{count} copies ({asked})")
+        await self.key_log(
+            row, "📑 Extra copies of the file found on a PC", who,
+            (("🎮 Macro", macro_label(asked)), ("🔢 Copies", f"{count:,} beyond the running one"),
+             ("📂 Where", where),
+             ("ℹ️ Note", "The macro found more than one copy of its file. Possible key sharing — "
+              "`/key disable` removes every copy on that PC the next time it checks.")),
+            WARN)
+        return web.Response(text="OK")
 
     # ---------------------------------------------------------- commands ----
 
