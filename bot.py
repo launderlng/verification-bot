@@ -107,10 +107,23 @@ class VerificationBot(commands.Bot):
         try:
             if DEV_GUILD_ID:
                 guild = discord.Object(id=int(DEV_GUILD_ID))
+                # Put every command on this one server (shows up instantly)...
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
-                log.info("Synced commands to dev guild %s", DEV_GUILD_ID)
+                # ...then wipe the GLOBAL copies, or each command would appear twice
+                # (once global, once for the server). This clears old global duplicates.
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                log.info("Synced commands to dev guild %s (cleared global duplicates)", DEV_GUILD_ID)
             else:
+                # Global only. Clear any leftover commands on the server we used to dev-sync to,
+                # so they don't sit alongside the global ones as duplicates.
+                old_guild = os.getenv("CLEAR_GUILD_ID") or os.getenv("OLD_GUILD_ID")
+                if old_guild:
+                    g = discord.Object(id=int(old_guild))
+                    self.tree.clear_commands(guild=g)
+                    await self.tree.sync(guild=g)
+                    log.info("Cleared leftover commands from guild %s", old_guild)
                 await self.tree.sync()
                 log.info("Synced commands globally (can take up to an hour to appear)")
             self.sync_status = "ok"
