@@ -131,3 +131,7 @@ def support_button(guild: discord.Guild, cfg):
     return discord.ui.Button(
         style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{cfg['panel_channel_id']}",
     )
+
+
+# A link (usually a Stripe Payment Link) pasted where a price belongs. Never shown as a price.
+LINK_RE = re.compile(r"(https?://|www\.|buy\.stripe\.com|discord\.gg/)", re.I)
