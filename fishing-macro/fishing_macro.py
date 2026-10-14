@@ -546,61 +546,71 @@ class SetupWindow:
         self._auto()
 
     def _auto(self):
-        """Find the bars + colours automatically from the screenshot. Sets whichever bar is showing."""
+        """Find the bar + colours from the screenshot. Both bars live in the same panel (bottom-centre),
+        so the cast bar fixes BOTH regions; the fishing colours are only read inside that panel."""
         arr = np.array(self.shot.convert("RGB"))
         H, W, _ = arr.shape
-        r, g, b = arr[:, :, 0].astype(int), arr[:, :, 1].astype(int), arr[:, :, 2].astype(int)
-        y0 = int(H * 0.55)                      # bars sit in the lower part of the screen
+
+        def med(a, ys, xs):
+            return [int(np.median(a[ys, xs, 0])), int(np.median(a[ys, xs, 1])), int(np.median(a[ys, xs, 2]))]
+
+        # only ever look in the bottom-centre panel, never the scene (sky/water/clothes are blue at night)
+        bx1, bx2 = int(W * 0.26), int(W * 0.74)
+        by1, by2 = int(H * 0.74), int(H * 0.97)
+        sub = arr[by1:by2, bx1:bx2]
+        sr, sg, sb = sub[:, :, 0].astype(int), sub[:, :, 1].astype(int), sub[:, :, 2].astype(int)
         done = []
 
-        def med(ys, xs):
-            return [int(np.median(arr[ys, xs, 0])), int(np.median(arr[ys, xs, 1])), int(np.median(arr[ys, xs, 2]))]
-
-        green = (g > 120) & (g - r > 35) & (g - b > 35)
-        green[:y0, :] = False
+        # GREEN zone -> the Cast Power bar. Anchors the bar's position for BOTH skill checks.
+        green = (sg > 110) & (sg - sr > 30) & (sg - sb > 30)
         gy, gx = np.where(green)
-        if len(gx) > 15:
-            cx, cy = int(np.median(gx)), int(np.median(gy))
-            x1, x2 = max(0, cx - 330), min(W, cx + 330)
-            yy1, yy2 = max(0, cy - 24), min(H, cy + 24)
-            self.cfg["region1"] = [x1, yy1, x2 - x1, yy2 - yy1]
-            self.cfg["col_green"] = med(gy, gx)
+        if len(gx) > 10:
+            cx = bx1 + int(np.median(gx))
+            cy = by1 + int(np.median(gy))
+            x1, x2 = max(0, cx - 340), min(W, cx + 340)
+            self.cfg["region1"] = [x1, max(0, cy - 26), x2 - x1, 52]
+            self.cfg["region2"] = [x1, max(0, cy - 36), x2 - x1, 74]   # fishing bar: same place, taller
+            self.cfg["col_green"] = med(sub, gy, gx)
             row = arr[cy, x1:x2]
-            brown = (row[:, 0] > 80) & (row[:, 1] > 55) & (row[:, 2] < 95) & (row[:, 0] - row[:, 2] > 25)
+            brown = (row[:, 0] > 75) & (row[:, 1] > 50) & (row[:, 2] < 95) & (row[:, 0] - row[:, 2] > 18)
             if brown.any():
                 bi = np.where(brown)[0]
                 self.cfg["col_fill"] = [int(np.median(row[bi, 0])), int(np.median(row[bi, 1])), int(np.median(row[bi, 2]))]
-            done.append("Cast bar ✓")
+            done.append("Cast bar")
 
-        orange = (r > 150) & (r - b > 55) & (g > 40) & (g < r)
-        blue = (b > 115) & (b >= r) & (b >= g - 15) & (b - r > 35)
-        orange[:y0, :] = False
-        blue[:y0, :] = False
-        oy, ox = np.where(orange)
-        by, bx = np.where(blue)
-        if len(ox) > 8 and len(bx) > 20:
-            allx = np.concatenate([ox, bx])
-            ally = np.concatenate([oy, by])
-            x1, x2 = max(0, int(allx.min()) - 40), min(W, int(allx.max()) + 40)
-            yy1, yy2 = max(0, int(ally.min()) - 18), min(H, int(ally.max()) + 18)
-            self.cfg["region2"] = [x1, yy1, x2 - x1, yy2 - yy1]
-            self.cfg["col_fish"] = med(oy, ox)
-            self.cfg["col_blue"] = med(by, bx)
-            done.append("Fishing bar ✓")
+        # FISH orange + your BLUE bar -> only inside the fishing region (the panel), so the scene can't fool it
+        rx, ry, rw, rh = self.cfg["region2"]
+        p = arr[ry:ry + rh, rx:rx + rw]
+        if p.size:
+            pr, pg, pb = p[:, :, 0].astype(int), p[:, :, 1].astype(int), p[:, :, 2].astype(int)
+            orange = (pr > 150) & (pr - pb > 55) & (pg > 40) & (pg < pr)
+            blue = (pb > 110) & (pb >= pr) & (pb - pr > 35) & (pb >= pg - 20)
+            oy, ox = np.where(orange)
+            byi, bxi = np.where(blue)
+            got = []
+            if len(ox) > 5:
+                self.cfg["col_fish"] = med(p, oy, ox)
+                got.append("fish")
+            if len(bxi) > 12:
+                self.cfg["col_blue"] = med(p, byi, bxi)
+                got.append("your bar")
+            if got:
+                done.append("Fishing " + "+".join(got))
 
         save_cfg(self.cfg)
         if done:
-            self.status.config(text="Auto-detected " + " + ".join(done) + ".  Capture the other bar, or Save & close.")
+            self.status.config(text="Got: " + " · ".join(done) + ".   Capture the other bar if needed, then Save & close.")
             self._draw_regions()
         else:
-            self.status.config(text="No bar spotted. Make sure a Cast or Fishing bar is clearly on screen, then Auto-detect again. "
-                                    "(Or use the buttons above to set it by hand.)")
+            self.status.config(text="No bar spotted in the centre. Make sure a Cast or Fishing bar is clearly on screen, "
+                                    "then Auto-detect again (or set it by hand with the buttons).")
 
     def _draw_regions(self):
-        for key, col in (("region1", ACC), ("region2", GREEN)):
+        for key, col, lbl in (("region1", ACC, "Cast"), ("region2", GREEN, "Fishing")):
             x, y, w, h = self.cfg[key]
-            self.canvas.create_rectangle(x * self.scale, y * self.scale, (x + w) * self.scale, (y + h) * self.scale,
-                                         outline=col, width=2)
+            s = self.scale
+            self.canvas.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline=col, width=2)
+            self.canvas.create_text(x * s + 4, y * s - 8, anchor="w", text=lbl, fill=col, font=("Segoe UI", 9, "bold"))
 
     def set_mode(self, mode, target):
         self.mode = mode
