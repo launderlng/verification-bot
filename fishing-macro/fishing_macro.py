@@ -337,39 +337,31 @@ class Worker(threading.Thread):
             self.log("Cast released.")
             return
 
-        # GREEN mode: hold the cast key, watch the gold charge grow from the left, release when it reaches the green.
+        # GREEN mode: hold the cast key and let go the moment the gold charge reaches INTO the green zone.
         press(c["cast_key"], True)
-        g0 = None
+        g0 = g1 = None
         t1 = time.time()
-        released = False
+        hit = False
+        rp = float(c.get("release_point", 0.5))
         while not self.stop_flag.is_set():
             a = self.grab.grab(reg)
             if a is None:
                 break
-            if g0 is None:
-                gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
-                if len(gc):
-                    g0 = int(gc.min())
-            fillmask = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
-            trues = np.where(fillmask)[0]
-            if g0 is not None and len(trues):
-                start = int(trues[0])
-                front = start
-                for x in range(start, len(fillmask)):
-                    if fillmask[x]:
-                        front = x
-                    else:
-                        break
-                if front >= g0 - 2:                     # the fill reached the green
-                    released = True
+            gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
+            if len(gc):
+                g0, g1 = int(gc.min()), int(gc.max())      # remember where the green is
+            if g0 is not None:
+                fillmask = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
+                tx = g0 + max(1, int(rp * max(1, g1 - g0)))  # how far into the green to wait for
+                if fillmask[g0:tx + 1].any():              # the gold charge has entered the green → release now
+                    hit = True
                     break
-            if time.time() - t1 > 3.0:                  # safety: fall back to a timed hold so it still casts
+            if time.time() - t1 > 3.0:                     # safety: fall back to a timed hold so it still casts
                 time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
-                released = True
                 break
             time.sleep(0.003)
         press(c["cast_key"], False)
-        self.log("Cast released on green." if g0 is not None else "Cast released (couldn't see green — tune colours).")
+        self.log("Released E on the green." if hit else "Cast released (green not seen — re-pick the Green/Fill colours).")
 
     # ---- skill check 2: keep your bar on the fish ----
     def reel(self):
