@@ -10,9 +10,11 @@ Set the two regions, pick the four colours, press START (or F6). Build to an .ex
 """
 
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import string
+import traceback
 import subprocess
 import sys
 import tempfile
@@ -289,6 +291,12 @@ class Worker(threading.Thread):
         c = self.cfg
         self.grab = Grabber()
         try:
+            for i in (3, 2, 1):                 # grace so you can click back into the game
+                if self.stop_flag.is_set():
+                    return
+                self.log("Starting in %ds — click into FiveM now…" % i)
+                time.sleep(1)
+            self.log("Go. Watching for the fishing bars.")
             while not self.stop_flag.is_set():
                 self.cast()
                 if self.stop_flag.is_set():
@@ -300,6 +308,9 @@ class Worker(threading.Thread):
                     time.sleep(c["recast_delay"])
                 else:
                     break
+        except Exception as e:
+            self.log("ERROR: %s" % e)
+            self.log(traceback.format_exc().strip().splitlines()[-1])
         finally:
             press(c["cast_key"], False)
             if c["reel_mode"] == "hold":
@@ -487,8 +498,25 @@ class App:
         self._build()
         self.root.after(120, self._drain_log)
         self.root.bind("<F6>", lambda e: self.toggle())
+        threading.Thread(target=self._hotkey_loop, daemon=True).start()
         if self.lic.get("key"):
             threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _hotkey_loop(self):
+        """System-wide F6 start/stop, so you can trigger it while FiveM is focused."""
+        try:
+            u = ctypes.windll.user32
+            if not u.RegisterHotKey(None, 1, 0, 0x75):   # 0x75 = VK_F6
+                return
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:                # WM_HOTKEY
+                    try:
+                        self.root.after(0, self.toggle)
+                    except Exception:
+                        break
+        except Exception:
+            pass
 
     def _card(self, parent, pad=12):
         c = tk.Frame(parent, bg=CARD)
