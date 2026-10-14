@@ -497,9 +497,9 @@ class SetupWindow:
 
         top = tk.Frame(self.win, bg=BG)
         top.pack(fill="x", padx=12, pady=(10, 4))
-        tk.Label(top, text="1) Show a fishing bar in game   2) Capture   3) Drag the boxes / click the colours",
+        tk.Label(top, text="Show a Cast or Fishing bar in game, then hit Auto-detect. Do it once for each bar.",
                  bg=BG, fg=TXT, font=("Segoe UI", 9)).pack(side="left")
-        tk.Button(top, text="Capture screen (4s)", command=self.capture, bg="#5a2fd6", fg="white",
+        tk.Button(top, text="✨ Auto-detect (4s)", command=self.capture, bg="#5a2fd6", fg="white",
                   relief="flat", font=("Segoe UI", 9, "bold")).pack(side="right")
 
         tools = tk.Frame(self.win, bg=BG)
@@ -543,7 +543,64 @@ class SetupWindow:
         self.canvas.config(width=disp.width, height=disp.height)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.tkimg)
-        self.status.config(text="Pick a tool above, then DRAG a box or CLICK a colour on the screenshot.")
+        self._auto()
+
+    def _auto(self):
+        """Find the bars + colours automatically from the screenshot. Sets whichever bar is showing."""
+        arr = np.array(self.shot.convert("RGB"))
+        H, W, _ = arr.shape
+        r, g, b = arr[:, :, 0].astype(int), arr[:, :, 1].astype(int), arr[:, :, 2].astype(int)
+        y0 = int(H * 0.55)                      # bars sit in the lower part of the screen
+        done = []
+
+        def med(ys, xs):
+            return [int(np.median(arr[ys, xs, 0])), int(np.median(arr[ys, xs, 1])), int(np.median(arr[ys, xs, 2]))]
+
+        green = (g > 120) & (g - r > 35) & (g - b > 35)
+        green[:y0, :] = False
+        gy, gx = np.where(green)
+        if len(gx) > 15:
+            cx, cy = int(np.median(gx)), int(np.median(gy))
+            x1, x2 = max(0, cx - 330), min(W, cx + 330)
+            yy1, yy2 = max(0, cy - 24), min(H, cy + 24)
+            self.cfg["region1"] = [x1, yy1, x2 - x1, yy2 - yy1]
+            self.cfg["col_green"] = med(gy, gx)
+            row = arr[cy, x1:x2]
+            brown = (row[:, 0] > 80) & (row[:, 1] > 55) & (row[:, 2] < 95) & (row[:, 0] - row[:, 2] > 25)
+            if brown.any():
+                bi = np.where(brown)[0]
+                self.cfg["col_fill"] = [int(np.median(row[bi, 0])), int(np.median(row[bi, 1])), int(np.median(row[bi, 2]))]
+            done.append("Cast bar ✓")
+
+        orange = (r > 150) & (r - b > 55) & (g > 40) & (g < r)
+        blue = (b > 115) & (b >= r) & (b >= g - 15) & (b - r > 35)
+        orange[:y0, :] = False
+        blue[:y0, :] = False
+        oy, ox = np.where(orange)
+        by, bx = np.where(blue)
+        if len(ox) > 8 and len(bx) > 20:
+            allx = np.concatenate([ox, bx])
+            ally = np.concatenate([oy, by])
+            x1, x2 = max(0, int(allx.min()) - 40), min(W, int(allx.max()) + 40)
+            yy1, yy2 = max(0, int(ally.min()) - 18), min(H, int(ally.max()) + 18)
+            self.cfg["region2"] = [x1, yy1, x2 - x1, yy2 - yy1]
+            self.cfg["col_fish"] = med(oy, ox)
+            self.cfg["col_blue"] = med(by, bx)
+            done.append("Fishing bar ✓")
+
+        save_cfg(self.cfg)
+        if done:
+            self.status.config(text="Auto-detected " + " + ".join(done) + ".  Capture the other bar, or Save & close.")
+            self._draw_regions()
+        else:
+            self.status.config(text="No bar spotted. Make sure a Cast or Fishing bar is clearly on screen, then Auto-detect again. "
+                                    "(Or use the buttons above to set it by hand.)")
+
+    def _draw_regions(self):
+        for key, col in (("region1", ACC), ("region2", GREEN)):
+            x, y, w, h = self.cfg[key]
+            self.canvas.create_rectangle(x * self.scale, y * self.scale, (x + w) * self.scale, (y + h) * self.scale,
+                                         outline=col, width=2)
 
     def set_mode(self, mode, target):
         self.mode = mode
