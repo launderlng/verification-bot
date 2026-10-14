@@ -326,46 +326,50 @@ class Worker(threading.Thread):
             tap(c["prime_key"])
             self.log("Pressed %s to start the cast." % c["prime_key"])
             time.sleep(c.get("prime_delay", 0.4))
-        # wait for the cast bar to appear (green visible), up to 4s
-        t0 = time.time()
-        arr = None
-        while not self.stop_flag.is_set():
-            a = self.grab.grab(reg)
-            if a is not None and column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]).any():
-                arr = a
-                break
-            if time.time() - t0 > 4:
-                return
-            time.sleep(0.02)
-        if self.stop_flag.is_set() or arr is None:
+        if self.stop_flag.is_set():
             return
-        self.log("Skill check 1: charging.")
-        press(c["cast_key"], True)
+
         if c.get("cast_mode", "timed") == "pixel":
-            # live: release the instant the fill front reaches the green release point
-            green_cols = np.where(column_mask(arr, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
-            g0, g1 = int(green_cols.min()), int(green_cols.max())
-            release_x = g0 + c["release_point"] * (g1 - g0)
-            last_front, last_t, t1 = None, time.time(), time.time()
+            # advanced: wait for the green, then release when the fill front reaches it
+            t0, arr = time.time(), None
             while not self.stop_flag.is_set():
                 a = self.grab.grab(reg)
-                if a is None:
+                if a is not None and column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]).any():
+                    arr = a
                     break
-                fill = np.where(column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"]))[0]
-                if len(fill):
-                    front = int(fill.max())
-                    now = time.time()
-                    vel = (front - last_front) / (now - last_t) if (last_front is not None and now > last_t) else 0.0
-                    if front + vel * c["release_latency"] >= release_x:
+                if time.time() - t0 > 4:
+                    break
+                time.sleep(0.02)
+            press(c["cast_key"], True)
+            if arr is not None:
+                green_cols = np.where(column_mask(arr, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
+                g0, g1 = int(green_cols.min()), int(green_cols.max())
+                release_x = g0 + c["release_point"] * (g1 - g0)
+                last_front, last_t, t1 = None, time.time(), time.time()
+                while not self.stop_flag.is_set():
+                    a = self.grab.grab(reg)
+                    if a is None:
                         break
-                    last_front, last_t = front, now
-                if time.time() - t1 > 3:       # safety: never hold forever
-                    break
-                time.sleep(0.004)
+                    fill = np.where(column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"]))[0]
+                    if len(fill):
+                        front = int(fill.max())
+                        now = time.time()
+                        vel = (front - last_front) / (now - last_t) if (last_front is not None and now > last_t) else 0.0
+                        if front + vel * c["release_latency"] >= release_x:
+                            break
+                        last_front, last_t = front, now
+                    if time.time() - t1 > 3:
+                        break
+                    time.sleep(0.004)
+            else:
+                time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))  # fell back to timed
+            press(c["cast_key"], False)
         else:
-            # timed: hold for a tuned time so it lands on the (fixed) green. Tune "Hold E for (s)".
+            # timed (default): just hold the cast key for a tuned time, so it ALWAYS casts.
+            self.log("Casting (hold %s for %ss)." % (c["cast_key"], c.get("cast_hold_s", 0.6)))
+            press(c["cast_key"], True)
             time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
-        press(c["cast_key"], False)
+            press(c["cast_key"], False)
         self.log("Cast released.")
 
     # ---- skill check 2: keep your bar on the fish ----
