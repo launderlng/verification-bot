@@ -17,34 +17,38 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install AutoHotkey + compile
+        continue-on-error: true
         shell: pwsh
         run: |
-          choco install autohotkey -y --no-progress
-          $c = Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -Filter Ahk2Exe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          $b = Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -Filter AutoHotkey64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $c) { throw "Ahk2Exe.exe not found" }
-          if (-not $b) { throw "AutoHotkey64.exe base not found" }
-          Write-Host "compiler = $($c.FullName)"
-          Write-Host "base     = $($b.FullName)"
-          & $c.FullName /in "fishing-ahk\xzx_fishing.ahk" /out "XZX Fishing.exe" /icon "fishing-ahk\xzx_fishing.ico" /base $b.FullName
-          if (-not (Test-Path "XZX Fishing.exe")) { throw "compile produced no exe" }
-          Get-Item "XZX Fishing.exe" | Format-List Name,Length
+          $ErrorActionPreference = "Continue"
+          choco install autohotkey -y --no-progress *>&1 | Tee-Object -FilePath build.log -Append
+          "---- tree under Program Files\AutoHotkey ----" | Tee-Object build.log -Append
+          Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName | Out-String | Tee-Object build.log -Append
+          $c = Get-ChildItem "C:\" -Recurse -Filter Ahk2Exe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $b = Get-ChildItem "C:\" -Recurse -Filter AutoHotkey64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          "compiler = $($c.FullName)" | Tee-Object build.log -Append
+          "base     = $($b.FullName)" | Tee-Object build.log -Append
+          if ($c -and $b) {
+            "---- Ahk2Exe output ----" | Tee-Object build.log -Append
+            & $c.FullName /in "fishing-ahk\xzx_fishing.ahk" /out "XZX Fishing.exe" /icon "fishing-ahk\xzx_fishing.ico" /base $b.FullName *>&1 | Tee-Object build.log -Append
+            "exit code = $LASTEXITCODE" | Tee-Object build.log -Append
+          } else {
+            "SKIPPED compile: compiler or base missing" | Tee-Object build.log -Append
+          }
+          if (Test-Path "XZX Fishing.exe") { "EXE OK" | Tee-Object build.log -Append } else { "NO EXE" | Tee-Object build.log -Append }
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: XZX-Fishing-AHK-exe
-          path: "XZX Fishing.exe"
-          if-no-files-found: error
-
-      - name: Publish exe to a branch I can fetch
+      - name: Publish log (+ exe if built) to a branch I can fetch
+        if: always()
         shell: bash
         run: |
-          mkdir out && cp "XZX Fishing.exe" "out/XZX Fishing.exe"
+          mkdir out
+          cp build.log "out/build.log" || echo "no log" > out/build.log
+          if [ -f "XZX Fishing.exe" ]; then cp "XZX Fishing.exe" "out/XZX Fishing.exe"; else echo "compile failed - see build.log" > out/NO_EXE.txt; fi
           cd out
           git init -q
           git checkout -q -b exe-dist-ahk
           git config user.email "bot@users.noreply.github.com"
           git config user.name "exe-bot"
           git add -A
-          git commit -q -m "fishing AHK exe ${{ github.sha }}"
+          git commit -q -m "ahk build + log ${{ github.sha }}"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" exe-dist-ahk
