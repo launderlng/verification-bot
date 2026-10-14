@@ -30,7 +30,7 @@ import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import db
 import ui
@@ -257,6 +257,54 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             app.router.add_get("/auth/callback", self.handle_auth_callback)
             log.info("License check route is ready at /api/activate (Discord linking %s)",
                      "ON" if self.linking_enabled() else "off: set DISCORD_CLIENT_SECRET to turn it on")
+        if not self.expiry_sweep.is_running():
+            self.expiry_sweep.start()
+
+    async def cog_unload(self):
+        self.expiry_sweep.cancel()
+
+    async def dm_owner(self, user_id: Optional[int], embed: discord.Embed) -> bool:
+        """DM the key's Discord owner. Returns False if they have no account, can't be found, or have DMs closed."""
+        if not user_id:
+            return False
+        user = self.bot.get_user(user_id)
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(user_id)
+            except discord.HTTPException:
+                return False
+        try:
+            await user.send(embed=embed)
+            return True
+        except discord.HTTPException:
+            return False
+
+    @tasks.loop(minutes=5)
+    async def expiry_sweep(self):
+        """Every few minutes, DM the owner of any key that has just run out (once each)."""
+        try:
+            rows = await db.fetch_all(
+                "SELECT * FROM licenses WHERE user_id IS NOT NULL AND expires_at IS NOT NULL AND active = 1 "
+                "AND (expiry_notified IS NULL OR expiry_notified = 0)")
+        except Exception:
+            return
+        nowt = now()
+        for row in rows:
+            exp = parse_time(row["expires_at"])
+            if exp is None or exp > nowt:
+                continue
+            embed = ui.card(
+                "⌛ Your macro key has expired",
+                f"Your {macro_name(row['macro'])} key `{row['code']}` ran out {discord.utils.format_dt(exp, 'R')}, so it no longer works.\n\n"
+                "Grab a new one from the shop with `/store`. If you just renewed, log in again and you're set.",
+                color=WARN, section="Keys")
+            await self.dm_owner(row["user_id"], embed)
+            await db.execute("UPDATE licenses SET expiry_notified = 1 WHERE id = ?", (row["id"],))
+            await log_event(row["id"], "expiry_dm", "owner notified")
+
+    @expiry_sweep.before_loop
+    async def before_expiry_sweep(self):
+        await self.bot.wait_until_ready()
 
     # --------------------------------------------------- discord linking ----
 
@@ -675,11 +723,23 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await find_license(code)
         await db.execute("UPDATE licenses SET active = ? WHERE id = ?", (int(active), row["id"]))
         await log_event(row["id"], "activated" if active else "deactivated", f"by {interaction.user.id}")
+        dm = ""
+        if not active and row["user_id"]:       # auto-DM the owner that their key was turned off
+            embed = ui.card(
+                "⛔ Your macro key was disabled",
+                f"Your {macro_name(row['macro'])} key `{row['code']}` has been turned off and no longer works.\n\n"
+                "If you think this is a mistake, open a ticket in the server and we'll sort it out.",
+                color=DANGER, guild=interaction.guild, section="Keys")
+            sent = await self.dm_owner(row["user_id"], embed)
+            dm = "\n📬 Owner notified by DM." if sent else "\n📪 Couldn't DM the owner (DMs closed or no account)."
         await emit(interaction.guild, "keys", "🔑 Key enabled" if active else "⛔ Key disabled",
                    ui.kv(("Key", f"`{row['code']}`"), ("Owner", f"<@{row['user_id']}>" if row["user_id"] else None), ("By", interaction.user.mention)),
                    subject=row["user_id"])
         row = await find_license(code)
-        await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
+        embed = license_embed(row, interaction.guild)
+        if dm:
+            embed.set_footer(text=dm.strip())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(description="Stop a key from working (e.g. refund or sharing). Anyone using it is logged out within a minute")
     @app_commands.autocomplete(code=key_autocomplete)
@@ -723,6 +783,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             await db.execute("UPDATE licenses SET expires_at = ? WHERE id = ?", ((base + timedelta(days=days)).isoformat(), row["id"]))
         else:
             raise UserError("Fill in `days` or set `lifetime` to True.")
+        await db.execute("UPDATE licenses SET expiry_notified = 0 WHERE id = ?", (row["id"],))
         await log_event(row["id"], "extended", "lifetime" if lifetime else f"+{days}d")
         row = await find_license(code)
         await interaction.response.send_message(embed=license_embed(row, interaction.guild), ephemeral=True)
