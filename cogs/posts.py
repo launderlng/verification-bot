@@ -224,13 +224,11 @@ async def publish_draft(guild: discord.Guild, user, draft: Draft) -> discord.Mes
             await draft.channel.send(files=[discord.File(io.BytesIO(d), filename=n) for n, d, _ in chunk], allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             log.exception("Couldn't post extra photos under post %s", message.id)
-    if below and draft.extra_parts:  # a big file in parts, one message each, with a how-to on the first
+    if below and draft.extra_parts:  # a big file in parts, one message each
         total = len(draft.extra_parts)
         for i, (name, data, _) in enumerate(draft.extra_parts, 1):
-            note = (f"📦 **Split into {total} parts.** Download all {total}, keep them in one folder, then open "
-                    f"`{draft.extra_parts[0][0]}` with **7-Zip** or **WinRAR** to join them.") if i == 1 else None
-            try:
-                await draft.channel.send(content=note, file=discord.File(io.BytesIO(data), filename=name), allowed_mentions=discord.AllowedMentions.none())
+            try:  # just the files, no explanation text
+                await draft.channel.send(file=discord.File(io.BytesIO(data), filename=name), allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.exception("Couldn't post part %s/%s under post %s", i, total, message.id)
     elif below:  # the file goes underneath the card, image and GIF
