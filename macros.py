@@ -11,6 +11,7 @@ from discord import app_commands
 MACROS = {
     "metal": ("Metal Detector", "⛏️"),
     "altclick": ("Alt Click", "🖱️"),
+    "fishing": ("Fishing", "🎣"),
 }
 
 # Older macro builds don't say which macro they are. Those builds are all the Metal Detector.
