@@ -16,22 +16,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download AutoHotkey v2 (zip) + compile
+      - name: Fetch AutoHotkey v2 + Ahk2Exe, compile
         continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          $hdr = @{ "User-Agent" = "gh-actions"; Authorization = "Bearer $env:GITHUB_TOKEN" }
+
+          # 1) AutoHotkey v2 (gives us the base AutoHotkey64.exe)
           $ver = "2.0.18"
-          $url = "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$ver/AutoHotkey_$ver.zip"
-          "---- download $url ----" | Tee-Object build.log -Append
-          Invoke-WebRequest -Uri $url -OutFile ahk.zip *>&1 | Tee-Object build.log -Append
-          Expand-Archive -Path ahk.zip -DestinationPath ahk -Force
-          "---- tree under .\ahk ----" | Tee-Object build.log -Append
-          Get-ChildItem ahk -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName | Out-String | Tee-Object build.log -Append
-          $c = Get-ChildItem ahk -Recurse -Filter Ahk2Exe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          $b = Get-ChildItem ahk -Recurse -Filter AutoHotkey64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          "---- download AutoHotkey v$ver ----" | Tee-Object build.log -Append
+          Invoke-WebRequest -Uri "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$ver/AutoHotkey_$ver.zip" -OutFile ahk.zip *>&1 | Tee-Object build.log -Append
+          Expand-Archive ahk.zip -DestinationPath ahk -Force
+          $b = Get-ChildItem ahk -Recurse -Filter AutoHotkey64.exe | Select-Object -First 1
+
+          # 2) Ahk2Exe (separate repo) - discover the release asset
+          "---- Ahk2Exe latest release assets ----" | Tee-Object build.log -Append
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/AutoHotkey/Ahk2Exe/releases/latest" -Headers $hdr
+          "tag = $($rel.tag_name)" | Tee-Object build.log -Append
+          $rel.assets | ForEach-Object { "asset: $($_.name)" } | Tee-Object build.log -Append
+          $asset = $rel.assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -First 1
+          if (-not $asset) { $asset = $rel.assets | Select-Object -First 1 }
+          "chosen = $($asset.name)" | Tee-Object build.log -Append
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ahk2exe.zip -Headers $hdr *>&1 | Tee-Object build.log -Append
+          if ($asset.name -match '\.zip$') { Expand-Archive ahk2exe.zip -DestinationPath ahk2exe -Force }
+          else { New-Item -ItemType Directory -Force -Path ahk2exe | Out-Null; Copy-Item ahk2exe.zip "ahk2exe\$($asset.name)" }
+          $c = Get-ChildItem ahk2exe -Recurse -Filter Ahk2Exe.exe | Select-Object -First 1
+
           "compiler = $($c.FullName)" | Tee-Object build.log -Append
           "base     = $($b.FullName)" | Tee-Object build.log -Append
+
           if ($c -and $b) {
             "---- Ahk2Exe output ----" | Tee-Object build.log -Append
             & $c.FullName /in "fishing-ahk\xzx_fishing.ahk" /out "XZX Fishing.exe" /icon "fishing-ahk\xzx_fishing.ico" /base $b.FullName *>&1 | Tee-Object build.log -Append
