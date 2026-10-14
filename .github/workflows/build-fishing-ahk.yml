@@ -30,18 +30,14 @@ jobs:
           Expand-Archive ahk.zip -DestinationPath ahk -Force
           $b = Get-ChildItem ahk -Recurse -Filter AutoHotkey64.exe | Select-Object -First 1
 
-          # 2) Ahk2Exe (separate repo) - discover the release asset
-          "---- Ahk2Exe latest release assets ----" | Tee-Object build.log -Append
-          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/AutoHotkey/Ahk2Exe/releases/latest" -Headers $hdr
-          "tag = $($rel.tag_name)" | Tee-Object build.log -Append
-          $rel.assets | ForEach-Object { "asset: $($_.name)" } | Tee-Object build.log -Append
-          $asset = $rel.assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -First 1
-          if (-not $asset) { $asset = $rel.assets | Select-Object -First 1 }
-          "chosen = $($asset.name)" | Tee-Object build.log -Append
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ahk2exe.zip -Headers $hdr *>&1 | Tee-Object build.log -Append
-          if ($asset.name -match '\.zip$') { Expand-Archive ahk2exe.zip -DestinationPath ahk2exe -Force }
-          else { New-Item -ItemType Directory -Force -Path ahk2exe | Out-Null; Copy-Item ahk2exe.zip "ahk2exe\$($asset.name)" }
-          $c = Get-ChildItem ahk2exe -Recurse -Filter Ahk2Exe.exe | Select-Object -First 1
+          # 2) AutoHotkey 1.1 zip bundles Compiler\Ahk2Exe.exe (works with a v2 base)
+          $v1 = "1.1.37.02"
+          "---- download AutoHotkey v$v1 (for Ahk2Exe) ----" | Tee-Object build.log -Append
+          Invoke-WebRequest -Uri "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$v1/AutoHotkey_$v1.zip" -OutFile ahk1.zip *>&1 | Tee-Object build.log -Append
+          Expand-Archive ahk1.zip -DestinationPath ahk1 -Force
+          "---- Compiler folder ----" | Tee-Object build.log -Append
+          Get-ChildItem ahk1 -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Compiler' } | Select-Object -ExpandProperty FullName | Out-String | Tee-Object build.log -Append
+          $c = Get-ChildItem ahk1 -Recurse -Filter Ahk2Exe.exe | Select-Object -First 1
 
           "compiler = $($c.FullName)" | Tee-Object build.log -Append
           "base     = $($b.FullName)" | Tee-Object build.log -Append
