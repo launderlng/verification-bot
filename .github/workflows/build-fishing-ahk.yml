@@ -1,0 +1,77 @@
+name: Build Fishing EXE (AutoHotkey)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "fishing-ahk/**"
+      - ".github/workflows/build-fishing-ahk.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch AutoHotkey v2 + Ahk2Exe, compile
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $hdr = @{ "User-Agent" = "gh-actions"; Authorization = "Bearer $env:GITHUB_TOKEN" }
+
+          # 1) AutoHotkey v2 (gives us the base AutoHotkey64.exe)
+          $ver = "2.0.18"
+          "---- download AutoHotkey v$ver ----" | Tee-Object build.log -Append
+          Invoke-WebRequest -Uri "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$ver/AutoHotkey_$ver.zip" -OutFile ahk.zip *>&1 | Tee-Object build.log -Append
+          Expand-Archive ahk.zip -DestinationPath ahk -Force
+          $b = Get-ChildItem ahk -Recurse -Filter AutoHotkey64.exe | Select-Object -First 1
+
+          # 2) AutoHotkey 1.1 zip bundles Compiler\Ahk2Exe.exe (works with a v2 base)
+          $v1 = "1.1.37.02"
+          "---- download AutoHotkey v$v1 (for Ahk2Exe) ----" | Tee-Object build.log -Append
+          Invoke-WebRequest -Uri "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$v1/AutoHotkey_$v1.zip" -OutFile ahk1.zip *>&1 | Tee-Object build.log -Append
+          Expand-Archive ahk1.zip -DestinationPath ahk1 -Force
+          "---- Compiler folder ----" | Tee-Object build.log -Append
+          Get-ChildItem ahk1 -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Compiler' } | Select-Object -ExpandProperty FullName | Out-String | Tee-Object build.log -Append
+          $c = Get-ChildItem ahk1 -Recurse -Filter Ahk2Exe.exe | Select-Object -First 1
+
+          "compiler = $($c.FullName)" | Tee-Object build.log -Append
+          "base     = $($b.FullName)" | Tee-Object build.log -Append
+
+          if ($c -and $b) {
+            $inp = (Resolve-Path "fishing-ahk\xzx_fishing.ahk").Path
+            $ico = (Resolve-Path "fishing-ahk\xzx_fishing.ico").Path
+            $out = Join-Path $PWD "XZX Fishing.exe"
+            "---- Ahk2Exe output ----" | Tee-Object build.log -Append
+            & $c.FullName /in $inp /out $out /icon $ico /base $b.FullName *>&1 | Tee-Object build.log -Append
+            "exit code = $LASTEXITCODE" | Tee-Object build.log -Append
+            "---- any XZX Fishing.exe found ----" | Tee-Object build.log -Append
+            $found = Get-ChildItem -Recurse -Filter "XZX Fishing.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              "found = $($found.FullName) ($($found.Length) bytes)" | Tee-Object build.log -Append
+              if ($found.FullName -ne $out) { Copy-Item $found.FullName $out -Force }
+            }
+          } else {
+            "SKIPPED compile: compiler or base missing" | Tee-Object build.log -Append
+          }
+          if (Test-Path "XZX Fishing.exe") { "EXE OK" | Tee-Object build.log -Append } else { "NO EXE" | Tee-Object build.log -Append }
+
+      - name: Publish log (+ exe if built) to a branch I can fetch
+        if: always()
+        shell: bash
+        run: |
+          mkdir out
+          cp build.log "out/build.log" 2>/dev/null || echo "no log" > out/build.log
+          if [ -f "XZX Fishing.exe" ]; then cp "XZX Fishing.exe" "out/XZX Fishing.exe"; else echo "compile failed - see build.log" > out/NO_EXE.txt; fi
+          cd out
+          git init -q
+          git checkout -q -b exe-dist-ahk
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "exe-bot"
+          git add -A
+          git commit -q -m "ahk build + log ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" exe-dist-ahk
