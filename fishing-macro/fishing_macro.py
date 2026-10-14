@@ -48,12 +48,15 @@ DISCORD_INVITE = "discord.gg/xzxx"
 PRODUCT = "fishing"
 
 # XZX purple theme
-BG = "#0b0614"
-CARD = "#160d28"
-INPUT = "#241940"
+BG = "#09060f"       # base, matches XZX Alt Click
+CARD = "#130c24"     # panel
+INPUT = "#241940"    # inputs / chips
 TXT = "#f4eeff"
 SUB = "#a99cc4"
-ACC = "#b57bff"
+DIM = "#6f6489"      # tiny section labels
+ACC = "#b57bff"      # purple accent
+ACC2 = "#5a2fd6"     # deep purple (button)
+GLOW = "#2a1458"     # top glow tint
 GREEN = "#6ee7b7"
 RED = "#f0587e"
 
@@ -256,6 +259,7 @@ DEFAULTS = {
     "tolerance": 40,
     "min_pixels": 2,
     "fish_timeout": 0.3,
+    "end_timeout": 0.3,
     "auto_recast": True,
     "prime_key": "1",
     "prime_delay": 0.4,
@@ -334,12 +338,49 @@ class Worker(threading.Thread):
         if self.stop_flag.is_set():
             return
 
-        if c.get("cast_mode", "green") == "timed":
+        mode = c.get("cast_mode", "green")
+        if mode == "timed":
             self.log("Casting (hold %s for %ss)." % (c["cast_key"], c.get("cast_hold_s", 0.6)))
             press(c["cast_key"], True)
             time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
             press(c["cast_key"], False)
             self.log("Cast released.")
+            return
+
+        if mode == "front":
+            # FRONT mode (set by the Test run): follow the learned charge colour and release a measured
+            # number of px BEFORE the green, so the in-game release lands dead on it.
+            press(c["cast_key"], True)
+            g0 = None
+            lead = int(c.get("release_lead_px", 18))
+            t1 = time.time()
+            hit = False
+            while not self.stop_flag.is_set():
+                a = self.grab.grab(reg)
+                if a is None:
+                    break
+                gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
+                if len(gc):
+                    g0 = int(gc.min())
+                fm = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
+                tr = np.where(fm)[0]
+                if g0 is not None and len(tr):
+                    start = int(tr[0])
+                    front = start
+                    for x in range(start, len(fm)):
+                        if fm[x]:
+                            front = x
+                        else:
+                            break
+                    if front >= g0 - lead:
+                        hit = True
+                        break
+                if time.time() - t1 > 3.0:
+                    time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
+                    break
+                time.sleep(0.002)
+            press(c["cast_key"], False)
+            self.log("Cast released (front).")
             return
 
         # GREEN mode: hold the cast key and release the moment the charge starts covering the GREEN.
@@ -397,11 +438,16 @@ class Worker(threading.Thread):
             box_cols = np.where(column_mask(arr, c["col_blue"], c["tolerance"], c["min_pixels"]))[0]
             now = time.time()
             if not len(fish_cols):
-                if lost_since is None:
-                    lost_since = now
-                elif now - lost_since > c["fish_timeout"]:
-                    break
-                time.sleep(0.008)
+                # end the reel only when the WHOLE bar is gone (fish AND your box). If the box is still
+                # there, the fish just flickered/moved fast — keep tracking so we don't lose it.
+                if not len(box_cols):
+                    if lost_since is None:
+                        lost_since = now
+                    elif now - lost_since > c.get("end_timeout", 0.3):
+                        break
+                else:
+                    lost_since = None
+                time.sleep(0.006)
                 continue
             lost_since = None
             fish = float(fish_cols.mean())
@@ -711,7 +757,7 @@ class App:
         self.root.title("XZX Fishing Macro")
         self.root.overrideredirect(True)          # borderless, like the other XZX macros
         self.root.configure(bg=BG)
-        w, h = 470, 812
+        w, h = 470, 852
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
         self.root.attributes("-topmost", True)
@@ -739,12 +785,86 @@ class App:
         except Exception:
             pass
 
-    def _card(self, parent, pad=12):
-        c = tk.Frame(parent, bg=CARD)
-        c.pack(fill="x", padx=14, pady=6)
-        inner = tk.Frame(c, bg=CARD)
-        inner.pack(fill="x", padx=pad, pady=pad)
+    def _round_rect(self, cv, x1, y1, x2, y2, r, fill):
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(pts, smooth=True, splinesteps=24,
+                                 fill=fill, outline=fill, tags="rr")
+
+    def _vgrad(self, cv, w, h, c1, c2, steps=48):
+        cv.delete("grad")
+        r1, g1, b1 = self.root.winfo_rgb(c1)
+        r2, g2, b2 = self.root.winfo_rgb(c2)
+        for i in range(steps):
+            t = i / (steps - 1)
+            r = int((r1 + (r2 - r1) * t) / 256)
+            g = int((g1 + (g2 - g1) * t) / 256)
+            b = int((b1 + (b2 - b1) * t) / 256)
+            y0 = int(h * i / steps)
+            y1 = int(h * (i + 1) / steps) + 1
+            cv.create_rectangle(0, y0, w, y1, outline="", fill="#%02x%02x%02x" % (r, g, b), tags="grad")
+        cv.tag_lower("grad")
+
+    def _paint_power(self):
+        cv = getattr(self, "powerbar", None)
+        if not cv:
+            return
+        cv.delete("all")
+        w = cv.winfo_width()
+        if w <= 1:
+            return
+        running = bool(self.worker and self.worker.is_alive())
+        self._round_rect(cv, 0, 0, w, 8, 4, INPUT)
+        if running:
+            self._round_rect(cv, 0, 0, w, 8, 4, GREEN)
+        else:
+            self._round_rect(cv, 0, 0, max(8, int(w * 0.18)), 8, 4, ACC)
+
+    def _card(self, parent, pad=14):
+        """A rounded panel (XZX Alt Click look). Returns the inner frame to fill."""
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(fill="x", padx=12, pady=6)
+        cv = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0, height=10)
+        cv.pack(fill="x")
+        inner = tk.Frame(cv, bg=CARD)
+        win = cv.create_window((pad, pad), window=inner, anchor="nw")
+
+        def _redraw(_=None):
+            w = cv.winfo_width()
+            if w <= 1:
+                return
+            inner.update_idletasks()
+            ih = inner.winfo_reqheight()
+            cv.configure(height=ih + pad * 2)
+            cv.itemconfigure(win, width=w - pad * 2)
+            cv.delete("rr")
+            self._round_rect(cv, 1, 1, w - 2, ih + pad * 2 - 1, 16, CARD)
+            cv.tag_lower("rr")
+        inner.bind("<Configure>", _redraw)
+        cv.bind("<Configure>", _redraw)
         return inner
+
+    def _tile(self, parent, name):
+        """A small rounded stat tile. Returns the value label."""
+        cv = tk.Canvas(parent, bg=BG, highlightthickness=0, bd=0, height=62, width=10)
+        cv.pack(side="left", expand=True, fill="x", padx=4)
+        inner = tk.Frame(cv, bg=CARD)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        tk.Label(inner, text=name, bg=CARD, fg=DIM,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=12, pady=(11, 0))
+        val = tk.Label(inner, text="0", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 16))
+        val.pack(anchor="w", padx=12, pady=(0, 11))
+
+        def _redraw(_=None):
+            w = cv.winfo_width()
+            if w <= 1:
+                return
+            cv.itemconfigure(win, width=w)
+            cv.delete("rr")
+            self._round_rect(cv, 1, 1, w - 2, 61, 14, CARD)
+            cv.tag_lower("rr")
+        cv.bind("<Configure>", _redraw)
+        return val
 
     def _drag_bind(self, widget):
         widget.bind("<Button-1>", lambda e: setattr(self, "_drag", (e.x_root, e.y_root,
@@ -828,47 +948,55 @@ class App:
     def _build(self):
         self.region_lbl = {}
 
-        # ---- header bar (drag to move, X to close) ----
-        hdr = tk.Frame(self.root, bg=BG)
-        hdr.pack(fill="x", padx=14, pady=(12, 2))
-        tk.Label(hdr, text="XZX", bg=BG, fg=ACC, font=("Segoe UI Semibold", 20, "bold")).pack(side="left")
-        tt = tk.Frame(hdr, bg=BG)
-        tt.pack(side="left", padx=10)
-        tk.Label(tt, text="Fishing Macro", bg=BG, fg=TXT, font=("Segoe UI Semibold", 14)).pack(anchor="w")
-        tk.Label(tt, text="Auto cast · track · collect", bg=BG, fg=SUB, font=("Segoe UI", 8)).pack(anchor="w")
-        tk.Button(hdr, text="✕", bg=BG, fg=SUB, relief="flat", bd=0, activebackground=BG,
-                  activeforeground=RED, font=("Segoe UI", 12), command=self._close).pack(side="right")
-        self.pill = tk.Label(hdr, text="IDLE", bg=INPUT, fg=SUB, font=("Segoe UI", 8, "bold"), padx=10, pady=3)
-        self.pill.pack(side="right", padx=8)
+        # ---- header bar with purple glow (drag to move, X to close) ----
+        W = 470
+        hdr = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0, height=78)
+        hdr.pack(fill="x")
+        self._vgrad(hdr, W, 78, GLOW, BG)
+        hdr.create_text(22, 30, text="XZX", anchor="w", fill=ACC,
+                        font=("Segoe UI Semibold", 22, "bold"))
+        hdr.create_text(78, 24, text="Fishing Macro", anchor="w", fill=TXT,
+                        font=("Segoe UI Semibold", 14))
+        hdr.create_text(79, 48, text="Auto cast · track · collect", anchor="w", fill=SUB,
+                        font=("Segoe UI", 8))
+        close = tk.Label(hdr, text="✕", bg=GLOW, fg=SUB, font=("Segoe UI", 12))
+        close.bind("<Button-1>", lambda e: self._close())
+        hdr.create_window(W - 18, 20, window=close)
+        self.pill = tk.Label(hdr, text="IDLE", bg=INPUT, fg=SUB,
+                             font=("Segoe UI", 8, "bold"), padx=10, pady=3)
+        hdr.create_window(W - 50, 20, window=self.pill, anchor="e")
         self._drag_bind(hdr)
-        self._drag_bind(tt)
 
         # ---- hero status card ----
         hero = self._card(self.root, pad=14)
-        tk.Label(hero, text="STATUS", bg=CARD, fg="#6f6489", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.state_lbl = tk.Label(hero, text="READY", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 22))
+        top = tk.Frame(hero, bg=CARD)
+        top.pack(fill="x")
+        left = tk.Frame(top, bg=CARD)
+        left.pack(side="left", anchor="w")
+        tk.Label(left, text="STATUS", bg=CARD, fg=DIM, font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.state_lbl = tk.Label(left, text="READY", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 22))
         self.state_lbl.pack(anchor="w")
-        tk.Label(hero, text="Link set · press START or F6", bg=CARD, fg=SUB, font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(left, text="Link set · press START or F6", bg=CARD, fg=SUB,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        # power bar (accent while running)
+        self.powerbar = tk.Canvas(hero, bg=CARD, highlightthickness=0, bd=0, height=8)
+        self.powerbar.pack(fill="x", pady=(12, 0))
+        self.powerbar.bind("<Configure>", lambda e: self._paint_power())
 
-        # ---- stat cards: casts / catches ----
+        # ---- stat tiles: casts / catches ----
         stats = tk.Frame(self.root, bg=BG)
-        stats.pack(fill="x", padx=10)
+        stats.pack(fill="x", padx=8)
         self.stat_lbl = {}
         for key, name in (("casts", "CASTS"), ("catches", "CATCHES")):
-            c = tk.Frame(stats, bg=CARD)
-            c.pack(side="left", expand=True, fill="x", padx=4)
-            tk.Label(c, text=name, bg=CARD, fg="#6f6489", font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
-            v = tk.Label(c, text="0", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 16))
-            v.pack(anchor="w", padx=12, pady=(0, 10))
-            self.stat_lbl[key] = v
+            self.stat_lbl[key] = self._tile(stats, name)
 
         # ---- START / STOP ----
         bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=14, pady=8)
-        self.btn = tk.Button(bar, text="▶  START", command=self.toggle, bg="#5a2fd6", fg="white",
+        bar.pack(fill="x", padx=12, pady=8)
+        self.btn = tk.Button(bar, text="▶  START", command=self.toggle, bg=ACC2, fg="white",
                              activebackground=ACC, activeforeground="white", relief="flat",
                              font=("Segoe UI Semibold", 12))
-        self.btn.pack(side="left", expand=True, fill="x", ipady=8, padx=(0, 4))
+        self.btn.pack(side="left", expand=True, fill="x", ipady=12, padx=(0, 4))
         self.stopbtn = tk.Button(bar, text="■  STOP", command=self.stop, bg=INPUT, fg=TXT,
                                  activebackground=CARD, activeforeground=TXT, relief="flat",
                                  font=("Segoe UI Semibold", 12))
@@ -910,7 +1038,7 @@ class App:
         box.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
 
         self._num(box, "cast_key", "Cast key (hold)")
-        self._choice(box, "cast_mode", "Cast mode", ["green", "timed"])
+        self._choice(box, "cast_mode", "Cast mode", ["front", "green", "timed"])
         self._num(box, "cast_hold_s", "Hold E for (s) ← tune to green")
         self._num(box, "release_point", "Release point in green (0-1)")
         self._num(box, "green_cover", "Green release (0-1) ← lower = later")
@@ -936,18 +1064,23 @@ class App:
         self._num(box, "claim_presses", "Claim presses")
         self._num(box, "recast_delay", "Delay between runs (s)")
 
-        # ---- footer: test / preview + log ----
+        # ---- tools strip ----
+        tk.Label(self.root, text="TOOLS   ·   F6 starts / stops anywhere", bg=BG, fg=DIM,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=20, pady=(4, 2))
         foot = tk.Frame(self.root, bg=BG)
-        foot.pack(fill="x", padx=14, pady=(2, 4))
-        self._chip(foot, "⚙ Setup for my screen", lambda: SetupWindow(self)).pack(side="left")
+        foot.pack(fill="x", padx=18, pady=(0, 4))
+        self._chip(foot, "⚙ Setup", lambda: SetupWindow(self)).pack(side="left")
+        self._chip(foot, "🎯 Test run", self._autotune).pack(side="left", padx=6)
         self._chip(foot, "Test", self._test).pack(side="left", padx=6)
         self._chip(foot, "Preview", self._preview).pack(side="left")
-        tk.Label(foot, text="F6 start/stop", bg=BG, fg=SUB, font=("Segoe UI", 8)).pack(side="right")
 
         self.logbox = tk.Text(self.root, height=5, bg="#070510", fg=GREEN, bd=0,
                               insertbackground=GREEN, font=("Consolas", 9))
-        self.logbox.pack(fill="both", expand=True, padx=14, pady=(2, 12))
+        self.logbox.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+        tk.Label(self.root, text="XZX Macro  ·  by Coop", bg=BG, fg=DIM,
+                 font=("Segoe UI", 7)).pack(pady=(0, 10))
         self.log("Ready. Set the two regions, pick the colours, then START.")
+        self.root.after(80, self._paint_power)
 
     def _chip(self, parent, text, cmd):
         return tk.Button(parent, text=text, command=cmd, bg=INPUT, fg=TXT, relief="flat",
@@ -1045,6 +1178,7 @@ class App:
             self.btn.config(text="▶  RUNNING")
             self.pill.config(text="RUNNING", fg=GREEN)
             self.state_lbl.config(text="RUNNING", fg=GREEN)
+            self._paint_power()
             self.log("Started.")
 
     def stop(self):
@@ -1054,7 +1188,80 @@ class App:
         self.btn.config(text="▶  START")
         self.pill.config(text="IDLE", fg=SUB)
         self.state_lbl.config(text="READY", fg=TXT)
+        self._paint_power()
         self.log("Stopped.")
+
+    def _autotune(self):
+        if self.worker and self.worker.is_alive():
+            self.log("Stop the macro first, then Test run.")
+            return
+        threading.Thread(target=self._autotune_run, daemon=True).start()
+
+    def _autotune_run(self):
+        """Test run: do one cast, LEARN the charge colour by watching it grow, measure its speed,
+        and set the release lead so the cast lands on green. Switches cast to the precise 'front' mode."""
+        c = self.cfg
+        g = Grabber()
+        reg = tuple(c["region1"])
+        for i in (3, 2, 1):
+            self.log("Test run: switch to FiveM and get ready… %d" % i)
+            time.sleep(1)
+        if c.get("prime_key"):
+            tap(c["prime_key"])
+            time.sleep(c.get("prime_delay", 0.4))
+        base = g.grab(reg)
+        if base is None:
+            self.log("Test run: couldn't capture the screen.")
+            return
+        press(c["cast_key"], True)
+        frames, times = [], []
+        t0 = time.time()
+        while time.time() - t0 < 1.4:
+            a = g.grab(reg)
+            if a is not None:
+                frames.append(a.astype(int))
+                times.append(time.time() - t0)
+            time.sleep(0.02)
+        press(c["cast_key"], False)
+        if len(frames) < 5:
+            self.log("Test run: not enough frames — try again.")
+            return
+        # the charge = pixels that got much brighter from the start to the end of the hold
+        b = base.astype(int)
+        late = frames[-1]
+        bright = late.sum(axis=2) - b.sum(axis=2)
+        ys, xs = np.where(bright > 90)
+        if len(xs) < 20:
+            self.log("Test run: couldn't see the charge grow. Make sure the Cast bar came up during the run.")
+            return
+        col = [int(np.median(late[ys, xs, ch])) for ch in range(3)]
+        self.cfg["col_fill"] = col
+        # measure the charge speed from how the fill front advanced across the frames
+        fronts = []
+        for a in frames:
+            fm = column_mask(a.astype(np.uint8), col, c["tolerance"], c["min_pixels"])
+            tr = np.where(fm)[0]
+            if len(tr):
+                start = int(tr[0])
+                front = start
+                for x in range(start, len(fm)):
+                    if fm[x]:
+                        front = x
+                    else:
+                        break
+                fronts.append(front)
+            else:
+                fronts.append(0)
+        spd = 0.0
+        if fronts[-1] > fronts[0] and times[-1] > times[0]:
+            spd = (fronts[-1] - fronts[0]) / (times[-1] - times[0])   # px per second
+        lead = int(min(70, max(8, spd * 0.06)))                      # release ~60 ms of travel early
+        self.cfg["release_lead_px"] = lead
+        self.cfg["cast_mode"] = "front"
+        save_cfg(self.cfg)
+        self.root.after(0, lambda: self.vars["cast_mode"].set("front") if "cast_mode" in self.vars else None)
+        self.log("Test run done ✓  Learned charge colour %s, speed %d px/s, release lead %d px. Cast set to 'front'." % (
+            tuple(col), int(spd), lead))
 
     def _test(self):
         c = self.cfg
@@ -1143,12 +1350,27 @@ def run_login(cfg):
     win = tk.Tk()
     win.title("XZX Fishing — Login")
     win.configure(bg=BG)
-    win.geometry("420x380")
+    win.geometry("420x400")
     win.resizable(False, False)
 
-    tk.Label(win, text="XZX Fishing", bg=BG, fg=ACC, font=("Segoe UI", 20, "bold")).pack(pady=(22, 2))
+    def _lgrad(cv, w, h, c1, c2, steps=48):
+        r1, g1, b1 = win.winfo_rgb(c1)
+        r2, g2, b2 = win.winfo_rgb(c2)
+        for i in range(steps):
+            t = i / (steps - 1)
+            col = "#%02x%02x%02x" % (int((r1 + (r2 - r1) * t) / 256),
+                                     int((g1 + (g2 - g1) * t) / 256),
+                                     int((b1 + (b2 - b1) * t) / 256))
+            cv.create_rectangle(0, int(h * i / steps), w, int(h * (i + 1) / steps) + 1,
+                                outline="", fill=col)
+
+    head = tk.Canvas(win, bg=BG, highlightthickness=0, bd=0, height=96)
+    head.pack(fill="x")
+    _lgrad(head, 420, 96, GLOW, BG)
+    head.create_text(210, 40, text="XZX", fill=ACC, font=("Segoe UI Semibold", 26, "bold"))
+    head.create_text(210, 70, text="Fishing Macro", fill=TXT, font=("Segoe UI Semibold", 13))
     tk.Label(win, text="Link your Discord, then enter your key", bg=BG, fg=SUB,
-             font=("Segoe UI", 9)).pack()
+             font=("Segoe UI", 9)).pack(pady=(6, 0))
 
     discord_btn = tk.Button(win, text="Link Discord account", bg=INPUT, fg=TXT,
                             activebackground=CARD, activeforeground=TXT, relief="flat",
