@@ -1,0 +1,50 @@
+name: Build Fishing EXE (AutoHotkey)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "fishing-ahk/**"
+      - ".github/workflows/build-fishing-ahk.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install AutoHotkey + compile
+        shell: pwsh
+        run: |
+          choco install autohotkey -y --no-progress
+          $c = Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -Filter Ahk2Exe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $b = Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -Filter AutoHotkey64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $c) { throw "Ahk2Exe.exe not found" }
+          if (-not $b) { throw "AutoHotkey64.exe base not found" }
+          Write-Host "compiler = $($c.FullName)"
+          Write-Host "base     = $($b.FullName)"
+          & $c.FullName /in "fishing-ahk\xzx_fishing.ahk" /out "XZX Fishing.exe" /icon "fishing-ahk\xzx_fishing.ico" /base $b.FullName
+          if (-not (Test-Path "XZX Fishing.exe")) { throw "compile produced no exe" }
+          Get-Item "XZX Fishing.exe" | Format-List Name,Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XZX-Fishing-AHK-exe
+          path: "XZX Fishing.exe"
+          if-no-files-found: error
+
+      - name: Publish exe to a branch I can fetch
+        shell: bash
+        run: |
+          mkdir out && cp "XZX Fishing.exe" "out/XZX Fishing.exe"
+          cd out
+          git init -q
+          git checkout -q -b exe-dist-ahk
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "exe-bot"
+          git add -A
+          git commit -q -m "fishing AHK exe ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" exe-dist-ahk
