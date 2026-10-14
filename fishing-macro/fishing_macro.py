@@ -237,6 +237,8 @@ DEFAULTS = {
     "col_blue": [1, 86, 146],
     "col_fish": [154, 72, 3],
     "cast_key": "e",
+    "cast_mode": "timed",
+    "cast_hold_s": 0.6,
     "release_point": 0.5,
     "release_latency": 0.03,
     "reel_mode": "two_key",
@@ -296,18 +298,15 @@ class Worker(threading.Thread):
                     return
                 self.log("Starting in %ds — click into FiveM now…" % i)
                 time.sleep(1)
-            self.log("Go. Watching for the fishing bars.")
-            while not self.stop_flag.is_set():
+            self.log("Go. Looping until you press F6 to stop.")
+            while not self.stop_flag.is_set():          # keeps fishing: press 1, cast, reel, collect, repeat
                 self.cast()
                 if self.stop_flag.is_set():
                     break
                 self.reel()
                 if self.stop_flag.is_set():
                     break
-                if c["auto_recast"]:
-                    time.sleep(c["recast_delay"])
-                else:
-                    break
+                time.sleep(c["recast_delay"])
         except Exception as e:
             self.log("ERROR: %s" % e)
             self.log(traceback.format_exc().strip().splitlines()[-1])
@@ -316,7 +315,7 @@ class Worker(threading.Thread):
             if c["reel_mode"] == "hold":
                 press(c["hold_input"], False)
 
-    # ---- skill check 1: hold cast key, release when the fill reaches the green release point ----
+    # ---- skill check 1: hold the cast key, release on the green ----
     def cast(self):
         c = self.cfg
         reg = tuple(c["region1"])
@@ -325,41 +324,47 @@ class Worker(threading.Thread):
             tap(c["prime_key"])
             self.log("Pressed %s to start the cast." % c["prime_key"])
             time.sleep(c.get("prime_delay", 0.4))
-        # wait for the cast bar (green zone visible)
+        # wait for the cast bar to appear (green visible), up to 4s
         t0 = time.time()
+        arr = None
         while not self.stop_flag.is_set():
-            arr = self.grab.grab(reg)
-            if arr is not None and column_mask(arr, c["col_green"], c["tolerance"], c["min_pixels"]).any():
+            a = self.grab.grab(reg)
+            if a is not None and column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]).any():
+                arr = a
                 break
-            if time.time() - t0 > 6:
+            if time.time() - t0 > 4:
                 return
-            time.sleep(0.03)
-        if self.stop_flag.is_set():
+            time.sleep(0.02)
+        if self.stop_flag.is_set() or arr is None:
             return
         self.log("Skill check 1: charging.")
         press(c["cast_key"], True)
-        green_cols = np.where(column_mask(arr, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
-        g0, g1 = int(green_cols.min()), int(green_cols.max())
-        release_x = g0 + c["release_point"] * (g1 - g0)
-        last_front, last_t = None, time.time()
-        while not self.stop_flag.is_set():
-            arr = self.grab.grab(reg)
-            if arr is None:
-                break
-            fill = np.where(column_mask(arr, c["col_fill"], c["tolerance"], c["min_pixels"]))[0]
-            if len(fill):
-                front = int(fill.max())
-                now = time.time()
-                vel = 0.0
-                if last_front is not None and now > last_t:
-                    vel = (front - last_front) / (now - last_t)  # px/s
-                lead = vel * c["release_latency"]
-                if front + lead >= release_x:
+        if c.get("cast_mode", "timed") == "pixel":
+            # live: release the instant the fill front reaches the green release point
+            green_cols = np.where(column_mask(arr, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
+            g0, g1 = int(green_cols.min()), int(green_cols.max())
+            release_x = g0 + c["release_point"] * (g1 - g0)
+            last_front, last_t, t1 = None, time.time(), time.time()
+            while not self.stop_flag.is_set():
+                a = self.grab.grab(reg)
+                if a is None:
                     break
-                last_front, last_t = front, now
-            time.sleep(0.004)
+                fill = np.where(column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"]))[0]
+                if len(fill):
+                    front = int(fill.max())
+                    now = time.time()
+                    vel = (front - last_front) / (now - last_t) if (last_front is not None and now > last_t) else 0.0
+                    if front + vel * c["release_latency"] >= release_x:
+                        break
+                    last_front, last_t = front, now
+                if time.time() - t1 > 3:       # safety: never hold forever
+                    break
+                time.sleep(0.004)
+        else:
+            # timed: hold for a tuned time so it lands on the (fixed) green. Tune "Hold E for (s)".
+            time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
         press(c["cast_key"], False)
-        self.log("Cast released on green.")
+        self.log("Cast released.")
 
     # ---- skill check 2: keep your bar on the fish ----
     def reel(self):
@@ -877,6 +882,8 @@ class App:
         box.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
 
         self._num(box, "cast_key", "Cast key (hold)")
+        self._choice(box, "cast_mode", "Cast mode", ["timed", "pixel"])
+        self._num(box, "cast_hold_s", "Hold E for (s) ← tune to green")
         self._num(box, "release_point", "Release point in green (0-1)")
         self._num(box, "release_latency", "Release latency comp (s)")
         self._choice(box, "reel_mode", "Reel mode", ["two_key", "hold"])
@@ -948,7 +955,7 @@ class App:
     def _on_change(self, key):
         v = self.vars[key].get()
         if key in ("release_point", "release_latency", "deadzone_frac", "prediction_lead",
-                   "fish_timeout", "recast_delay", "prime_delay"):
+                   "fish_timeout", "recast_delay", "prime_delay", "cast_hold_s"):
             try:
                 v = float(v)
             except ValueError:
