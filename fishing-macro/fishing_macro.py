@@ -248,7 +248,8 @@ DEFAULTS = {
     "min_pixels": 2,
     "fish_timeout": 1.5,
     "auto_recast": True,
-    "recast_key": "e",
+    "prime_key": "1",
+    "prime_delay": 0.4,
     "recast_delay": 1.5,
 }
 
@@ -296,8 +297,6 @@ class Worker(threading.Thread):
                     break
                 if c["auto_recast"]:
                     time.sleep(c["recast_delay"])
-                    tap(c["recast_key"])
-                    self.log("Recast (%s)." % c["recast_key"])
                 else:
                     break
         finally:
@@ -309,6 +308,11 @@ class Worker(threading.Thread):
     def cast(self):
         c = self.cfg
         reg = tuple(c["region1"])
+        # press the prime key (e.g. 1) to equip the rod / start the cast, BEFORE holding the cast key
+        if c.get("prime_key"):
+            tap(c["prime_key"])
+            self.log("Pressed %s to start the cast." % c["prime_key"])
+            time.sleep(c.get("prime_delay", 0.4))
         # wait for the cast bar (green zone visible)
         t0 = time.time()
         while not self.stop_flag.is_set():
@@ -670,7 +674,8 @@ class App:
         self._num(box, "min_pixels", "Min pixels / column")
         self._num(box, "fish_timeout", "Fish lost timeout (s)")
         self._check(box, "auto_recast", "Auto recast after reel")
-        self._num(box, "recast_key", "Recast key")
+        self._num(box, "prime_key", "Prime key (pressed before cast)")
+        self._num(box, "prime_delay", "Prime delay (s)")
         self._num(box, "recast_delay", "Recast delay (s)")
 
         # ---- footer: test / preview + log ----
@@ -725,7 +730,7 @@ class App:
     def _on_change(self, key):
         v = self.vars[key].get()
         if key in ("release_point", "release_latency", "deadzone_frac", "prediction_lead",
-                   "fish_timeout", "recast_delay"):
+                   "fish_timeout", "recast_delay", "prime_delay"):
             try:
                 v = float(v)
             except ValueError:
