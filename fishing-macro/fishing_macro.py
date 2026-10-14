@@ -241,7 +241,7 @@ DEFAULTS = {
     "cast_hold_s": 0.6,
     "release_point": 0.0,
     "release_lead_px": 14,
-    "green_cover": 0.7,
+    "green_cover": 0.85,
     "release_latency": 0.03,
     "reel_mode": "two_key",
     "left_key": "q",
@@ -694,6 +694,10 @@ class App:
         if not self.cfg.get("_green_cast"):   # move existing users onto the green-tracking cast once
             self.cfg["cast_mode"] = "green"
             self.cfg["_green_cast"] = True
+            save_cfg(self.cfg)
+        if not self.cfg.get("_gc_v2"):        # release a bit earlier so it stops overshooting the green
+            self.cfg["green_cover"] = 0.85
+            self.cfg["_gc_v2"] = True
             save_cfg(self.cfg)
         self.lic = lic or {}
         self.grab = Grabber()
