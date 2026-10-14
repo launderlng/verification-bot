@@ -468,16 +468,39 @@ class App:
         self.logq = queue.Queue()
         self._last_copy_sig = ""
 
+        self.casts = 0
+        self.catches = 0
         self.root = tk.Tk()
         self.root.title("XZX Fishing Macro")
-        self.root.configure(bg="#0d0a16")
-        self.root.geometry("440x760")
+        self.root.overrideredirect(True)          # borderless, like the other XZX macros
+        self.root.configure(bg=BG)
+        w, h = 470, 812
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
+        self.root.attributes("-topmost", True)
         self.vars = {}
         self._build()
         self.root.after(120, self._drain_log)
         self.root.bind("<F6>", lambda e: self.toggle())
         if self.lic.get("key"):
             threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _card(self, parent, pad=12):
+        c = tk.Frame(parent, bg=CARD)
+        c.pack(fill="x", padx=14, pady=6)
+        inner = tk.Frame(c, bg=CARD)
+        inner.pack(fill="x", padx=pad, pady=pad)
+        return inner
+
+    def _drag_bind(self, widget):
+        widget.bind("<Button-1>", lambda e: setattr(self, "_drag", (e.x_root, e.y_root,
+                    self.root.winfo_x(), self.root.winfo_y())))
+        widget.bind("<B1-Motion>", self._on_drag)
+
+    def _on_drag(self, e):
+        if hasattr(self, "_drag"):
+            x0, y0, wx, wy = self._drag
+            self.root.geometry("+%d+%d" % (wx + e.x_root - x0, wy + e.y_root - y0))
 
     # ---- licence heartbeat: logs out / self-destructs when the key is pulled, and reports copies ----
     def _heartbeat(self):
@@ -549,91 +572,155 @@ class App:
                             "paths": "\n".join(found)[:1500]})
 
     def _build(self):
-        pad = {"padx": 8, "pady": 2}
-        head = lambda t: tk.Label(self.root, text=t, bg="#0d0a16", fg="#b57bff",
-                                  font=("Segoe UI", 10, "bold"), anchor="w")
-
-        head("1. Screen regions").pack(fill="x", **pad)
         self.region_lbl = {}
-        for key, name in (("region1", "Skill check 1 (fill bar + green zone)"),
-                          ("region2", "Skill check 2 (blue bar + fish)")):
-            row = tk.Frame(self.root, bg="#0d0a16")
-            row.pack(fill="x", **pad)
-            tk.Label(row, text=name, bg="#0d0a16", fg="#f4eeff", width=30, anchor="w").pack(side="left")
-            lbl = tk.Label(row, text=self._region_text(key), bg="#0d0a16", fg="#a99cc4", width=16, anchor="w")
-            lbl.pack(side="left")
-            self.region_lbl[key] = lbl
-            tk.Button(row, text="Set region", command=lambda k=key: self._set_region(k)).pack(side="right")
 
-        head("2. Colors (click Pick, then click the colour on screen)").pack(fill="x", **pad)
+        # ---- header bar (drag to move, X to close) ----
+        hdr = tk.Frame(self.root, bg=BG)
+        hdr.pack(fill="x", padx=14, pady=(12, 2))
+        tk.Label(hdr, text="XZX", bg=BG, fg=ACC, font=("Segoe UI Semibold", 20, "bold")).pack(side="left")
+        tt = tk.Frame(hdr, bg=BG)
+        tt.pack(side="left", padx=10)
+        tk.Label(tt, text="Fishing Macro", bg=BG, fg=TXT, font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        tk.Label(tt, text="Auto cast · track · collect", bg=BG, fg=SUB, font=("Segoe UI", 8)).pack(anchor="w")
+        tk.Button(hdr, text="✕", bg=BG, fg=SUB, relief="flat", bd=0, activebackground=BG,
+                  activeforeground=RED, font=("Segoe UI", 12), command=self._close).pack(side="right")
+        self.pill = tk.Label(hdr, text="IDLE", bg=INPUT, fg=SUB, font=("Segoe UI", 8, "bold"), padx=10, pady=3)
+        self.pill.pack(side="right", padx=8)
+        self._drag_bind(hdr)
+        self._drag_bind(tt)
+
+        # ---- hero status card ----
+        hero = self._card(self.root, pad=14)
+        tk.Label(hero, text="STATUS", bg=CARD, fg="#6f6489", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.state_lbl = tk.Label(hero, text="READY", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 22))
+        self.state_lbl.pack(anchor="w")
+        tk.Label(hero, text="Link set · press START or F6", bg=CARD, fg=SUB, font=("Segoe UI", 9)).pack(anchor="w")
+
+        # ---- stat cards: casts / catches ----
+        stats = tk.Frame(self.root, bg=BG)
+        stats.pack(fill="x", padx=10)
+        self.stat_lbl = {}
+        for key, name in (("casts", "CASTS"), ("catches", "CATCHES")):
+            c = tk.Frame(stats, bg=CARD)
+            c.pack(side="left", expand=True, fill="x", padx=4)
+            tk.Label(c, text=name, bg=CARD, fg="#6f6489", font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
+            v = tk.Label(c, text="0", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 16))
+            v.pack(anchor="w", padx=12, pady=(0, 10))
+            self.stat_lbl[key] = v
+
+        # ---- START / STOP ----
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x", padx=14, pady=8)
+        self.btn = tk.Button(bar, text="▶  START", command=self.toggle, bg="#5a2fd6", fg="white",
+                             activebackground=ACC, activeforeground="white", relief="flat",
+                             font=("Segoe UI Semibold", 12))
+        self.btn.pack(side="left", expand=True, fill="x", ipady=8, padx=(0, 4))
+        self.stopbtn = tk.Button(bar, text="■  STOP", command=self.stop, bg=INPUT, fg=TXT,
+                                 activebackground=CARD, activeforeground=TXT, relief="flat",
+                                 font=("Segoe UI Semibold", 12))
+        self.stopbtn.pack(side="left", expand=True, fill="x", ipady=8, padx=(4, 0))
+
+        # ---- regions + colours ----
+        setup = self._card(self.root, pad=12)
+        tk.Label(setup, text="REGIONS & COLOURS", bg=CARD, fg="#6f6489",
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        for key, name in (("region1", "Skill check 1 (fill + green)"),
+                          ("region2", "Skill check 2 (fish + bar)")):
+            row = tk.Frame(setup, bg=CARD)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=name, bg=CARD, fg=TXT, width=24, anchor="w", font=("Segoe UI", 9)).pack(side="left")
+            self.region_lbl[key] = tk.Label(row, text=self._region_text(key), bg=CARD, fg=SUB,
+                                            width=14, anchor="w", font=("Consolas", 8))
+            self.region_lbl[key].pack(side="left")
+            self._chip(row, "Set", lambda k=key: self._set_region(k)).pack(side="right")
         for key, name in (("col_fill", "Filling bar"), ("col_green", "Green zone"),
                           ("col_blue", "Blue bar (yours)"), ("col_fish", "Orange fish")):
-            row = tk.Frame(self.root, bg="#0d0a16")
-            row.pack(fill="x", **pad)
-            tk.Label(row, text=name, bg="#0d0a16", fg="#f4eeff", width=18, anchor="w").pack(side="left")
-            sw = tk.Label(row, text="      ", bg=self._hex(key), relief="solid", bd=1)
+            row = tk.Frame(setup, bg=CARD)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=name, bg=CARD, fg=TXT, width=20, anchor="w", font=("Segoe UI", 9)).pack(side="left")
+            sw = tk.Label(row, text="   ", bg=self._hex(key), relief="flat", width=4)
             sw.pack(side="left", padx=6)
             self.region_lbl[key] = sw
-            tk.Button(row, text="Pick", command=lambda k=key: self._pick_color(k)).pack(side="right")
+            self._chip(row, "Pick", lambda k=key: self._pick_color(k)).pack(side="right")
 
-        head("3. Settings").pack(fill="x", **pad)
-        self._num("cast_key", "Cast key (hold, skill check 1)")
-        self._num("release_point", "Release point in green (0-1)")
-        self._num("release_latency", "Release latency compensation (s)")
-        self._choice("reel_mode", "Reel mode", ["two_key", "hold"])
-        self._num("left_key", "Left key (two_key mode)")
-        self._num("right_key", "Right key (two_key mode)")
-        self._choice("hold_input", "Hold-mode input", ["mouse_left", "mouse_right", "mouse_middle"])
-        self._choice("hold_moves", "Hold-mode: holding moves bar", ["right", "left"])
-        self._num("deadzone_px", "Deadzone min (px)")
-        self._num("deadzone_frac", "Deadzone (fraction of box width)")
-        self._num("prediction_lead", "Prediction lead (s)")
-        self._num("tolerance", "Color tolerance (0-255)")
-        self._num("min_pixels", "Min pixels per column")
-        self._num("fish_timeout", "Fish lost timeout (s)")
-        self._check("auto_recast", "Auto start next cast after reel")
-        self._num("recast_key", "Recast key")
-        self._num("recast_delay", "Recast delay (s)")
+        # ---- settings (scrollable so every field fits) ----
+        sc = self._card(self.root, pad=10)
+        tk.Label(sc, text="SETTINGS", bg=CARD, fg="#6f6489", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        cv = tk.Canvas(sc, bg=CARD, highlightthickness=0, height=168)
+        cv.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(sc, orient="vertical", command=cv.yview)
+        sb.pack(side="right", fill="y")
+        cv.configure(yscrollcommand=sb.set)
+        box = tk.Frame(cv, bg=CARD)
+        cv.create_window((0, 0), window=box, anchor="nw", width=392)
+        box.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
 
-        bar = tk.Frame(self.root, bg="#0d0a16")
-        bar.pack(fill="x", padx=8, pady=6)
-        self.btn = tk.Button(bar, text="START (F6)", command=self.toggle, bg="#5a2fd6", fg="white",
-                             font=("Segoe UI", 10, "bold"))
-        self.btn.pack(side="left", expand=True, fill="x")
-        tk.Button(bar, text="Test detection", command=self._test).pack(side="left", padx=4)
-        tk.Button(bar, text="Live preview", command=self._preview).pack(side="left")
+        self._num(box, "cast_key", "Cast key (hold)")
+        self._num(box, "release_point", "Release point in green (0-1)")
+        self._num(box, "release_latency", "Release latency comp (s)")
+        self._choice(box, "reel_mode", "Reel mode", ["two_key", "hold"])
+        self._num(box, "left_key", "Left key")
+        self._num(box, "right_key", "Right key")
+        self._choice(box, "hold_input", "Hold-mode input", ["mouse_left", "mouse_right", "mouse_middle"])
+        self._choice(box, "hold_moves", "Hold moves bar", ["right", "left"])
+        self._num(box, "deadzone_px", "Deadzone min (px)")
+        self._num(box, "deadzone_frac", "Deadzone (fraction)")
+        self._num(box, "prediction_lead", "Prediction lead (s)")
+        self._num(box, "tolerance", "Colour tolerance")
+        self._num(box, "min_pixels", "Min pixels / column")
+        self._num(box, "fish_timeout", "Fish lost timeout (s)")
+        self._check(box, "auto_recast", "Auto recast after reel")
+        self._num(box, "recast_key", "Recast key")
+        self._num(box, "recast_delay", "Recast delay (s)")
 
-        self.logbox = tk.Text(self.root, height=6, bg="#070510", fg="#8be28b",
-                              insertbackground="#8be28b", font=("Consolas", 9))
-        self.logbox.pack(fill="both", expand=True, padx=8, pady=6)
-        self.log("Ready. Set the two regions and pick the colours, then START.")
+        # ---- footer: test / preview + log ----
+        foot = tk.Frame(self.root, bg=BG)
+        foot.pack(fill="x", padx=14, pady=(2, 4))
+        self._chip(foot, "Test detection", self._test).pack(side="left")
+        self._chip(foot, "Live preview", self._preview).pack(side="left", padx=6)
+        tk.Label(foot, text="F6 start/stop", bg=BG, fg=SUB, font=("Segoe UI", 8)).pack(side="right")
+
+        self.logbox = tk.Text(self.root, height=5, bg="#070510", fg=GREEN, bd=0,
+                              insertbackground=GREEN, font=("Consolas", 9))
+        self.logbox.pack(fill="both", expand=True, padx=14, pady=(2, 12))
+        self.log("Ready. Set the two regions, pick the colours, then START.")
+
+    def _chip(self, parent, text, cmd):
+        return tk.Button(parent, text=text, command=cmd, bg=INPUT, fg=TXT, relief="flat",
+                         activebackground=CARD, activeforeground=TXT, font=("Segoe UI", 8, "bold"), padx=10)
 
     # ----- small widget helpers -----
-    def _num(self, key, label):
-        row = tk.Frame(self.root, bg="#0d0a16")
-        row.pack(fill="x", padx=8, pady=1)
-        tk.Label(row, text=label, bg="#0d0a16", fg="#f4eeff", width=30, anchor="w").pack(side="left")
+    def _num(self, parent, key, label):
+        row = tk.Frame(parent, bg=CARD)
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text=label, bg=CARD, fg=TXT, width=26, anchor="w", font=("Segoe UI", 9)).pack(side="left")
         v = tk.StringVar(value=str(self.cfg[key]))
         self.vars[key] = v
-        e = tk.Entry(row, textvariable=v, width=12, bg="#241940", fg="#f4eeff", insertbackground="#f4eeff")
-        e.pack(side="right")
+        tk.Entry(row, textvariable=v, width=10, bg=INPUT, fg=TXT, insertbackground=TXT,
+                 relief="flat", justify="center").pack(side="right", ipady=2)
         v.trace_add("write", lambda *a, k=key: self._on_change(k))
 
-    def _choice(self, key, label, opts):
-        row = tk.Frame(self.root, bg="#0d0a16")
-        row.pack(fill="x", padx=8, pady=1)
-        tk.Label(row, text=label, bg="#0d0a16", fg="#f4eeff", width=30, anchor="w").pack(side="left")
+    def _choice(self, parent, key, label, opts):
+        row = tk.Frame(parent, bg=CARD)
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text=label, bg=CARD, fg=TXT, width=26, anchor="w", font=("Segoe UI", 9)).pack(side="left")
         v = tk.StringVar(value=str(self.cfg[key]))
         self.vars[key] = v
         ttk.Combobox(row, textvariable=v, values=opts, width=11, state="readonly").pack(side="right")
         v.trace_add("write", lambda *a, k=key: self._on_change(k))
 
-    def _check(self, key, label):
+    def _check(self, parent, key, label):
         v = tk.BooleanVar(value=bool(self.cfg[key]))
         self.vars[key] = v
-        tk.Checkbutton(self.root, text=label, variable=v, bg="#0d0a16", fg="#f4eeff",
-                       selectcolor="#241940", activebackground="#0d0a16", activeforeground="#f4eeff",
-                       command=lambda k=key: self._on_change(k)).pack(fill="x", padx=8, pady=1)
+        tk.Checkbutton(parent, text=label, variable=v, bg=CARD, fg=TXT, anchor="w",
+                       selectcolor=INPUT, activebackground=CARD, activeforeground=TXT,
+                       font=("Segoe UI", 9), command=lambda k=key: self._on_change(k)).pack(fill="x", pady=1)
+
+    def _close(self):
+        if self.worker:
+            self.worker.stop()
+        self.root.destroy()
+        os._exit(0)
 
     def _on_change(self, key):
         v = self.vars[key].get()
@@ -687,15 +774,23 @@ class App:
     # ----- actions -----
     def toggle(self):
         if self.worker and self.worker.is_alive():
-            self.worker.stop()
-            self.worker = None
-            self.btn.config(text="START (F6)", bg="#5a2fd6")
-            self.log("Stopped.")
+            self.stop()
         else:
             self.worker = Worker(self.cfg, self.log)
             self.worker.start()
-            self.btn.config(text="STOP (F6)", bg="#a82d58")
+            self.btn.config(text="▶  RUNNING")
+            self.pill.config(text="RUNNING", fg=GREEN)
+            self.state_lbl.config(text="RUNNING", fg=GREEN)
             self.log("Started.")
+
+    def stop(self):
+        if self.worker:
+            self.worker.stop()
+            self.worker = None
+        self.btn.config(text="▶  START")
+        self.pill.config(text="IDLE", fg=SUB)
+        self.state_lbl.config(text="READY", fg=TXT)
+        self.log("Stopped.")
 
     def _test(self):
         c = self.cfg
@@ -750,6 +845,16 @@ class App:
                 msg = self.logq.get_nowait()
                 self.logbox.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
                 self.logbox.see("end")
+                if "Cast released" in msg:
+                    self.casts += 1
+                    self.stat_lbl["casts"].config(text=str(self.casts))
+                elif "Reel finished" in msg:
+                    self.catches += 1
+                    self.stat_lbl["catches"].config(text=str(self.catches))
+                if "Skill check 1" in msg:
+                    self.state_lbl.config(text="CASTING", fg=ACC)
+                elif "Tracking fish" in msg:
+                    self.state_lbl.config(text="REELING", fg=GREEN)
         except queue.Empty:
             pass
         self.root.after(120, self._drain_log)
