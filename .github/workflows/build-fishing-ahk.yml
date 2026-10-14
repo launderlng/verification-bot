@@ -16,16 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install AutoHotkey + compile
+      - name: Install AutoHotkey v2 + compile
         continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          choco install autohotkey -y --no-progress *>&1 | Tee-Object -FilePath build.log -Append
+          "---- download AutoHotkey v2 installer ----" | Tee-Object build.log -Append
+          Invoke-WebRequest -Uri "https://www.autohotkey.com/download/ahk-v2.exe" -OutFile ahk-v2.exe *>&1 | Tee-Object build.log -Append
+          Start-Process -FilePath ".\ahk-v2.exe" -ArgumentList "/silent" -Wait
+          Start-Sleep -Seconds 5
           "---- tree under Program Files\AutoHotkey ----" | Tee-Object build.log -Append
           Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName | Out-String | Tee-Object build.log -Append
-          $c = Get-ChildItem "C:\" -Recurse -Filter Ahk2Exe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          $b = Get-ChildItem "C:\" -Recurse -Filter AutoHotkey64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $c = Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -Filter Ahk2Exe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $b = Get-ChildItem "C:\Program Files\AutoHotkey" -Recurse -Filter AutoHotkey64.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           "compiler = $($c.FullName)" | Tee-Object build.log -Append
           "base     = $($b.FullName)" | Tee-Object build.log -Append
           if ($c -and $b) {
@@ -42,7 +45,7 @@ jobs:
         shell: bash
         run: |
           mkdir out
-          cp build.log "out/build.log" || echo "no log" > out/build.log
+          cp build.log "out/build.log" 2>/dev/null || echo "no log" > out/build.log
           if [ -f "XZX Fishing.exe" ]; then cp "XZX Fishing.exe" "out/XZX Fishing.exe"; else echo "compile failed - see build.log" > out/NO_EXE.txt; fi
           cd out
           git init -q
