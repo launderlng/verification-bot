@@ -148,7 +148,7 @@ class _IN(ctypes.Union):
     _fields_ = [("ki", _KB), ("mi", _MS)]
 
 
-class INPUT(ctypes.Structure):
+class _INP(ctypes.Structure):
     _fields_ = [("type", ctypes.c_ulong), ("u", _IN)]
 
 
@@ -169,12 +169,12 @@ MOUSE = {"mouse_left": (0x0002, 0x0004), "mouse_right": (0x0008, 0x0010), "mouse
 
 def _send_key(scan, up):
     flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0)
-    inp = INPUT(type=1, u=_IN(ki=_KB(0, scan, flags, 0, None)))
+    inp = _INP(type=1, u=_IN(ki=_KB(0, scan, flags, 0, None)))
     SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
 def _send_mouse(flag):
-    inp = INPUT(type=0, u=_IN(mi=_MS(0, 0, 0, flag, 0, None)))
+    inp = _INP(type=0, u=_IN(mi=_MS(0, 0, 0, flag, 0, None)))
     SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
