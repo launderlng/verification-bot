@@ -1,0 +1,24 @@
+name: Build Fishing EXE
+
+on:
+  workflow_dispatch:        # run it by hand from the Actions tab
+  push:
+    paths:
+      - "fishing-macro/**"
+      - ".github/workflows/build-fishing.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller mss numpy pillow
+      - run: pyinstaller --onefile --noconsole --name "XZX Fishing" --icon fishing-macro/xzx_fishing.ico fishing-macro/fishing_macro.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XZX-Fishing-exe
+          path: "dist/XZX Fishing.exe"
+          if-no-files-found: error
