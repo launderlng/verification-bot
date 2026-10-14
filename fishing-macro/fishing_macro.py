@@ -241,6 +241,7 @@ DEFAULTS = {
     "cast_hold_s": 0.6,
     "release_point": 0.0,
     "release_lead_px": 14,
+    "green_cover": 0.7,
     "release_latency": 0.03,
     "reel_mode": "two_key",
     "left_key": "q",
@@ -254,13 +255,13 @@ DEFAULTS = {
     "reel_max_hold": 0.045,
     "tolerance": 40,
     "min_pixels": 2,
-    "fish_timeout": 0.6,
+    "fish_timeout": 0.3,
     "auto_recast": True,
     "prime_key": "1",
     "prime_delay": 0.4,
     "claim_key": "e",
-    "claim_delay": 0.1,
-    "claim_presses": 6,
+    "claim_delay": 0.02,
+    "claim_presses": 4,
     "recast_delay": 0.3,
 }
 
@@ -341,43 +342,31 @@ class Worker(threading.Thread):
             self.log("Cast released.")
             return
 
-        # GREEN mode: hold the cast key and let go just as the gold charge APPROACHES the green,
-        # releasing a few px early so the in-game release lands on the green instead of overshooting it.
+        # GREEN mode: hold the cast key and release the moment the charge starts covering the GREEN.
+        # We watch how much green is visible: it's full at the start, and shrinks as the charge reaches it.
+        # No fill-colour guessing, so it won't fire straight away.
         press(c["cast_key"], True)
-        g0 = g1 = None
+        baseline = 0
         t1 = time.time()
         hit = False
-        rp = float(c.get("release_point", 0.0))
-        lead = int(c.get("release_lead_px", 14))           # how many px BEFORE the green to let go (raise if overshooting)
+        cover = float(c.get("green_cover", 0.7))           # release when green drops to this share (lower = release later)
         while not self.stop_flag.is_set():
             a = self.grab.grab(reg)
             if a is None:
                 break
-            gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
-            if len(gc):
-                g0, g1 = int(gc.min()), int(gc.max())      # remember where the green is (it moves each cast)
-            if g0 is not None:
-                fillmask = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
-                # the charge front = end of the gold that is contiguous from the left of the bar
-                tr = np.where(fillmask)[0]
-                if len(tr):
-                    start = int(tr[0])
-                    front = start
-                    for x in range(start, len(fillmask)):
-                        if fillmask[x]:
-                            front = x
-                        else:
-                            break
-                    target = g0 - lead + int(rp * max(1, g1 - g0))   # release point, pulled back by `lead`
-                    if front >= target:
-                        hit = True
-                        break
+            gcount = int(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]).sum())
+            if gcount > baseline:
+                baseline = gcount                          # remember the green at its fullest (before the charge covers it)
+            # armed only once we've actually seen a solid green marker
+            if baseline >= max(3, c["min_pixels"]) and gcount <= baseline * cover:
+                hit = True
+                break
             if time.time() - t1 > 3.0:                     # safety: fall back to a timed hold so it still casts
                 time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
                 break
             time.sleep(0.002)
         press(c["cast_key"], False)
-        self.log("Released E near the green." if hit else "Cast released (green not seen — re-pick the Green/Fill colours).")
+        self.log("Released E on the green." if hit else "Cast released (green never seen — re-pick the Green colour).")
 
     # ---- skill check 2: keep your bar on the fish ----
     def reel(self):
@@ -444,14 +433,14 @@ class Worker(threading.Thread):
             press(c["hold_input"], False)
         if self.stop_flag.is_set():
             return
-        # claim the fish: tap the claim key several times over ~0.8s so the claim prompt is caught whenever it shows
-        time.sleep(c.get("claim_delay", 0.1))
+        # claim the fish: press the claim key fast, right away, a few times so the prompt is caught
+        time.sleep(c.get("claim_delay", 0.02))
         ckey = c.get("claim_key", "e")
-        for _ in range(int(c.get("claim_presses", 6))):
+        for _ in range(int(c.get("claim_presses", 4))):
             if self.stop_flag.is_set():
                 break
             tap(ckey)
-            time.sleep(0.13)
+            time.sleep(0.05)
         self.log("Reel finished — pressed %s to claim." % ckey)
 
 
@@ -920,7 +909,7 @@ class App:
         self._choice(box, "cast_mode", "Cast mode", ["green", "timed"])
         self._num(box, "cast_hold_s", "Hold E for (s) ← tune to green")
         self._num(box, "release_point", "Release point in green (0-1)")
-        self._num(box, "release_lead_px", "Release early (px) ← raise if overshooting")
+        self._num(box, "green_cover", "Green release (0-1) ← lower = later")
         self._num(box, "release_latency", "Release latency comp (s)")
         self._choice(box, "reel_mode", "Reel mode", ["two_key", "hold"])
         self._num(box, "left_key", "Left key")
