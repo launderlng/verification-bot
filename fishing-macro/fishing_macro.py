@@ -475,6 +475,127 @@ def pick_color(root, grab, on_done):
 
 
 # ---------------------------------------------------------------- GUI ----
+class SetupWindow:
+    """Screenshot your screen, then drag the two boxes and click the colours on the picture."""
+
+    def __init__(self, app):
+        self.app = app
+        self.cfg = app.cfg
+        self.grab = app.grab
+        self.mode = None
+        self.target = None
+        self.shot = None
+        self.scale = 1.0
+        self.rect = None
+        self.start = None
+        self.tkimg = None
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Setup for your screen")
+        self.win.configure(bg=BG)
+        self.win.attributes("-topmost", True)
+
+        top = tk.Frame(self.win, bg=BG)
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(top, text="1) Show a fishing bar in game   2) Capture   3) Drag the boxes / click the colours",
+                 bg=BG, fg=TXT, font=("Segoe UI", 9)).pack(side="left")
+        tk.Button(top, text="Capture screen (4s)", command=self.capture, bg="#5a2fd6", fg="white",
+                  relief="flat", font=("Segoe UI", 9, "bold")).pack(side="right")
+
+        tools = tk.Frame(self.win, bg=BG)
+        tools.pack(fill="x", padx=12)
+        for text, mode, tgt in (("① Cast box", "region", "region1"), ("② Fishing box", "region", "region2"),
+                                ("Green", "color", "col_green"), ("Fill bar", "color", "col_fill"),
+                                ("Fish", "color", "col_fish"), ("Your bar", "color", "col_blue")):
+            tk.Button(tools, text=text, bg=INPUT, fg=TXT, relief="flat", font=("Segoe UI", 8, "bold"),
+                      command=lambda m=mode, t=tgt: self.set_mode(m, t)).pack(side="left", padx=3, pady=4)
+
+        self.status = tk.Label(self.win, text="Click “Capture screen” first.", bg=BG, fg=SUB, font=("Segoe UI", 9))
+        self.status.pack(anchor="w", padx=12)
+        self.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0, width=900, height=500)
+        self.canvas.pack(padx=12, pady=8)
+        self.canvas.bind("<Button-1>", self.on_down)
+        self.canvas.bind("<B1-Motion>", self.on_move)
+        self.canvas.bind("<ButtonRelease-1>", self.on_up)
+        tk.Button(self.win, text="Save & close", command=self.save, bg=INPUT, fg=TXT, relief="flat",
+                  font=("Segoe UI", 9, "bold")).pack(pady=(0, 12))
+
+    def capture(self):
+        self.status.config(text="Capturing in 4s — switch to the game and show a bar…")
+        self.win.update()
+        self.win.withdraw()
+        self.app.root.withdraw()
+        self.win.after(4000, self._grab)
+
+    def _grab(self):
+        sw, sh = self.app.root.winfo_screenwidth(), self.app.root.winfo_screenheight()
+        arr = self.grab.grab((0, 0, sw, sh))
+        self.app.root.deiconify()
+        self.win.deiconify()
+        self.win.lift()
+        if arr is None:
+            self.status.config(text="Capture failed.")
+            return
+        self.shot = Image.fromarray(arr)
+        self.scale = min(1.0, 1200.0 / self.shot.width)
+        disp = self.shot.resize((int(self.shot.width * self.scale), int(self.shot.height * self.scale)))
+        self.tkimg = ImageTk.PhotoImage(disp)
+        self.canvas.config(width=disp.width, height=disp.height)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.tkimg)
+        self.status.config(text="Pick a tool above, then DRAG a box or CLICK a colour on the screenshot.")
+
+    def set_mode(self, mode, target):
+        self.mode = mode
+        self.target = target
+        self.status.config(text=("Drag a box over it." if mode == "region" else "Click the colour.") + "  (" + target + ")")
+
+    def on_down(self, e):
+        if self.shot is None or self.mode is None:
+            return
+        if self.mode == "region":
+            self.start = (e.x, e.y)
+            self.rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline=ACC, width=2)
+        else:
+            self._pick_at(e.x, e.y)
+
+    def on_move(self, e):
+        if self.mode == "region" and self.rect and self.start:
+            self.canvas.coords(self.rect, self.start[0], self.start[1], e.x, e.y)
+
+    def on_up(self, e):
+        if self.mode == "region" and self.start:
+            x0, y0 = self.start
+            rx, ry = int(min(x0, e.x) / self.scale), int(min(y0, e.y) / self.scale)
+            rw, rh = int(abs(e.x - x0) / self.scale), int(abs(e.y - y0) / self.scale)
+            if rw > 3 and rh > 3:
+                self.cfg[self.target] = [rx, ry, rw, rh]
+                save_cfg(self.cfg)
+                self.status.config(text="%s set: %dx%d @ %d,%d" % (self.target, rw, rh, rx, ry))
+            self.start = None
+            self.rect = None
+
+    def _pick_at(self, cx, cy):
+        ix, iy = int(cx / self.scale), int(cy / self.scale)
+        try:
+            rgb = self.shot.getpixel((ix, iy))[:3]
+        except Exception:
+            return
+        self.cfg[self.target] = list(rgb)
+        save_cfg(self.cfg)
+        self.status.config(text="%s colour: %s" % (self.target, tuple(rgb)))
+
+    def save(self):
+        for k in ("region1", "region2"):
+            if k in self.app.region_lbl:
+                self.app.region_lbl[k].config(text=self.app._region_text(k))
+        for k in ("col_fill", "col_green", "col_blue", "col_fish"):
+            if k in self.app.region_lbl:
+                self.app.region_lbl[k].config(bg=self.app._hex(k))
+        self.app.log("Setup saved for your screen.")
+        self.win.destroy()
+
+
 class App:
     def __init__(self, lic=None):
         self.cfg = load_cfg()
@@ -710,8 +831,9 @@ class App:
         # ---- footer: test / preview + log ----
         foot = tk.Frame(self.root, bg=BG)
         foot.pack(fill="x", padx=14, pady=(2, 4))
-        self._chip(foot, "Test detection", self._test).pack(side="left")
-        self._chip(foot, "Live preview", self._preview).pack(side="left", padx=6)
+        self._chip(foot, "⚙ Setup for my screen", lambda: SetupWindow(self)).pack(side="left")
+        self._chip(foot, "Test", self._test).pack(side="left", padx=6)
+        self._chip(foot, "Preview", self._preview).pack(side="left")
         tk.Label(foot, text="F6 start/stop", bg=BG, fg=SUB, font=("Segoe UI", 8)).pack(side="right")
 
         self.logbox = tk.Text(self.root, height=5, bg="#070510", fg=GREEN, bd=0,
