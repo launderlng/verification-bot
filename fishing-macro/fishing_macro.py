@@ -248,7 +248,9 @@ DEFAULTS = {
     "hold_moves": "right",
     "deadzone_px": 4,
     "deadzone_frac": 0.05,
-    "prediction_lead": 0.05,
+    "prediction_lead": 0.03,
+    "reel_gain": 0.06,
+    "reel_max_hold": 0.045,
     "tolerance": 40,
     "min_pixels": 2,
     "fish_timeout": 0.6,
@@ -257,6 +259,7 @@ DEFAULTS = {
     "prime_delay": 0.4,
     "claim_key": "e",
     "claim_delay": 0.1,
+    "claim_presses": 6,
     "recast_delay": 0.3,
 }
 
@@ -411,26 +414,31 @@ class Worker(threading.Thread):
                 time.sleep(0.004)
                 continue
             if c["reel_mode"] == "two_key":
-                # proportional: nudge for small gaps, a short HOLD for big gaps, so the fish stays centred
+                # gentle proportional nudge, capped, so it doesn't shoot past the fish
                 key = c["right_key"] if diff > 0 else c["left_key"]
-                hold = min(0.12, 0.004 + abs(diff) / max(1.0, w) * 0.22)
+                gain = float(c.get("reel_gain", 0.06))
+                maxhold = float(c.get("reel_max_hold", 0.045))
+                hold = max(0.004, min(maxhold, abs(diff) / max(1.0, w) * gain))
                 press(key, True)
                 time.sleep(hold)
                 press(key, False)
+                time.sleep(0.012)        # let the box settle before the next correction (stops overshoot wobble)
             else:  # hold mode: hold the input to move one way, release to drift the other
                 want = (diff > 0) == (c["hold_moves"] == "right")
                 press(c["hold_input"], want)
-            time.sleep(0.003)
+                time.sleep(0.003)
         if c["reel_mode"] == "hold":
             press(c["hold_input"], False)
         if self.stop_flag.is_set():
             return
-        # claim the fish: press the claim key a couple of times so the prompt is caught
+        # claim the fish: tap the claim key several times over ~0.8s so the claim prompt is caught whenever it shows
         time.sleep(c.get("claim_delay", 0.1))
         ckey = c.get("claim_key", "e")
-        tap(ckey)
-        time.sleep(0.12)
-        tap(ckey)
+        for _ in range(int(c.get("claim_presses", 6))):
+            if self.stop_flag.is_set():
+                break
+            tap(ckey)
+            time.sleep(0.13)
         self.log("Reel finished — pressed %s to claim." % ckey)
 
 
@@ -908,6 +916,8 @@ class App:
         self._num(box, "deadzone_px", "Deadzone min (px)")
         self._num(box, "deadzone_frac", "Deadzone (fraction)")
         self._num(box, "prediction_lead", "Prediction lead (s)")
+        self._num(box, "reel_gain", "Reel push strength")
+        self._num(box, "reel_max_hold", "Reel max push (s)")
         self._num(box, "tolerance", "Colour tolerance")
         self._num(box, "min_pixels", "Min pixels / column")
         self._num(box, "fish_timeout", "Fish lost timeout (s)")
@@ -916,6 +926,7 @@ class App:
         self._num(box, "prime_delay", "Prime delay (s)")
         self._num(box, "claim_key", "Claim key (after catch)")
         self._num(box, "claim_delay", "Claim delay (s)")
+        self._num(box, "claim_presses", "Claim presses")
         self._num(box, "recast_delay", "Delay between runs (s)")
 
         # ---- footer: test / preview + log ----
@@ -971,7 +982,7 @@ class App:
     def _on_change(self, key):
         v = self.vars[key].get()
         if key in ("release_point", "release_latency", "deadzone_frac", "prediction_lead",
-                   "fish_timeout", "recast_delay", "prime_delay", "cast_hold_s", "claim_delay"):
+                   "fish_timeout", "recast_delay", "prime_delay", "cast_hold_s", "claim_delay", "reel_gain", "reel_max_hold"):
             try:
                 v = float(v)
             except ValueError:
