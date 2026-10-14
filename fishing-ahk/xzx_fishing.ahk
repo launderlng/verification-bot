@@ -62,6 +62,8 @@ global Cfg := {
     releaseTol:  ReadNum("releaseTol", 10),
     waitFishMs:  ReadNum("waitFishMs", 4500),
     endHoldMs:   ReadNum("endHoldMs", 180),
+    trackMinMs:  ReadNum("trackMinMs", 12),   ; shortest reel press (fish nearly centred)
+    trackMaxMs:  ReadNum("trackMaxMs", 60),   ; longest reel press (fish far from the box)
     drag:        ReadNum("drag", 0),          ; reused as "flip fish direction"
     stream:      ReadNum("stream", 1),
     ; keys sent into the game
@@ -83,7 +85,7 @@ Cfg.stream := 1
 InitRegions()
 
 SaveCfg() {
-    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
+    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","waitFishMs","endHoldMs","trackMinMs","trackMaxMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", k)
 }
 
@@ -266,30 +268,40 @@ EnsureCastUp() {
 ; Scan the fishing row for the fish + the box, then tap to centre the fish.
 TrackFish() {
     global LastTapAt
-    yrow := (Cfg.trackT + Cfg.trackB) // 2
+    ; sample a few rows across the bar (not just one) so the fish is found reliably
     fsum := 0, fn := 0, bsum := 0, bn := 0
-    x := Cfg.trackL
-    while (x <= Cfg.trackR) {
-        c := PixelGetColor(x, yrow)
-        if ColorNear(c, Cfg.fishCol, Cfg.colVar)
-            fsum += x, fn += 1
-        else if ColorNear(c, Cfg.boxCol, Cfg.colVar)
-            bsum += x, bn += 1
-        x += 2
+    ystep := Max(3, (Cfg.trackB - Cfg.trackT) // 3)
+    y := Cfg.trackT
+    while (y <= Cfg.trackB) {
+        x := Cfg.trackL
+        while (x <= Cfg.trackR) {
+            c := PixelGetColor(x, y)
+            if ColorNear(c, Cfg.fishCol, Cfg.colVar)
+                fsum += x, fn += 1
+            else if ColorNear(c, Cfg.boxCol, Cfg.colVar)
+                bsum += x, bn += 1
+            x += 3
+        }
+        y += ystep
     }
-    if (fn = 0)
+    if (fn < 2)                         ; need a couple of pixels so a stray dot isn't "the fish"
         return false
     fishC := fsum / fn
-    target := (bn > 0) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
-    if (A_TickCount - LastTapAt >= Cfg.tapMs) {
-        diff := fishC - target
-        if (Abs(diff) > Cfg.deadzone) {
-            goRight := (diff > 0)
-            if Cfg.drag
-                goRight := !goRight
-            Tap(goRight ? Cfg.rightKey : Cfg.leftKey)
-            LastTapAt := A_TickCount
-        }
+    target := (bn > 2) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
+    width := Max(1, Cfg.trackR - Cfg.trackL)
+    diff := fishC - target
+    ; proportional correction: far = longer press, close = tiny nudge (less overshoot)
+    if (A_TickCount - LastTapAt >= Cfg.tapMs && Abs(diff) > Cfg.deadzone) {
+        frac := Min(1.0, Abs(diff) / width)
+        hold := Round(Cfg.trackMinMs + frac * (Cfg.trackMaxMs - Cfg.trackMinMs))
+        goRight := (diff > 0)
+        if Cfg.drag
+            goRight := !goRight
+        key := goRight ? Cfg.rightKey : Cfg.leftKey
+        Send "{Blind}{" key " down}"
+        Sleep hold
+        Send "{Blind}{" key " up}"
+        LastTapAt := A_TickCount
     }
     return true
 }
