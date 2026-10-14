@@ -43,9 +43,18 @@ jobs:
           "base     = $($b.FullName)" | Tee-Object build.log -Append
 
           if ($c -and $b) {
+            $inp = (Resolve-Path "fishing-ahk\xzx_fishing.ahk").Path
+            $ico = (Resolve-Path "fishing-ahk\xzx_fishing.ico").Path
+            $out = Join-Path $PWD "XZX Fishing.exe"
             "---- Ahk2Exe output ----" | Tee-Object build.log -Append
-            & $c.FullName /in "fishing-ahk\xzx_fishing.ahk" /out "XZX Fishing.exe" /icon "fishing-ahk\xzx_fishing.ico" /base $b.FullName *>&1 | Tee-Object build.log -Append
+            & $c.FullName /in $inp /out $out /icon $ico /base $b.FullName *>&1 | Tee-Object build.log -Append
             "exit code = $LASTEXITCODE" | Tee-Object build.log -Append
+            "---- any XZX Fishing.exe found ----" | Tee-Object build.log -Append
+            $found = Get-ChildItem -Recurse -Filter "XZX Fishing.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              "found = $($found.FullName) ($($found.Length) bytes)" | Tee-Object build.log -Append
+              if ($found.FullName -ne $out) { Copy-Item $found.FullName $out -Force }
+            }
           } else {
             "SKIPPED compile: compiler or base missing" | Tee-Object build.log -Append
           }
