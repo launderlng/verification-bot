@@ -12,14 +12,25 @@ Set the two regions, pick the four colours, press START (or F6). Build to an .ex
 import ctypes
 import json
 import os
+import string
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import queue
+import urllib.parse
+import urllib.request
+import webbrowser
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 import numpy as np
+
+try:
+    import winreg
+except Exception:
+    winreg = None
 
 try:
     import mss
@@ -28,6 +39,95 @@ except Exception:
 from PIL import Image, ImageGrab, ImageTk
 
 CONFIG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "fishing_macro.json")
+
+# ---------------------------------------------------------------- licence / bot link ----
+LICENSE_API_URL = "https://verification-bot-production-2ea4.up.railway.app"
+DISCORD_INVITE = "discord.gg/xzxx"
+PRODUCT = "fishing"
+
+# XZX purple theme
+BG = "#0b0614"
+CARD = "#160d28"
+INPUT = "#241940"
+TXT = "#f4eeff"
+SUB = "#a99cc4"
+ACC = "#b57bff"
+GREEN = "#6ee7b7"
+RED = "#f0587e"
+
+
+def get_hwid():
+    if winreg:
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
+            v, _ = winreg.QueryValueEx(k, "MachineGuid")
+            if v:
+                return str(v)
+        except Exception:
+            pass
+    return os.environ.get("COMPUTERNAME", "unknown")
+
+
+def api(path, data=None, timeout=8):
+    """POST (data dict) or GET. Returns the body text, or DENIED|... on failure."""
+    url = LICENSE_API_URL.rstrip("/") + path
+    try:
+        if data is not None:
+            req = urllib.request.Request(url, urllib.parse.urlencode(data).encode(),
+                                         headers={"User-Agent": "XZXFishing/1.0"})
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": "XZXFishing/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace").strip()
+    except Exception:
+        return "DENIED|SERVER UNREACHABLE"
+
+
+def is_frozen():
+    return bool(getattr(sys, "frozen", False))
+
+
+def self_destruct():
+    """Delete this .exe, its config, and any copies with the same name on fixed drives. Then exit."""
+    running = sys.executable if is_frozen() else ""
+    name = os.path.basename(running) if running else ""
+    lines = ["@echo off"]
+    try:
+        if os.path.exists(CONFIG):
+            lines.append('del /f /q "%s" 2>nul' % CONFIG)
+    except Exception:
+        pass
+    if name:
+        for d in string.ascii_uppercase:
+            drv = "%s:\\" % d
+            try:
+                if os.path.exists(drv):
+                    lines.append('for /f "delims=" %%%%F in (\'dir /s /b "%s%s" 2^>nul\') do del /f /q "%%%%F" 2>nul' % (drv, name))
+            except Exception:
+                pass
+    if running:
+        lines += [":w", 'del /f /q "%s" 2>nul' % running,
+                  'if exist "%s" ( ping 127.0.0.1 -n 2 >nul & goto w )' % running]
+    lines.append('del "%~f0"')
+    try:
+        bat = os.path.join(tempfile.gettempdir(), "xzx_fishing_cleanup.bat")
+        with open(bat, "w") as f:
+            f.write("\r\n".join(lines))
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+    except Exception:
+        pass
+
+
+def startup_guard():
+    """A shared copy self-destructs before any login: if the saved HWID isn't this PC, remove it."""
+    try:
+        cfg = load_cfg()
+    except Exception:
+        return
+    saved = cfg.get("_hwid")
+    if saved and saved != get_hwid() and is_frozen():
+        self_destruct()
+        sys.exit(0)
 
 # ---------------------------------------------------------------- input (SendInput) ----
 SendInput = ctypes.windll.user32.SendInput
@@ -360,11 +460,13 @@ def pick_color(root, grab, on_done):
 
 # ---------------------------------------------------------------- GUI ----
 class App:
-    def __init__(self):
+    def __init__(self, lic=None):
         self.cfg = load_cfg()
+        self.lic = lic or {}
         self.grab = Grabber()
         self.worker = None
         self.logq = queue.Queue()
+        self._last_copy_sig = ""
 
         self.root = tk.Tk()
         self.root.title("XZX Fishing Macro")
@@ -374,6 +476,77 @@ class App:
         self._build()
         self.root.after(120, self._drain_log)
         self.root.bind("<F6>", lambda e: self.toggle())
+        if self.lic.get("key"):
+            threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    # ---- licence heartbeat: logs out / self-destructs when the key is pulled, and reports copies ----
+    def _heartbeat(self):
+        self._report_copies()
+        while True:
+            time.sleep(60)
+            code = self.lic.get("key")
+            if not code:
+                continue
+            r = api("/api/check", {"code": code, "session": self.lic.get("session", ""),
+                                   "product": PRODUCT, "hwid": get_hwid()})
+            if r.startswith("REVOKED|"):
+                self.root.after(0, lambda rsn=r.split("|", 1)[1]: self._revoked(rsn))
+                return
+            self._report_copies()
+
+    def _revoked(self, reason):
+        if self.worker:
+            self.worker.stop()
+        remove = any(k in reason for k in ("DISABLED", "DELETED", "EXPIRED", "DEVICE"))
+        try:
+            messagebox.showwarning("XZX Fishing", "You've been logged out.\n\n%s\n\n%s" % (
+                reason, "This copy is being removed." if remove else
+                ("Open a ticket in " + DISCORD_INVITE + " if this is a mistake.")))
+        except Exception:
+            pass
+        if remove:
+            self_destruct()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def _report_copies(self):
+        if not is_frozen():
+            return
+        name = os.path.basename(sys.executable)
+        running = sys.executable.lower()
+        found = []
+        roots = [os.path.dirname(sys.executable)]
+        up = os.environ.get("USERPROFILE", "")
+        if up:
+            for s in ("Desktop", "Downloads", "Documents", "OneDrive\\Desktop", "OneDrive\\Downloads"):
+                roots.append(os.path.join(up, s))
+        try:
+            for root in roots:
+                if not os.path.isdir(root):
+                    continue
+                for dp, _dirs, files in os.walk(root):
+                    for fn in files:
+                        if fn.lower() == name.lower():
+                            p = os.path.join(dp, fn)
+                            if p.lower() != running:
+                                found.append(p)
+                    if len(found) > 50:
+                        break
+        except Exception:
+            pass
+        if not found:
+            self._last_copy_sig = ""
+            return
+        sig = "|".join(sorted(p.lower() for p in found))
+        if sig == self._last_copy_sig:
+            return
+        self._last_copy_sig = sig
+        api("/api/report", {"code": self.lic.get("key", ""), "session": self.lic.get("session", ""),
+                            "product": PRODUCT, "count": len(found), "hwid": get_hwid(),
+                            "paths": "\n".join(found)[:1500]})
 
     def _build(self):
         pad = {"padx": 8, "pady": 2}
@@ -587,5 +760,120 @@ class App:
             self.worker.stop()
 
 
+def run_login(cfg):
+    """XZX login: link Discord, enter the access key. Returns {session, key} or None."""
+    result = {}
+    state = {"session": cfg.get("_session", ""), "link": "none"}
+
+    win = tk.Tk()
+    win.title("XZX Fishing — Login")
+    win.configure(bg=BG)
+    win.geometry("420x380")
+    win.resizable(False, False)
+
+    tk.Label(win, text="XZX Fishing", bg=BG, fg=ACC, font=("Segoe UI", 20, "bold")).pack(pady=(22, 2))
+    tk.Label(win, text="Link your Discord, then enter your key", bg=BG, fg=SUB,
+             font=("Segoe UI", 9)).pack()
+
+    discord_btn = tk.Button(win, text="Link Discord account", bg=INPUT, fg=TXT,
+                            activebackground=CARD, activeforeground=TXT, relief="flat",
+                            font=("Segoe UI", 10), width=30)
+    discord_btn.pack(pady=(18, 10), ipady=6)
+
+    key_var = tk.StringVar(value=cfg.get("_key", ""))
+    entry = tk.Entry(win, textvariable=key_var, bg=INPUT, fg=TXT, insertbackground=TXT,
+                     justify="center", font=("Consolas", 12), width=26)
+    entry.pack(ipady=6)
+
+    unlock = tk.Button(win, text="Unlock", bg="#5a2fd6", fg="white", relief="flat",
+                       activebackground=ACC, font=("Segoe UI", 11, "bold"), width=30)
+    unlock.pack(pady=12, ipady=6)
+
+    status = tk.Label(win, text="", bg=BG, fg=SUB, font=("Segoe UI", 9), wraplength=380)
+    status.pack(pady=4)
+    tk.Button(win, text="Need help?  Join " + DISCORD_INVITE, bg=BG, fg=ACC, relief="flat",
+              activebackground=BG, activeforeground=ACC, bd=0,
+              command=lambda: webbrowser.open("https://" + DISCORD_INVITE)).pack(pady=(6, 0))
+
+    def set_status(t, color=SUB):
+        status.config(text=t, fg=color)
+
+    def poll():
+        if state["link"] == "linked" or not state["session"]:
+            return
+        r = api("/api/auth/status?s=" + urllib.parse.quote(state["session"]))
+        if r.startswith("LINKED|"):
+            parts = r.split("|")
+            state["link"] = "linked"
+            discord_btn.config(text="✓ Linked as " + (parts[1] if len(parts) > 1 else "you"))
+            set_status("Linked. Enter your key and press Unlock.", GREEN)
+        elif r == "PENDING":
+            set_status("Waiting for Discord…")
+            win.after(1500, poll)
+        elif r.startswith("ERROR|"):
+            set_status(r.split("|", 1)[1], RED)
+        elif r == "OFF":
+            state["link"] = "off"
+        else:
+            set_status("Link expired — click Link Discord again.", RED)
+
+    def do_link():
+        r = api("/api/auth/new", {})
+        if r.startswith("OK|"):
+            _, sess, url = r.split("|", 2)
+            state["session"] = sess
+            webbrowser.open(url)
+            set_status("Finish linking in your browser…")
+            win.after(1500, poll)
+        elif r.startswith("OFF"):
+            state["link"] = "off"
+            set_status("Discord linking is off — just enter your key.", ACC)
+        else:
+            set_status("Couldn't start linking. Try again.", RED)
+
+    def do_unlock():
+        code = key_var.get().strip()
+        if not code:
+            set_status("Enter your access key.", RED)
+            return
+        set_status("Checking licence…")
+        win.update_idletasks()
+        r = api("/api/activate", {"code": code, "session": state["session"],
+                                  "product": PRODUCT, "hwid": get_hwid()})
+        if r.startswith("OK|"):
+            cfg["_session"] = state["session"]
+            cfg["_key"] = code
+            cfg["_hwid"] = get_hwid()
+            save_cfg(cfg)
+            result["session"] = state["session"]
+            result["key"] = code
+            win.destroy()
+            return
+        msg = r.split("|", 1)[1] if "|" in r else r
+        if "LOCKED TO ANOTHER DEVICE" in msg:
+            set_status("This key is locked to another PC — removing this copy…", RED)
+            win.update_idletasks()
+            self_destruct()
+            win.after(1500, lambda: os._exit(0))
+        else:
+            set_status("Access denied: " + msg, RED)
+            key_var.set("")
+
+    discord_btn.config(command=do_link)
+    unlock.config(command=do_unlock)
+    entry.bind("<Return>", lambda e: do_unlock())
+
+    if state["session"]:
+        set_status("Checking your Discord link…")
+        win.after(400, poll)
+
+    win.mainloop()
+    return result if result.get("key") else None
+
+
 if __name__ == "__main__":
-    App().run()
+    startup_guard()
+    _cfg = load_cfg()
+    _lic = run_login(_cfg)
+    if _lic:
+        App(_lic).run()
