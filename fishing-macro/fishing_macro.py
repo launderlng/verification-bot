@@ -237,7 +237,7 @@ DEFAULTS = {
     "col_blue": [1, 86, 146],
     "col_fish": [154, 72, 3],
     "cast_key": "e",
-    "cast_mode": "timed",
+    "cast_mode": "green",
     "cast_hold_s": 0.6,
     "release_point": 0.5,
     "release_latency": 0.03,
@@ -251,12 +251,12 @@ DEFAULTS = {
     "prediction_lead": 0.05,
     "tolerance": 40,
     "min_pixels": 2,
-    "fish_timeout": 1.5,
+    "fish_timeout": 0.6,
     "auto_recast": True,
     "prime_key": "1",
     "prime_delay": 0.4,
     "claim_key": "e",
-    "claim_delay": 0.2,
+    "claim_delay": 0.1,
     "recast_delay": 0.3,
 }
 
@@ -329,48 +329,47 @@ class Worker(threading.Thread):
         if self.stop_flag.is_set():
             return
 
-        if c.get("cast_mode", "timed") == "pixel":
-            # advanced: wait for the green, then release when the fill front reaches it
-            t0, arr = time.time(), None
-            while not self.stop_flag.is_set():
-                a = self.grab.grab(reg)
-                if a is not None and column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]).any():
-                    arr = a
-                    break
-                if time.time() - t0 > 4:
-                    break
-                time.sleep(0.02)
-            press(c["cast_key"], True)
-            if arr is not None:
-                green_cols = np.where(column_mask(arr, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
-                g0, g1 = int(green_cols.min()), int(green_cols.max())
-                release_x = g0 + c["release_point"] * (g1 - g0)
-                last_front, last_t, t1 = None, time.time(), time.time()
-                while not self.stop_flag.is_set():
-                    a = self.grab.grab(reg)
-                    if a is None:
-                        break
-                    fill = np.where(column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"]))[0]
-                    if len(fill):
-                        front = int(fill.max())
-                        now = time.time()
-                        vel = (front - last_front) / (now - last_t) if (last_front is not None and now > last_t) else 0.0
-                        if front + vel * c["release_latency"] >= release_x:
-                            break
-                        last_front, last_t = front, now
-                    if time.time() - t1 > 3:
-                        break
-                    time.sleep(0.004)
-            else:
-                time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))  # fell back to timed
-            press(c["cast_key"], False)
-        else:
-            # timed (default): just hold the cast key for a tuned time, so it ALWAYS casts.
+        if c.get("cast_mode", "green") == "timed":
             self.log("Casting (hold %s for %ss)." % (c["cast_key"], c.get("cast_hold_s", 0.6)))
             press(c["cast_key"], True)
             time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
             press(c["cast_key"], False)
-        self.log("Cast released.")
+            self.log("Cast released.")
+            return
+
+        # GREEN mode: hold the cast key, watch the gold charge grow from the left, release when it reaches the green.
+        press(c["cast_key"], True)
+        g0 = None
+        t1 = time.time()
+        released = False
+        while not self.stop_flag.is_set():
+            a = self.grab.grab(reg)
+            if a is None:
+                break
+            if g0 is None:
+                gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
+                if len(gc):
+                    g0 = int(gc.min())
+            fillmask = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
+            trues = np.where(fillmask)[0]
+            if g0 is not None and len(trues):
+                start = int(trues[0])
+                front = start
+                for x in range(start, len(fillmask)):
+                    if fillmask[x]:
+                        front = x
+                    else:
+                        break
+                if front >= g0 - 2:                     # the fill reached the green
+                    released = True
+                    break
+            if time.time() - t1 > 3.0:                  # safety: fall back to a timed hold so it still casts
+                time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
+                released = True
+                break
+            time.sleep(0.003)
+        press(c["cast_key"], False)
+        self.log("Cast released on green." if g0 is not None else "Cast released (couldn't see green — tune colours).")
 
     # ---- skill check 2: keep your bar on the fish ----
     def reel(self):
@@ -432,10 +431,15 @@ class Worker(threading.Thread):
             time.sleep(0.003)
         if c["reel_mode"] == "hold":
             press(c["hold_input"], False)
-        # claim the fish
-        time.sleep(c.get("claim_delay", 0.2))
-        tap(c.get("claim_key", "e"))
-        self.log("Reel finished — pressed %s to claim." % c.get("claim_key", "e"))
+        if self.stop_flag.is_set():
+            return
+        # claim the fish: press the claim key a couple of times so the prompt is caught
+        time.sleep(c.get("claim_delay", 0.1))
+        ckey = c.get("claim_key", "e")
+        tap(ckey)
+        time.sleep(0.12)
+        tap(ckey)
+        self.log("Reel finished — pressed %s to claim." % ckey)
 
 
 # ---------------------------------------------------------------- overlays ----
@@ -685,6 +689,10 @@ class SetupWindow:
 class App:
     def __init__(self, lic=None):
         self.cfg = load_cfg()
+        if not self.cfg.get("_green_cast"):   # move existing users onto the green-tracking cast once
+            self.cfg["cast_mode"] = "green"
+            self.cfg["_green_cast"] = True
+            save_cfg(self.cfg)
         self.lic = lic or {}
         self.grab = Grabber()
         self.worker = None
@@ -896,7 +904,7 @@ class App:
         box.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
 
         self._num(box, "cast_key", "Cast key (hold)")
-        self._choice(box, "cast_mode", "Cast mode", ["timed", "pixel"])
+        self._choice(box, "cast_mode", "Cast mode", ["green", "timed"])
         self._num(box, "cast_hold_s", "Hold E for (s) ← tune to green")
         self._num(box, "release_point", "Release point in green (0-1)")
         self._num(box, "release_latency", "Release latency comp (s)")
