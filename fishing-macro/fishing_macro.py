@@ -227,8 +227,9 @@ def column_mask(arr, rgb, tol, min_pixels):
 
 # ---------------------------------------------------------------- defaults ----
 DEFAULTS = {
-    "region1": [711, 900, 503, 40],       # cast: fill bar + green zone  (x, y, w, h)
-    "region2": [772, 880, 380, 67],       # reel: blue bar + fish
+    # measured off the FiveM bars at 1920x1080 (x, y, w, h). Use "Set region" if yours differ.
+    "region1": [768, 886, 576, 44],       # cast: fill bar + green zone
+    "region2": [800, 884, 320, 56],       # reel: blue bar + fish
     "col_fill": [138, 90, 18],
     "col_green": [45, 160, 89],
     "col_blue": [1, 86, 146],
@@ -805,9 +806,15 @@ class App:
         fl = int(column_mask(a1, c["col_fill"], c["tolerance"], c["min_pixels"]).sum()) if a1 is not None else 0
         fi = int(column_mask(a2, c["col_fish"], c["tolerance"], c["min_pixels"]).sum()) if a2 is not None else 0
         bx = int(column_mask(a2, c["col_blue"], c["tolerance"], c["min_pixels"]).sum()) if a2 is not None else 0
-        self.log("Test -> green cols:%d  fill cols:%d  fish cols:%d  blue cols:%d" % (g, fl, fi, bx))
-        if g == 0 and fi == 0:
-            self.log("Nothing detected. Open the fishing bar, then re-set regions / re-pick colours.")
+        self.log("Screen %dx%d.  region1=%s  region2=%s" % (
+            self.root.winfo_screenwidth(), self.root.winfo_screenheight(), c["region1"], c["region2"]))
+        self.log("Test -> green:%d  fill:%d  fish:%d  blue:%d  (a number > 0 means it sees that colour)" % (g, fl, fi, bx))
+        if g == 0 and fl == 0 and fi == 0 and bx == 0:
+            self.log("Saw NOTHING. Open a fishing bar on screen, then: 1) Set each region over its bar  2) Pick each colour.")
+        elif g == 0 and fi == 0:
+            self.log("Cast green / fish not seen — Set the regions over the bars and re-Pick those colours.")
+        else:
+            self.log("Detection OK. If a key isn't landing in game, run the .exe as administrator.")
 
     def _preview(self):
         win = tk.Toplevel(self.root)
