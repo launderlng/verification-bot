@@ -493,7 +493,7 @@ BuildGui() {
         Lbl(g, "x" (c.x + 14) " y" c.y " w180 h36 0x200", c.label, "s9", TXT_MAIN)
         switch c.kind {
             case "num":
-                e := g.AddEdit("x" (c.x + 181) " y" (c.y + 8) " w54 h20 Center -E0x200 Background" INPUT_HEX " Number", Cfg.%c.key%)
+                e := g.AddEdit("x" (c.x + 176) " y" (c.y + 8) " w78 h20 Center -E0x200 Limit6 Background" INPUT_HEX, Cfg.%c.key%)
                 e.SetFont("s10 c" TXT_MAIN, "Consolas")
                 e.OnEvent("Change", (*) => SetTimer(SaveFields, -500))
                 UI["f_" c.key] := e
