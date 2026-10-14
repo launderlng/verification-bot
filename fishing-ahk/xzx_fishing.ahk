@@ -109,6 +109,7 @@ global Runs := 0, LastRun := 0, T0 := A_TickCount, CurKeys := []
 global Casts := 0, Catches := 0, Phase := "idle", PhaseAt := 0
 global CastHeld := false, WasTracking := false, LostAt := 0
 global LastTapAt := 0, LastStartAt := 0
+global Debug := false
 
 ; License server = your Discord bot on Railway (same as the XZX Metal Detector)
 global LICENSE_API_URL := "https://verification-bot-production-2ea4.up.railway.app"
@@ -131,7 +132,9 @@ RegisterKeys()
 SetTimer(LoopTick, 25)
 SetTimer(SecondTick, 1000)
 Hotkey "$F2", (*) => ToggleMenu()
+Hotkey "$F9", (*) => ToggleDebug()
 Hotkey "$F10", (*) => ExitApp()
+SetTimer(DebugTick, 120)
 SetTimer(LicenseHeartbeat, 15000)   ; checks the key every 15s and logs them out fast if it is disabled
 SetTimer(StreamGuard, 4000)         ; keeps the window hidden from capture even if something resets it
 
@@ -322,30 +325,77 @@ FindColor(x1, y1, x2, y2, color, &ox, &oy) {
 ; The green target sits at a random spot on the cast bar each time. Find its left
 ; edge, then say "release now" the moment the gold charge fill arrives just before
 ; it (releaseTol = px of lead so the release lands on the green despite key latency).
-DetectGreenHit() {
-    if (Cfg.castR <= Cfg.castL)
-        return false
-    gL := -1
+; Returns the green's left edge x on the cast bar, or -1 if the green isn't seen.
+GreenLeft() {
     ystep := Max(2, (Cfg.castB - Cfg.castT) // 3)
     y := Cfg.castT
-    while (y <= Cfg.castB && gL < 0) {
+    while (y <= Cfg.castB) {
         x := Cfg.castL
         while (x <= Cfg.castR) {
-            if ColorNear(PixelGetColor(x, y), Cfg.greenCol, Cfg.colVar) {
-                gL := x
-                break
-            }
+            if ColorNear(PixelGetColor(x, y), Cfg.greenCol, Cfg.colVar)
+                return x
             x += 2
         }
         y += ystep
     }
+    return -1
+}
+
+; Returns the right edge x of the growing gold fill (rightmost gold, from the left,
+; tolerating small gaps), or -1 if no fill is seen.
+FillEdge(stopX) {
+    yc := (Cfg.castT + Cfg.castB) // 2
+    edge := -1, gap := 0
+    x := Cfg.castL
+    while (x < stopX) {
+        if ColorNear(PixelGetColor(x, yc), Cfg.markerCol, Cfg.colVar)
+            edge := x, gap := 0
+        else {
+            gap += 2
+            if (edge >= 0 && gap > 14)      ; after the fill, a real dark run = the leading edge
+                break
+        }
+        x += 2
+    }
+    return edge
+}
+
+; The green target is at a random spot each cast. Release once the gold fill's
+; leading edge reaches it (releaseTol = px of lead to beat key latency).
+DetectGreenHit() {
+    if (Cfg.castR <= Cfg.castL)
+        return false
+    gL := GreenLeft()
     if (gL < 0)
         return false
-    probe := Max(Cfg.castL, gL - Cfg.releaseTol)
-    yc := (Cfg.castT + Cfg.castB) // 2
-    return ColorNear(PixelGetColor(probe, yc), Cfg.markerCol, Cfg.colVar)
-        || ColorNear(PixelGetColor(probe, Cfg.castT + 3), Cfg.markerCol, Cfg.colVar)
-        || ColorNear(PixelGetColor(probe, Cfg.castB - 3), Cfg.markerCol, Cfg.colVar)
+    edge := FillEdge(gL)
+    return (edge >= 0 && edge >= gL - Cfg.releaseTol)
+}
+
+ToggleDebug(*) {
+    global Debug
+    Debug := !Debug
+    if !Debug
+        ToolTip
+}
+
+; F9: live readout so you can tell if the cast bar colours/region are calibrated.
+; Hover the green, then the gold fill, and watch the numbers follow your cursor.
+DebugTick() {
+    if !Debug
+        return
+    MouseGetPos(&mx, &my)
+    cur := PixelGetColor(mx, my)
+    gL := GreenLeft()
+    edge := (gL >= 0) ? FillEdge(gL) : -1
+    gtxt := (gL >= 0) ? gL : "none"
+    ftxt := (edge >= 0) ? edge : "none"
+    ToolTip "XZX detect  (F9 to hide)`n"
+        . "cursor colour: " Format("0x{:06X}", cur) "  @ " mx "," my "`n"
+        . "greenCol=" Format("0x{:06X}", Cfg.greenCol) "   goldCol=" Format("0x{:06X}", Cfg.markerCol) "   tol=" Cfg.colVar "`n"
+        . "green left x = " gtxt "    fill edge x = " ftxt "`n"
+        . "cast region = " Cfg.castL "," Cfg.castT " .. " Cfg.castR "," Cfg.castB "`n"
+        . "release fires when fill edge >= green - " Cfg.releaseTol
 }
 
 ; If never calibrated, drop the detection boxes where the game usually draws the bars.
@@ -368,8 +418,8 @@ Calibrate(*) {
     steps := [
         ["Hover the LEFT end of the CAST POWER bar", "castLpt"],
         ["Hover the RIGHT end of the CAST POWER bar", "castRpt"],
-        ["Hover the GREEN target on the cast bar", "green"],
-        ["Hover the MOVING charge marker on the cast bar", "marker"],
+        ["Hover the GREEN target block on the cast bar", "green"],
+        ["Hover the GOLD filled part of the cast bar (the charge colour)", "marker"],
         ["Hover the LEFT end of the FISHING bar", "trackLpt"],
         ["Hover the RIGHT end of the FISHING bar", "trackRpt"],
         ["Hover the FISH", "fish"],
