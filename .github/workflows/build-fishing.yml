@@ -7,6 +7,9 @@ on:
       - "fishing-macro/**"
       - ".github/workflows/build-fishing.yml"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,3 +25,15 @@ jobs:
           name: XZX-Fishing-exe
           path: "dist/XZX Fishing.exe"
           if-no-files-found: error
+      - name: Publish exe to a branch I can fetch
+        shell: bash
+        run: |
+          mkdir out && cp "dist/XZX Fishing.exe" "out/XZX Fishing.exe"
+          cd out
+          git init -q
+          git checkout -q -b exe-dist
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "exe-bot"
+          git add -A
+          git commit -q -m "fishing exe build ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" exe-dist
