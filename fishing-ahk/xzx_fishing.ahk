@@ -184,9 +184,14 @@ LoopTick() {
                 SetHero("CASTING", "Charging - releasing on the green")
             }
         case "charging":
-            ; release the instant the growing fill reaches the (randomly placed) green;
-            ; castHoldMs is only a long safety if the green can't be read
-            if (DetectGreenHit() || (t - PhaseAt >= Max(Cfg.castHoldMs, 3000))) {
+            ; Always cast at the tuned hold time (reliable). The green auto-release can
+            ; only fire it EARLIER, and never in the first 200ms, so it can't misfire to
+            ; an instant release or hang holding the key.
+            held := t - PhaseAt
+            greenHit := false
+            if (held >= 200)
+                try greenHit := DetectGreenHit()
+            if (greenHit || held >= Cfg.castHoldMs) {
                 Send "{Blind}{" Cfg.castKey " up}"
                 CastHeld := false
                 Casts++
