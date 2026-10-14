@@ -247,7 +247,7 @@ DEFAULTS = {
     "hold_input": "mouse_left",
     "hold_moves": "right",
     "deadzone_px": 4,
-    "deadzone_frac": 0.10,
+    "deadzone_frac": 0.05,
     "prediction_lead": 0.05,
     "tolerance": 40,
     "min_pixels": 2,
@@ -255,7 +255,9 @@ DEFAULTS = {
     "auto_recast": True,
     "prime_key": "1",
     "prime_delay": 0.4,
-    "recast_delay": 1.5,
+    "claim_key": "e",
+    "claim_delay": 0.2,
+    "recast_delay": 0.3,
 }
 
 
@@ -399,7 +401,7 @@ class Worker(threading.Thread):
                     lost_since = now
                 elif now - lost_since > c["fish_timeout"]:
                     break
-                time.sleep(0.01)
+                time.sleep(0.008)
                 continue
             lost_since = None
             fish = float(fish_cols.mean())
@@ -407,21 +409,29 @@ class Worker(threading.Thread):
             vel = 0.0
             if last_fish is not None and now > last_t:
                 vel = (fish - last_fish) / (now - last_t)
-            target = fish + vel * c["prediction_lead"]
+            target = fish + vel * c["prediction_lead"]   # aim where the fish is going
             last_fish, last_t = fish, now
-            diff = target - box
+            diff = target - box                          # +ve: fish is right of your box
+            if abs(diff) <= dead:
+                time.sleep(0.004)
+                continue
             if c["reel_mode"] == "two_key":
-                if diff > dead:
-                    tap(c["right_key"])
-                elif diff < -dead:
-                    tap(c["left_key"])
+                # proportional: nudge for small gaps, a short HOLD for big gaps, so the fish stays centred
+                key = c["right_key"] if diff > 0 else c["left_key"]
+                hold = min(0.12, 0.004 + abs(diff) / max(1.0, w) * 0.22)
+                press(key, True)
+                time.sleep(hold)
+                press(key, False)
             else:  # hold mode: hold the input to move one way, release to drift the other
                 want = (diff > 0) == (c["hold_moves"] == "right")
                 press(c["hold_input"], want)
-            time.sleep(0.006)
+            time.sleep(0.003)
         if c["reel_mode"] == "hold":
             press(c["hold_input"], False)
-        self.log("Reel finished.")
+        # claim the fish
+        time.sleep(c.get("claim_delay", 0.2))
+        tap(c.get("claim_key", "e"))
+        self.log("Reel finished — pressed %s to claim." % c.get("claim_key", "e"))
 
 
 # ---------------------------------------------------------------- overlays ----
@@ -900,7 +910,9 @@ class App:
         self._check(box, "auto_recast", "Auto recast after reel")
         self._num(box, "prime_key", "Prime key (pressed before cast)")
         self._num(box, "prime_delay", "Prime delay (s)")
-        self._num(box, "recast_delay", "Recast delay (s)")
+        self._num(box, "claim_key", "Claim key (after catch)")
+        self._num(box, "claim_delay", "Claim delay (s)")
+        self._num(box, "recast_delay", "Delay between runs (s)")
 
         # ---- footer: test / preview + log ----
         foot = tk.Frame(self.root, bg=BG)
@@ -955,7 +967,7 @@ class App:
     def _on_change(self, key):
         v = self.vars[key].get()
         if key in ("release_point", "release_latency", "deadzone_frac", "prediction_lead",
-                   "fish_timeout", "recast_delay", "prime_delay", "cast_hold_s"):
+                   "fish_timeout", "recast_delay", "prime_delay", "cast_hold_s", "claim_delay"):
             try:
                 v = float(v)
             except ValueError:
