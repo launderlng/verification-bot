@@ -239,7 +239,8 @@ DEFAULTS = {
     "cast_key": "e",
     "cast_mode": "green",
     "cast_hold_s": 0.6,
-    "release_point": 0.5,
+    "release_point": 0.0,
+    "release_lead_px": 14,
     "release_latency": 0.03,
     "reel_mode": "two_key",
     "left_key": "q",
@@ -340,31 +341,43 @@ class Worker(threading.Thread):
             self.log("Cast released.")
             return
 
-        # GREEN mode: hold the cast key and let go the moment the gold charge reaches INTO the green zone.
+        # GREEN mode: hold the cast key and let go just as the gold charge APPROACHES the green,
+        # releasing a few px early so the in-game release lands on the green instead of overshooting it.
         press(c["cast_key"], True)
         g0 = g1 = None
         t1 = time.time()
         hit = False
-        rp = float(c.get("release_point", 0.5))
+        rp = float(c.get("release_point", 0.0))
+        lead = int(c.get("release_lead_px", 14))           # how many px BEFORE the green to let go (raise if overshooting)
         while not self.stop_flag.is_set():
             a = self.grab.grab(reg)
             if a is None:
                 break
             gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
             if len(gc):
-                g0, g1 = int(gc.min()), int(gc.max())      # remember where the green is
+                g0, g1 = int(gc.min()), int(gc.max())      # remember where the green is (it moves each cast)
             if g0 is not None:
                 fillmask = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
-                tx = g0 + max(1, int(rp * max(1, g1 - g0)))  # how far into the green to wait for
-                if fillmask[g0:tx + 1].any():              # the gold charge has entered the green → release now
-                    hit = True
-                    break
+                # the charge front = end of the gold that is contiguous from the left of the bar
+                tr = np.where(fillmask)[0]
+                if len(tr):
+                    start = int(tr[0])
+                    front = start
+                    for x in range(start, len(fillmask)):
+                        if fillmask[x]:
+                            front = x
+                        else:
+                            break
+                    target = g0 - lead + int(rp * max(1, g1 - g0))   # release point, pulled back by `lead`
+                    if front >= target:
+                        hit = True
+                        break
             if time.time() - t1 > 3.0:                     # safety: fall back to a timed hold so it still casts
                 time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
                 break
-            time.sleep(0.003)
+            time.sleep(0.002)
         press(c["cast_key"], False)
-        self.log("Released E on the green." if hit else "Cast released (green not seen — re-pick the Green/Fill colours).")
+        self.log("Released E near the green." if hit else "Cast released (green not seen — re-pick the Green/Fill colours).")
 
     # ---- skill check 2: keep your bar on the fish ----
     def reel(self):
@@ -907,6 +920,7 @@ class App:
         self._choice(box, "cast_mode", "Cast mode", ["green", "timed"])
         self._num(box, "cast_hold_s", "Hold E for (s) ← tune to green")
         self._num(box, "release_point", "Release point in green (0-1)")
+        self._num(box, "release_lead_px", "Release early (px) ← raise if overshooting")
         self._num(box, "release_latency", "Release latency comp (s)")
         self._choice(box, "reel_mode", "Reel mode", ["two_key", "hold"])
         self._num(box, "left_key", "Left key")
