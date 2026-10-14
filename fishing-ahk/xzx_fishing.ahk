@@ -60,6 +60,8 @@ global Cfg := {
     recastMs:    ReadNum("recastMs", 1200),
     ; tuning in fishing.ini only
     releaseTol:  ReadNum("releaseTol", 10),
+    trackMinMs:  ReadNum("trackMinMs", 12),   ; shortest reel press (fish nearly centred)
+    trackMaxMs:  ReadNum("trackMaxMs", 60),   ; longest reel press (fish far from the box)
     waitFishMs:  ReadNum("waitFishMs", 4500),
     endHoldMs:   ReadNum("endHoldMs", 180),
     drag:        ReadNum("drag", 0),          ; reused as "flip fish direction"
@@ -83,7 +85,7 @@ Cfg.stream := 1
 InitRegions()
 
 SaveCfg() {
-    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
+    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","trackMinMs","trackMaxMs","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", k)
 }
 
@@ -182,13 +184,9 @@ LoopTick() {
                 SetHero("CASTING", "Charging - releasing on the green")
             }
         case "charging":
-            done := (t - PhaseAt >= Cfg.castHoldMs)
-            if (!done && Cfg.castR > Cfg.castL
-                && FindColor(Cfg.castL, Cfg.castT, Cfg.castR, Cfg.castB, Cfg.greenCol, &gx, &gy)
-                && FindColor(Cfg.castL, Cfg.castT, Cfg.castR, Cfg.castB, Cfg.markerCol, &mx, &my)
-                && mx >= gx - Cfg.releaseTol)
-                done := true
-            if done {
+            ; release the instant the growing fill reaches the (randomly placed) green;
+            ; castHoldMs is only a long safety if the green can't be read
+            if (DetectGreenHit() || (t - PhaseAt >= Max(Cfg.castHoldMs, 3000))) {
                 Send "{Blind}{" Cfg.castKey " up}"
                 CastHeld := false
                 Casts++
@@ -266,30 +264,40 @@ EnsureCastUp() {
 ; Scan the fishing row for the fish + the box, then tap to centre the fish.
 TrackFish() {
     global LastTapAt
-    yrow := (Cfg.trackT + Cfg.trackB) // 2
+    ; sample a few rows across the bar (not just one) so the fish is found reliably
     fsum := 0, fn := 0, bsum := 0, bn := 0
-    x := Cfg.trackL
-    while (x <= Cfg.trackR) {
-        c := PixelGetColor(x, yrow)
-        if ColorNear(c, Cfg.fishCol, Cfg.colVar)
-            fsum += x, fn += 1
-        else if ColorNear(c, Cfg.boxCol, Cfg.colVar)
-            bsum += x, bn += 1
-        x += 2
+    ystep := Max(3, (Cfg.trackB - Cfg.trackT) // 3)
+    y := Cfg.trackT
+    while (y <= Cfg.trackB) {
+        x := Cfg.trackL
+        while (x <= Cfg.trackR) {
+            c := PixelGetColor(x, y)
+            if ColorNear(c, Cfg.fishCol, Cfg.colVar)
+                fsum += x, fn += 1
+            else if ColorNear(c, Cfg.boxCol, Cfg.colVar)
+                bsum += x, bn += 1
+            x += 3
+        }
+        y += ystep
     }
-    if (fn = 0)
+    if (fn < 2)                         ; need a couple of pixels so a stray dot isn't "the fish"
         return false
     fishC := fsum / fn
-    target := (bn > 0) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
-    if (A_TickCount - LastTapAt >= Cfg.tapMs) {
-        diff := fishC - target
-        if (Abs(diff) > Cfg.deadzone) {
-            goRight := (diff > 0)
-            if Cfg.drag
-                goRight := !goRight
-            Tap(goRight ? Cfg.rightKey : Cfg.leftKey)
-            LastTapAt := A_TickCount
-        }
+    target := (bn > 2) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
+    width := Max(1, Cfg.trackR - Cfg.trackL)
+    diff := fishC - target
+    ; proportional correction: far = longer press, close = tiny nudge (less overshoot)
+    if (A_TickCount - LastTapAt >= Cfg.tapMs && Abs(diff) > Cfg.deadzone) {
+        frac := Min(1.0, Abs(diff) / width)
+        hold := Round(Cfg.trackMinMs + frac * (Cfg.trackMaxMs - Cfg.trackMinMs))
+        goRight := (diff > 0)
+        if Cfg.drag
+            goRight := !goRight
+        key := goRight ? Cfg.rightKey : Cfg.leftKey
+        Send "{Blind}{" key " down}"
+        Sleep hold
+        Send "{Blind}{" key " up}"
+        LastTapAt := A_TickCount
     }
     return true
 }
@@ -304,6 +312,35 @@ FindColor(x1, y1, x2, y2, color, &ox, &oy) {
     if (x2 <= x1 || y2 <= y1)
         return false
     return PixelSearch(&ox, &oy, x1, y1, x2, y2, color, Cfg.colVar)
+}
+
+; The green target sits at a random spot on the cast bar each time. Find its left
+; edge, then say "release now" the moment the gold charge fill arrives just before
+; it (releaseTol = px of lead so the release lands on the green despite key latency).
+DetectGreenHit() {
+    if (Cfg.castR <= Cfg.castL)
+        return false
+    gL := -1
+    ystep := Max(2, (Cfg.castB - Cfg.castT) // 3)
+    y := Cfg.castT
+    while (y <= Cfg.castB && gL < 0) {
+        x := Cfg.castL
+        while (x <= Cfg.castR) {
+            if ColorNear(PixelGetColor(x, y), Cfg.greenCol, Cfg.colVar) {
+                gL := x
+                break
+            }
+            x += 2
+        }
+        y += ystep
+    }
+    if (gL < 0)
+        return false
+    probe := Max(Cfg.castL, gL - Cfg.releaseTol)
+    yc := (Cfg.castT + Cfg.castB) // 2
+    return ColorNear(PixelGetColor(probe, yc), Cfg.markerCol, Cfg.colVar)
+        || ColorNear(PixelGetColor(probe, Cfg.castT + 3), Cfg.markerCol, Cfg.colVar)
+        || ColorNear(PixelGetColor(probe, Cfg.castB - 3), Cfg.markerCol, Cfg.colVar)
 }
 
 ; If never calibrated, drop the detection boxes where the game usually draws the bars.
@@ -493,7 +530,7 @@ BuildGui() {
         Lbl(g, "x" (c.x + 14) " y" c.y " w180 h36 0x200", c.label, "s9", TXT_MAIN)
         switch c.kind {
             case "num":
-                e := g.AddEdit("x" (c.x + 176) " y" (c.y + 8) " w78 h20 Center -E0x200 Limit6 Background" INPUT_HEX, Cfg.%c.key%)
+                e := g.AddEdit("x" (c.x + 181) " y" (c.y + 9) " w54 h18 Center -E0x200 Limit6 Background" INPUT_HEX, Cfg.%c.key%)
                 e.SetFont("s10 c" TXT_MAIN, "Consolas")
                 e.OnEvent("Change", (*) => SetTimer(SaveFields, -500))
                 UI["f_" c.key] := e
