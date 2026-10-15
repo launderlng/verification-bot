@@ -152,6 +152,8 @@ class General(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    info = app_commands.Group(name="info", description="Info about the server or a member")
+
     @app_commands.command(name="help", description="Browse every command, or look one up")
     @app_commands.describe(command="Look up one command, e.g. shop createorder")
     @app_commands.autocomplete(command=help_autocomplete)
@@ -222,7 +224,7 @@ class General(commands.Cog):
         embed.set_footer(text=f"Python {sys.version.split()[0]} · discord.py {discord.__version__}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(description="Show info about this server, including its member count")
+    @info.command(name="server", description="Show info about this server, including its member count")
     @app_commands.guild_only()
     async def serverinfo(self, interaction: discord.Interaction):
         g = interaction.guild
@@ -242,7 +244,7 @@ class General(commands.Cog):
         embed.set_footer(text=f"ID: {g.id}")
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(description="Show info about a member, including their avatar")
+    @info.command(name="user", description="Show info about a member, including their avatar")
     @app_commands.describe(member="Who to look up (defaults to you)")
     @app_commands.guild_only()
     async def userinfo(self, interaction: discord.Interaction, member: Optional[discord.Member] = None):

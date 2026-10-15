@@ -33,11 +33,11 @@ SECTIONS = {
         ("/files add · list · send", "The file library"),
     ]),
     "moderation": ("🛡️ Moderation", [
-        ("/warn · /warnings · /timeout · /kick · /ban", "Actions on members"),
+        ("/mod warn · warnings · timeout · kick · ban", "Actions on members"),
         ("/staff notes · note", "Private notes on a member"),
         ("/staff history @member", "Warnings, notes and automod strikes together"),
         ("/automod status", "Automatic moderation rules"),
-        ("/purge · /slowmode · /lock", "Channel control (lock has an unlock option)"),
+        ("/mod purge · slowmode · lock", "Channel control (lock has an unlock option)"),
     ]),
     "giveaways": ("🎉 Giveaways", [
         ("/giveaway start", "Start one, with invite, message, role and age requirements"),
