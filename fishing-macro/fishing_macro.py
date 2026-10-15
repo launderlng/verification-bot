@@ -976,6 +976,9 @@ class App:
     def __init__(self, license=None):
         self.cfg, self.first_run = load_config()
         self.license = license or {}
+        self.casts = 0
+        self.catches = 0
+        self.session_start = None
         self.bot = None
         self.logq = queue.Queue()          # bot/hotkey threads -> window. Tk itself is only touched
         self.cmdq = queue.Queue()          # from the main thread, so nothing can hang or get stuck.
@@ -1054,22 +1057,79 @@ class App:
             pass
 
     # ------------------------------------------------------------------ UI
+    def _vgrad(self, cv, w, h, c1, c2, steps=44):
+        try:
+            r1, g1, b1 = self.root.winfo_rgb(c1)
+            r2, g2, b2 = self.root.winfo_rgb(c2)
+        except Exception:
+            return
+        for i in range(steps):
+            t = i / (steps - 1)
+            col = "#%02x%02x%02x" % (int((r1 + (r2 - r1) * t) / 256),
+                                     int((g1 + (g2 - g1) * t) / 256),
+                                     int((b1 + (b2 - b1) * t) / 256))
+            cv.create_rectangle(0, int(h * i / steps), w, int(h * (i + 1) / steps) + 1, outline="", fill=col)
+
+    def _paint_power(self):
+        cv = getattr(self, "powerbar", None)
+        if cv is None:
+            return
+        cv.delete("all")
+        w = cv.winfo_width()
+        if w <= 1:
+            return
+        running = bool(self.bot and self.bot.is_alive())
+        cv.create_rectangle(0, 1, w, 7, outline="", fill=THEME["panel2"])
+        if running:
+            cv.create_rectangle(0, 1, w, 7, outline="", fill=THEME["green"])
+        else:
+            cv.create_rectangle(0, 1, max(8, int(w * 0.18)), 7, outline="", fill=THEME["accent"])
+
     def build_ui(self):
         T, r = THEME, self.root
         pad = {"padx": 12, "pady": 4}
 
-        # ---- header with live status
-        head = ttk.Frame(r)
-        head.pack(fill="x", padx=12, pady=(10, 2))
-        tk.Label(head, text="XZX", bg=T["bg"], fg=T["accent"], font=("Segoe UI Semibold", 16, "bold")).pack(side="left")
-        ttk.Label(head, text="Fishing", style="Title.TLabel").pack(side="left", padx=(6, 0))
-        right = ttk.Frame(head)
-        right.pack(side="right")
-        self.status_lbl = tk.Label(right, text="\u25cf STOPPED", bg=T["bg"], fg=T["muted"],
-                                   font=("Segoe UI Semibold", 11))
-        self.status_lbl.pack(anchor="e")
-        self.detail_lbl = tk.Label(right, text="Press F6 to start", bg=T["bg"], fg=T["muted"], font=("Segoe UI", 9))
-        self.detail_lbl.pack(anchor="e")
+        # ---- XZX header (purple glow) ----
+        head = tk.Canvas(r, bg=T["bg"], highlightthickness=0, bd=0, height=76)
+        head.pack(fill="x")
+        self._vgrad(head, 1400, 76, "#2a1458", T["bg"])
+        head.create_text(22, 30, text="XZX", anchor="w", fill=T["accent"], font=("Segoe UI Semibold", 21, "bold"))
+        head.create_text(80, 23, text="Fishing Macro", anchor="w", fill=T["fg"], font=("Segoe UI Semibold", 14))
+        head.create_text(81, 47, text="Auto cast \u00b7 track \u00b7 collect", anchor="w", fill=T["muted"], font=("Segoe UI", 8))
+        self.pill = tk.Label(head, text="IDLE", bg=T["panel2"], fg=T["muted"], font=("Segoe UI", 8, "bold"), padx=10, pady=2)
+        self._pill_id = head.create_window(1380, 22, window=self.pill, anchor="e")
+        head.bind("<Configure>", lambda e: head.coords(self._pill_id, e.width - 16, 22))
+
+        # ---- hero status card ----
+        hero = tk.Frame(r, bg=T["panel"])
+        hero.pack(fill="x", padx=12, pady=(8, 4))
+        inner = tk.Frame(hero, bg=T["panel"])
+        inner.pack(fill="x", padx=14, pady=12)
+        tk.Label(inner, text="STATUS", bg=T["panel"], fg=T["muted"], font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.status_lbl = tk.Label(inner, text="READY", bg=T["panel"], fg=T["fg"], font=("Segoe UI Semibold", 22))
+        self.status_lbl.pack(anchor="w")
+        self.detail_lbl = tk.Label(inner, text="Press F6 to start", bg=T["panel"], fg=T["muted"], font=("Segoe UI", 9))
+        self.detail_lbl.pack(anchor="w")
+        self.powerbar = tk.Canvas(inner, bg=T["panel"], highlightthickness=0, bd=0, height=8)
+        self.powerbar.pack(fill="x", pady=(10, 0))
+        self.powerbar.bind("<Configure>", lambda e: self._paint_power())
+
+        # ---- stat tiles ----
+        tiles = tk.Frame(r, bg=T["bg"])
+        tiles.pack(fill="x", padx=8)
+        self.tile_lbl = {}
+        for key, name in (("casts", "CASTS"), ("catches", "CATCHES"), ("time", "SESSION")):
+            cfr = tk.Frame(tiles, bg=T["panel"])
+            cfr.pack(side="left", expand=True, fill="x", padx=4)
+            tk.Label(cfr, text=name, bg=T["panel"], fg=T["muted"], font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
+            v = tk.Label(cfr, text=("00:00:00" if key == "time" else "0"), bg=T["panel"], fg=T["fg"],
+                         font=("Segoe UI Semibold", 13 if key == "time" else 15))
+            v.pack(anchor="w", padx=12, pady=(0, 10))
+            self.tile_lbl[key] = v
+
+        # ---- START / STOP ----
+        self.btn = ttk.Button(r, text="START  (F6)", style="Start.TButton", command=self.toggle)
+        self.btn.pack(fill="x", padx=12, pady=(6, 4))
 
         nb = ttk.Notebook(r)
         nb.pack(fill="x", **pad)
@@ -1196,9 +1256,7 @@ class App:
         self.bools["always_on_top"].trace_add("write", lambda *a: self.root.attributes(
             "-topmost", bool(self.bools["always_on_top"].get())))
 
-        # ---- big start button + tools
-        self.btn = ttk.Button(r, text="START  (F6)", style="Start.TButton", command=self.toggle)
-        self.btn.pack(fill="x", padx=12, pady=(8, 4))
+        # ---- tools row (START is up top in the header)
         tools = ttk.Frame(r)
         tools.pack(fill="x", padx=12, pady=2)
         for text, cmd in (("Test detection", self.test_detect), ("Live preview", self.live_preview),
@@ -1217,7 +1275,9 @@ class App:
         sb.pack(side="right", fill="y")
         self.logbox.pack(side="left", fill="both", expand=True)
         ttk.Label(r, text="F6 start/stop   \u2022   F8 show this window", style="Muted.TLabel").pack(
-            anchor="w", padx=14, pady=(0, 8))
+            anchor="w", padx=14, pady=(0, 2))
+        tk.Label(r, text="XZX Macro  \u00b7  by Coop", bg=T["bg"], fg=T["muted"],
+                 font=("Segoe UI", 7)).pack(pady=(0, 8))
 
         self.log("Ready. Config file: " + CONFIG_FILE)
         if self.first_run:
@@ -1346,6 +1406,14 @@ class App:
         except queue.Empty:
             pass
         if lines:
+            for ln in lines:                                 # count casts / catches off the bot's own log lines
+                low = ln.lower()
+                if "cast (" in low:
+                    self.casts += 1
+                    self.tile_lbl["casts"].config(text=str(self.casts))
+                if "reel finished" in low or "claim" in low:
+                    self.catches += 1
+                    self.tile_lbl["catches"].config(text=str(self.catches))
             self.logbox.config(state="normal")
             self.logbox.insert("end", "\n".join(lines) + "\n")
             total = int(self.logbox.index("end-1c").split(".")[0])
@@ -1360,11 +1428,19 @@ class App:
             if running != self._shown[0]:
                 self.btn.config(text="STOP  (F6)" if running else "START  (F6)",
                                 style="Stop.TButton" if running else "Start.TButton")
-                self.status_lbl.config(text="\u25cf RUNNING" if running else "\u25cf STOPPED",
-                                       fg=THEME["green"] if running else THEME["muted"])
+                self.status_lbl.config(text="RUNNING" if running else "READY",
+                                       fg=THEME["green"] if running else THEME["fg"])
+                self.pill.config(text="\u25cf RUNNING" if running else "IDLE",
+                                 fg=THEME["green"] if running else THEME["muted"])
                 self.root.title(f"{APP_TITLE} - {'RUNNING' if running else 'stopped'}")
+                if running and self.session_start is None:
+                    self.session_start = time.time()
+                self._paint_power()
             self.detail_lbl.config(text=detail, fg=THEME["fg"] if running else THEME["muted"])
             self._shown = (running, detail)
+        if self.session_start is not None:                   # live session timer
+            s = int(time.time() - self.session_start)
+            self.tile_lbl["time"].config(text="%02d:%02d:%02d" % (s // 3600, (s % 3600) // 60, s % 60))
         self.root.after(60, self.tick)
 
     # ------------------------------------------------------------------ start / stop / hotkeys
