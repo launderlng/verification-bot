@@ -456,18 +456,33 @@ DebugTick() {
         return
     MouseGetPos(&mx, &my)
     cur := PixelGetColor(mx, my)
-    gL := GreenLeft()
-    edge := (gL >= 0) ? FillEdge(gL) : -1
-    gtxt := (gL >= 0) ? gL : "none"
-    ftxt := (edge >= 0) ? edge : "none"
-    cc := PixelGetColor(mx, my)
-    kind := ColorIsFill(cc) ? "BLUE charge" : ColorIsGreen(cc) ? "GREEN target" : "-"
+    kind := ColorIsFill(cur) ? "BLUE" : ColorIsGreen(cur) ? "GREEN" : "-"
     CastBounds(&L, &T, &R, &B)
+    ; count green + blue in the band, and note where they are
+    gc := 0, bc := 0, gminx := -1, bmaxx := -1
+    y := T
+    while (y <= B) {
+        x := L
+        while (x <= R) {
+            c := PixelGetColor(x, y)
+            if ColorIsGreen(c) {
+                gc += 1
+                if (gminx < 0)
+                    gminx := x
+            } else if ColorIsFill(c) {
+                bc += 1
+                bmaxx := x
+            }
+            x += 3
+        }
+        y += 3
+    }
     ToolTip "XZX detect  (F9 to hide)`n"
-        . "cursor colour: " Format("0x{:06X}", cur) "  (" kind ")  @ " mx "," my "`n"
-        . "green left x = " gtxt "    blue charge edge x = " ftxt "   (bar only shows while casting)`n"
-        . "screen " A_ScreenWidth "x" A_ScreenHeight "   scan band = " L "," T " .. " R "," B "`n"
-        . "releases when blue edge >= green - " Cfg.releaseTol
+        . "cursor " Format("0x{:06X}", cur) " (" kind ") @ " mx "," my "`n"
+        . "GREEN pixels in band = " gc "  (leftmost x=" (gminx < 0 ? "-" : gminx) ")`n"
+        . "BLUE pixels in band  = " bc "  (rightmost x=" (bmaxx < 0 ? "-" : bmaxx) ")`n"
+        . "screen " A_ScreenWidth "x" A_ScreenHeight "   band y " T ".." B " x " L ".." R "`n"
+        . "** hold E in-game to show the bar, then screenshot this **"
 }
 
 ; If never calibrated, drop the detection boxes where the game usually draws the bars.
