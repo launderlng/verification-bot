@@ -55,15 +55,16 @@ global Cfg := {
     castHoldMs:  ReadNum("castHoldMs", 700),
     castDelayMs: ReadNum("castDelayMs", 350),
     deadzone:    ReadNum("deadzone", 14),
-    tapMs:       ReadNum("tapMs", 35),
+    tapMs:       ReadNum("tapMs", 12),        ; settle pause after each reel nudge (Python reel)
     colVar:      ReadNum("colVar", 60),
     recastMs:    ReadNum("recastMs", 1200),
     ; tuning in fishing.ini only
     releaseTol:  ReadNum("releaseTol", 12),   ; extra px to release early (raise if it over-charges)
     leadMs:      ReadNum("leadMs", 45),        ; how far ahead to predict the charge (input latency)
-    trackMinMs:  ReadNum("trackMinMs", 10),   ; shortest reel press (fish nearly centred)
-    trackMaxMs:  ReadNum("trackMaxMs", 55),   ; longest reel press (fish far from the box)
-    trackLeadMs: ReadNum("trackLeadMs", 45),  ; aim this far ahead of the moving fish
+    trackMinMs:  ReadNum("trackMinMs", 4),    ; shortest reel press
+    trackMaxMs:  ReadNum("trackMaxMs", 45),   ; longest reel press (cap)
+    trackLeadMs: ReadNum("trackLeadMs", 30),  ; aim this far ahead of the moving fish (Python prediction_lead)
+    reelGain:    ReadNum("reelGain", 60),     ; press-length per px of error (Python 0.06 * 1000)
     waitFishMs:  ReadNum("waitFishMs", 4500),
     endHoldMs:   ReadNum("endHoldMs", 180),
     drag:        ReadNum("drag", 0),          ; reused as "flip fish direction"
@@ -87,7 +88,7 @@ Cfg.stream := 1
 InitRegions()
 
 SaveCfg() {
-    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","leadMs","trackMinMs","trackMaxMs","trackLeadMs","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
+    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","leadMs","trackMinMs","trackMaxMs","trackLeadMs","reelGain","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", k)
 }
 
@@ -304,31 +305,29 @@ TrackFish() {
     }
     fishC := fsum / fn
     boxC := (bn > 2) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
+    w := Max(1, Cfg.trackR - Cfg.trackL)
 
-    ; Predict where the fish is heading and aim the box's CENTRE there, so the fish
-    ; stays in the middle of the box instead of the box chasing from behind.
+    ; --- ported straight from the Python reel loop ---
+    ; predict where the fish is going, aim the box centre there, nudge proportionally,
+    ; then settle, so the fish stays in the middle of the box without wobble.
     t := A_TickCount
-    fishAim := fishC
-    if (FishPrev >= 0 && t > FishPrevT) {
+    vel := 0.0
+    if (FishPrev >= 0 && t > FishPrevT)
         vel := (fishC - FishPrev) / (t - FishPrevT)        ; px per ms
-        fishAim := fishC + vel * Cfg.trackLeadMs
-    }
     FishPrev := fishC, FishPrevT := t
-
-    error := fishAim - boxC                                 ; how far the box centre is from the fish
-    half := Max(1, (Cfg.trackR - Cfg.trackL) / 2)
-    if (A_TickCount - LastTapAt >= Cfg.tapMs && Abs(error) > Cfg.deadzone) {
-        frac := Min(1.0, Abs(error) / half)
-        hold := Round(Cfg.trackMinMs + frac * (Cfg.trackMaxMs - Cfg.trackMinMs))
-        goRight := (error > 0)
-        if Cfg.drag
-            goRight := !goRight
-        key := goRight ? Cfg.rightKey : Cfg.leftKey
-        Send "{Blind}{" key " down}"
-        Sleep hold
-        Send "{Blind}{" key " up}"
-        LastTapAt := A_TickCount
-    }
+    target := fishC + vel * Cfg.trackLeadMs                 ; aim where the fish is going
+    diff := target - boxC                                   ; +ve: fish is right of the box
+    if (Abs(diff) <= Cfg.deadzone)
+        return true
+    hold := Max(Cfg.trackMinMs, Min(Cfg.trackMaxMs, Abs(diff) / w * Cfg.reelGain))
+    goRight := (diff > 0)
+    if Cfg.drag
+        goRight := !goRight
+    key := goRight ? Cfg.rightKey : Cfg.leftKey
+    Send "{Blind}{" key " down}"
+    Sleep Round(hold)
+    Send "{Blind}{" key " up}"
+    Sleep Cfg.tapMs                                         ; settle before the next correction (stops overshoot wobble)
     return true
 }
 
