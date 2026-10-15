@@ -59,7 +59,8 @@ global Cfg := {
     colVar:      ReadNum("colVar", 60),
     recastMs:    ReadNum("recastMs", 1200),
     ; tuning in fishing.ini only
-    releaseTol:  ReadNum("releaseTol", 10),
+    releaseTol:  ReadNum("releaseTol", 12),   ; extra px to release early (raise if it over-charges)
+    leadMs:      ReadNum("leadMs", 45),        ; how far ahead to predict the charge (input latency)
     trackMinMs:  ReadNum("trackMinMs", 12),   ; shortest reel press (fish nearly centred)
     trackMaxMs:  ReadNum("trackMaxMs", 60),   ; longest reel press (fish far from the box)
     waitFishMs:  ReadNum("waitFishMs", 4500),
@@ -85,7 +86,7 @@ Cfg.stream := 1
 InitRegions()
 
 SaveCfg() {
-    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","trackMinMs","trackMaxMs","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
+    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","leadMs","trackMinMs","trackMaxMs","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", k)
 }
 
@@ -110,6 +111,7 @@ global Casts := 0, Catches := 0, Phase := "idle", PhaseAt := 0
 global CastHeld := false, WasTracking := false, LostAt := 0
 global LastTapAt := 0, LastStartAt := 0
 global Debug := false
+global PrevEdge := -1, PrevEdgeT := 0
 
 ; License server = your Discord bot on Railway (same as the XZX Metal Detector)
 global LICENSE_API_URL := "https://verification-bot-production-2ea4.up.railway.app"
@@ -387,11 +389,28 @@ FillEdge(stopX) {
 ; The green target is at a random spot each cast. Release once the gold fill's
 ; leading edge reaches it (releaseTol = px of lead to beat key latency).
 DetectGreenHit() {
+    global PrevEdge, PrevEdgeT
     gL := GreenLeft()
-    if (gL < 0)
+    if (gL < 0) {
+        PrevEdge := -1
         return false
+    }
     edge := FillEdge(gL)
-    return (edge >= 0 && edge >= gL - Cfg.releaseTol)
+    if (edge < 0) {
+        PrevEdge := -1
+        return false
+    }
+    ; Predict where the charge will be after the input latency, so we release early
+    ; enough to land ON the green instead of charging past it.
+    t := A_TickCount
+    predicted := edge
+    if (PrevEdge >= 0 && t > PrevEdgeT) {
+        vel := (edge - PrevEdge) / (t - PrevEdgeT)      ; px per ms
+        if (vel > 0)
+            predicted := edge + vel * Cfg.leadMs
+    }
+    PrevEdge := edge, PrevEdgeT := t
+    return (predicted >= gL - Cfg.releaseTol)
 }
 
 ToggleDebug(*) {
@@ -650,7 +669,7 @@ Cells() => [
     {x: 304, y: 452, label: "Wait before hold (ms)", kind: "num", key: "castDelayMs"},
     {x: 40,  y: 494, label: "Fish dead-zone (px)",   kind: "num", key: "deadzone"},
     {x: 304, y: 494, label: "Tap speed (ms)",        kind: "num", key: "tapMs"},
-    {x: 40,  y: 536, label: "Colour tolerance",      kind: "num", key: "colVar"},
+    {x: 40,  y: 536, label: "Cast lead (px, higher=earlier)", kind: "num", key: "releaseTol"},
     {x: 304, y: 536, label: "Flip fish direction",   kind: "switch", key: "drag"},
     {x: 40,  y: 578, label: "Stream proof",          kind: "switch", key: "stream"},
     {x: 304, y: 578, label: "Set up (calibrate)",    kind: "test", key: ""}
@@ -716,7 +735,7 @@ PaintState() {
 }
 
 SaveFields() {
-    for k in ["castHoldMs", "castDelayMs", "deadzone", "tapMs", "colVar"] {
+    for k in ["castHoldMs", "castDelayMs", "deadzone", "tapMs", "releaseTol"] {
         v := Trim(UI["f_" k].Value)
         if !IsNumber(v)
             continue
