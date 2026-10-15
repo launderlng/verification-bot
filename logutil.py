@@ -81,7 +81,7 @@ def clip(text: str | None, limit: int = 1000) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-async def send_log(guild: discord.Guild, category: str, embed: discord.Embed) -> bool:
+async def send_log(guild: discord.Guild, category: str, embed: discord.Embed, view=None) -> bool:
     """Send an embed to the log channel for this category (respecting toggles and routes)."""
     cfg = await db.get_config(guild.id)
     if not cfg:
@@ -98,7 +98,7 @@ async def send_log(guild: discord.Guild, category: str, embed: discord.Embed) ->
     if channel is None:
         return False
     try:
-        await channel.send(embed=embed)
+        await channel.send(embed=embed, **({"view": view} if view is not None else {}))
         return True
     except discord.HTTPException:
         return False

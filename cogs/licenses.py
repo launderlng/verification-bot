@@ -36,7 +36,7 @@ import db
 import ui
 from common import DANGER, SUCCESS, WARN, UserError
 from fileutil import public_base_url
-from logutil import emit
+from logutil import emit, send_log
 from macros import DEFAULT_MACRO, FILTER_MACRO_CHOICES, KEY_MACRO_CHOICES, MACROS, clean_macro, macro_label, macro_name
 
 log = logging.getLogger("verification-bot")
@@ -242,6 +242,86 @@ h1{{font-size:22px;margin:0 0 10px}}p{{margin:0;color:#a99cc4;line-height:1.5}}<
 
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
+def _tos_dm(code: str, macro) -> discord.Embed:
+    return ui.card(
+        "⛔ Your macro key was disabled — copying detected",
+        f"Extra copies of the {macro_name(macro)} macro were found on a device using your key `{code}`.\n\n"
+        "Copying, sharing or redistributing the macro breaks our **Terms of Service**. Your key has been **disabled**, and "
+        "those copies are now being removed from that PC automatically.\n\n"
+        "If you believe this is a mistake, open a ticket in the server.",
+        color=DANGER, section="Keys")
+
+
+async def _dm_user(bot, user_id: Optional[int], embed: discord.Embed) -> bool:
+    if not user_id:
+        return False
+    user = bot.get_user(user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            return False
+    try:
+        await user.send(embed=embed)
+        return True
+    except discord.HTTPException:
+        return False
+
+
+class CopyDisableButton(discord.ui.DynamicItem[discord.ui.Button], template=r"copyguard:off:(?P<lid>[0-9]+)"):
+    """Staff review: disable the key for copying (ToS). Every copy on that PC self-destructs on the next check."""
+    def __init__(self, license_id: int):
+        super().__init__(discord.ui.Button(label="Disable key (ToS)", emoji="⛔",
+                                           style=discord.ButtonStyle.danger, custom_id=f"copyguard:off:{license_id}"))
+        self.license_id = license_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["lid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("Only staff can action this.", ephemeral=True)
+        row = await db.fetch_one("SELECT * FROM licenses WHERE id = ?", (self.license_id,))
+        if not row:
+            return await interaction.response.send_message("That key no longer exists.", ephemeral=True)
+        dmed = False
+        if row["active"]:
+            await db.execute("UPDATE licenses SET active = 0 WHERE id = ?", (row["id"],))
+            await log_event(row["id"], "deactivated", f"copy review: disabled by {interaction.user.id}")
+            dmed = await _dm_user(interaction.client, row["user_id"], _tos_dm(row["code"], row["macro"]))
+        embed = interaction.message.embeds[0] if interaction.message.embeds else ui.card("Copy review", "", color=DANGER)
+        embed.set_footer(text=f"⛔ Disabled by {interaction.user} · copies self-destruct on next check · "
+                              + ("owner DM'd" if dmed else "owner not DM'd (DMs closed / no account)"))
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class CopyIgnoreButton(discord.ui.DynamicItem[discord.ui.Button], template=r"copyguard:keep:(?P<lid>[0-9]+)"):
+    """Staff review: dismiss the copy alert and leave the key active."""
+    def __init__(self, license_id: int):
+        super().__init__(discord.ui.Button(label="Dismiss", emoji="✓",
+                                           style=discord.ButtonStyle.secondary, custom_id=f"copyguard:keep:{license_id}"))
+        self.license_id = license_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["lid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("Only staff can action this.", ephemeral=True)
+        embed = interaction.message.embeds[0] if interaction.message.embeds else ui.card("Copy review", "")
+        embed.set_footer(text=f"✓ Dismissed by {interaction.user} · key left active")
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+def copy_review_view(license_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(CopyDisableButton(license_id))
+    view.add_item(CopyIgnoreButton(license_id))
+    return view
+
+
 class Keys(commands.GroupCog, group_name="key", group_description="Macro license keys"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -261,6 +341,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             app.router.add_get("/auth/callback", self.handle_auth_callback)
             log.info("License check route is ready at /api/activate (Discord linking %s)",
                      "ON" if self.linking_enabled() else "off: set DISCORD_CLIENT_SECRET to turn it on")
+        self.bot.add_dynamic_items(CopyDisableButton, CopyIgnoreButton)
         if not self.expiry_sweep.is_running():
             self.expiry_sweep.start()
 
@@ -632,35 +713,36 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         where = "\n".join(f"`{p}`" for p in paths.splitlines() if p.strip())[:950] or "Unknown"
         await log_event(row["id"], "copies_found", f"{count} copies, {bin_count} in bin ({asked}) hwid={hwid[:60]}")
 
-        # Copying the macro breaks the ToS: if real copies exist on disk, auto-disable the key (so every copy on that
-        # PC self-destructs on its next check, within a minute) and DM the owner that they broke the Terms of Service.
-        auto_disabled = False
+        # Real copies on disk = possible ToS break. Post a STAFF-REVIEW alert with buttons: Disable (turns the key off so
+        # every copy self-destructs on the next check + DMs the owner about the ToS) or Dismiss (leaves it active).
         if count >= 1 and row["active"]:
-            await db.execute("UPDATE licenses SET active = 0 WHERE id = ?", (row["id"],))
-            await log_event(row["id"], "deactivated", "auto: copies found (ToS)")
-            auto_disabled = True
-            dm = ui.card(
-                "⛔ Your macro key was disabled — copying detected",
-                f"We found **{count:,}** extra cop{'y' if count == 1 else 'ies'} of the {macro_name(asked)} macro on a device using "
-                f"your key `{row['code']}`.\n\n"
-                "Copying, sharing or redistributing the macro breaks our **Terms of Service**. Your key has been **disabled**, and "
-                "those copies are now being removed from that PC automatically.\n\n"
-                "If you believe this is a mistake, open a ticket in the server.",
-                color=DANGER, section="Keys")
-            await self.dm_owner(who, dm)
+            guild = self.log_guild(row)
+            if guild is not None:
+                embed = ui.card(
+                    "🚨 Copying detected — staff review",
+                    ui.kv(("👤 Owner", f"<@{who}> · `{who}`" if who else "No Discord account linked"),
+                          ("🔑 Key", f"`{row['code']}`"),
+                          ("🎮 Macro", macro_label(asked)),
+                          ("🖥️ Device (HWID)", f"`{hwid}`"),
+                          ("🔢 Copies on disk", f"{count:,} beyond the running one"),
+                          ("🗑️ In the Recycle Bin", f"{bin_count:,}" if bin_count else None),
+                          ("📂 Every copy", where),
+                          ("ℹ️ Action", "**Disable key (ToS)** turns the key off, DMs the owner about the Terms of Service, and every "
+                           "copy on that PC self-destructs on its next check. **Dismiss** leaves the key active.")),
+                    color=DANGER, guild=guild, section="Keys", timestamp=True)
+                await send_log(guild, "keys", embed, view=copy_review_view(row["id"]))
+            return web.Response(text="OK")
 
+        # Only Recycle-Bin copies, or the key is already disabled: a passive note, no action buttons.
         await self.key_log(
-            row, "🚨 Copying detected — key auto-disabled" if auto_disabled else "📑 Extra copies of the file found on a PC", who,
+            row, "📑 Extra copies of the file found on a PC", who,
             (("🎮 Macro", macro_label(asked)),
              ("🖥️ Device (HWID)", f"`{hwid}`"),
              ("🔢 Copies on disk", f"{count:,} beyond the running one"),
              ("🗑️ In the Recycle Bin", f"{bin_count:,}" if bin_count else None),
              ("📂 Every copy", where),
-             ("ℹ️ Note", "🚨 Key **auto-disabled** for breaking the ToS (copying). The owner was DM'd, and every copy on that PC "
-              "self-destructs on its next check." if auto_disabled else
-              "The macro found more than one copy of its file. Possible key sharing — "
-              "`/key disable` removes every copy on that PC the next time it checks.")),
-            DANGER if auto_disabled else WARN)
+             ("ℹ️ Note", "The macro found copies of its file. Use `/key disable` to remove every copy on that PC.")),
+            WARN)
         return web.Response(text="OK")
 
     # ---------------------------------------------------------- commands ----
