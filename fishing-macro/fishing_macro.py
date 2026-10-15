@@ -1,68 +1,237 @@
 """
-XZX Fishing Macro  -  standalone (no AutoHotkey)
+Fishing Macro
+=============
+Skill check 1 (cast): HOLD the cast key (E). A bar fills left -> right.
+                      Release when the fill reaches the green zone.
+Skill check 2 (reel): A blue bar must stay on the orange fish, which moves
+                      left/right. The macro holds/releases your control
+                      (mouse or key) to keep the blue bar under the fish.
 
-Two skill checks, read from the screen:
-  1) Cast / fill bar: holds the cast key, releases when the fill reaches the green zone.
-  2) Reel / blue bar + fish: taps Q/E (or holds a mouse button) to keep your bar on the fish.
-Then it auto-recasts.
+Setup:
+    pip install mss numpy pillow pydirectinput pynput
+Run:
+    python fishing_macro.py
 
-Set the two regions, pick the four colours, press START (or F6). Build to an .exe with BUILD_FISHING.bat.
+First time:
+    1. Click "Set region" for each skill check (the app waits 4s so you can
+       get the skill check on screen, then you drag a box around it).
+    2. Click "Pick" for each color, then click on that color on screen.
+    3. Press F6 (or the Start button) to start / stop the macro.
+Run the game in Windowed or Borderless mode. If keys don't register in the
+game, run this script as Administrator.
 """
 
-import ctypes
-from ctypes import wintypes
 import json
 import os
-import string
-import traceback
-import subprocess
+import queue
 import sys
-import tempfile
+import shutil
 import threading
 import time
-import queue
-import urllib.parse
-import urllib.request
-import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import filedialog, messagebox, ttk
 
+import urllib.request
+import urllib.parse
+import webbrowser
+
+import mss
 import numpy as np
+from PIL import Image, ImageTk
 
 try:
     import winreg
-except Exception:
+except ImportError:
     winreg = None
 
+# Make coordinates match real pixels on high-DPI Windows screens
 try:
-    import mss
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
-    mss = None
-from PIL import Image, ImageGrab, ImageTk
+    pass
 
-CONFIG = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "fishing_macro.json")
+APP_NAME = "FishingMacro"
+CONFIG_NAME = "fishing_macro_config.json"
 
-# ---------------------------------------------------------------- licence / bot link ----
+if getattr(sys, "frozen", False):          # running as compiled .exe
+    APP_DIR = os.path.dirname(sys.executable)
+    BUNDLE_DIR = getattr(sys, "_MEIPASS", APP_DIR)   # files baked into the exe
+else:
+    APP_DIR = BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_config_path():
+    """Config lives next to the exe. If that folder is read-only, fall back to %APPDATA%."""
+    try:
+        probe = os.path.join(APP_DIR, ".write_test")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        return os.path.join(APP_DIR, CONFIG_NAME)
+    except Exception:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, APP_NAME)
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, CONFIG_NAME)
+
+
+CONFIG_FILE = resolve_config_path()
+BUNDLED_DEFAULT = os.path.join(BUNDLE_DIR, CONFIG_NAME)   # optional: settings baked in at build time
+
+DEFAULTS = {
+    "region1": None,            # skill check 1 region {left, top, width, height}
+    "region2": None,            # skill check 2 region
+    "colors": {
+        "fill":   [255, 255, 255],   # filling bar (skill check 1)
+        "green":  [28, 126, 65],     # green target zone (skill check 1)
+        "blue":   [48, 87, 143],     # your bar (skill check 2)
+        "orange": [141, 66, 21],     # the fish (skill check 2)
+        "red":    [200, 40, 40],     # RED mystery box (skill check 2)
+    },
+    # --- rod / casting ---
+    "equip_rod": True,           # press the hotbar key to equip the rod
+    "rod_slot": 1,               # hotbar slot 1-5 that holds the rod
+    "cast_action": "mouse_left", # what "casting" is: mouse_left or a key (e, f, space...)
+    "auto_cast_on_start": True,  # equip + cast as soon as the macro starts
+    "auto_recast": True,         # cast again after each catch
+    "re_equip_each_cast": False, # press the hotbar key before every cast too
+    "pre_cast_press": True,      # press a key (E) right before every RE-cast (not the very first cast)
+    "pre_cast_key": "e",
+    "pre_cast_delay": 0.6,       # seconds to wait after that key press before casting
+    "start_delay": 3.0,          # seconds to click into the game after pressing start
+    "recast_delay": 1.5,
+    "check1_timeout": 15.0,      # no skill check 1 this long after casting -> cast again (0 = off)
+    "bite_timeout": 90.0,        # no skill check 2 this long after a cast -> recast (0 = off)
+    # --- skill check 1 ---
+    "cast_key": "e",           # key held for skill check 1
+    "release_at": 0.5,         # release point inside green zone (0=left edge, 1=right edge)
+    "release_latency": 0.045,  # seconds: input lag + screen-capture lag. Lands LEFT of green -> lower it, RIGHT of green -> raise it
+    # --- skill check 2 ---
+    "reel_mode": "two_key",    # two_key = Q moves left / E moves right | hold = one input, hold to move
+    "left_key": "q",
+    "right_key": "e",
+    "reel_input": "mouse_left",  # (hold mode only)
+    "hold_moves": "right",       # (hold mode only)
+    "deadzone": 4,             # px minimum
+    "deadzone_frac": 0.10,     # deadzone as a fraction of the blue box width
+    "lead": 0.05,              # seconds of prediction
+    "lost_timeout": 1.5,       # seconds without fish = reel finished
+    # --- window ---
+    "always_on_top": False,       # keep the window above the game (off = behaves like a normal app)
+    "minimize_on_start": True,    # get out of the way when the macro starts
+    "window_geometry": None,      # remembered position/size
+    # --- smarter detection ---
+    "green_detect": "auto",    # auto = any green-looking zone (+ picked color) | color = picked color only
+    "fill_detect": "auto",     # auto = watch what changes on the bar (any color) | color = picked fill color
+    "diff_threshold": 35,      # how different a pixel must be to count as "filled" (auto mode)
+    "auto_tune": False,        # (only works if the bar stays visible after release)
+    "debug_trace": False,      # write cast_trace.txt (bar positions over time) next to the config
+    "red_enabled": True,       # also track the red mystery box
+    # --- detection ---
+    "tolerance": 40,           # color match tolerance (0-255)
+    "min_pixels": 2,           # min pixels in a column to count as a hit
+}
+
+
+def primary_monitor():
+    with mss.mss() as sct:
+        return dict(sct.monitors[1])
+
+
+def _merge(cfg, data):
+    """Merge a loaded dict into cfg. Regions are stored as screen fractions so a config
+    made on one resolution still lines up on another screen with the same layout."""
+    mon = primary_monitor()
+    for k, v in data.items():
+        if k == "colors" and isinstance(v, dict):
+            cfg["colors"].update(v)
+        elif k in ("region1_rel", "region2_rel"):
+            if v:
+                l, t, w, h = v
+                cfg[k[:-4]] = {"left": mon["left"] + round(l * mon["width"]),
+                               "top": mon["top"] + round(t * mon["height"]),
+                               "width": max(1, round(w * mon["width"])),
+                               "height": max(1, round(h * mon["height"]))}
+        elif k in ("region1", "region2"):
+            if not data.get(k + "_rel"):
+                cfg[k] = v          # old absolute-pixel format
+        elif k in cfg:
+            cfg[k] = v
+
+
+def to_file_dict(cfg):
+    mon = primary_monitor()
+    out = {k: v for k, v in cfg.items() if k not in ("region1", "region2")}
+    for k in ("region1", "region2"):
+        r = cfg.get(k)
+        out[k + "_rel"] = None if not r else [
+            round((r["left"] - mon["left"]) / mon["width"], 5),
+            round((r["top"] - mon["top"]) / mon["height"], 5),
+            round(r["width"] / mon["width"], 5),
+            round(r["height"] / mon["height"], 5)]
+    return out
+
+
+def read_config_file(path, cfg):
+    with open(path, encoding="utf-8") as f:
+        _merge(cfg, json.load(f))
+
+
+def load_config():
+    """Returns (cfg, first_run). Creates the config file automatically if it doesn't exist."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    first_run = not os.path.exists(CONFIG_FILE)
+    try:
+        if not first_run:
+            read_config_file(CONFIG_FILE, cfg)
+        elif os.path.exists(BUNDLED_DEFAULT):
+            read_config_file(BUNDLED_DEFAULT, cfg)      # settings the exe's author baked in
+    except Exception as e:
+        print("Config unreadable, using defaults:", e)
+    if first_run:
+        save_config(cfg)                                # auto-create on first launch
+    return cfg, first_run
+
+
+def save_config(cfg, path=None):
+    try:
+        with open(path or CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(to_file_dict(cfg), f, indent=2)
+        return True
+    except Exception as e:
+        print("Could not save config:", e)
+        return False
+
+
+# --------------------------------------------------------------------------
+# Licence  (access control only: login, HWID lock, auto-logout. No file changes.)
+# --------------------------------------------------------------------------
 LICENSE_API_URL = "https://verification-bot-production-2ea4.up.railway.app"
 DISCORD_INVITE = "discord.gg/xzxx"
 PRODUCT = "fishing"
+LICENSE_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "fishing_license.json")
 
-# XZX purple theme
-BG = "#09060f"       # base, matches XZX Alt Click
-CARD = "#130c24"     # panel
-INPUT = "#241940"    # inputs / chips
-TXT = "#f4eeff"
-SUB = "#a99cc4"
-DIM = "#6f6489"      # tiny section labels
-ACC = "#b57bff"      # purple accent
-ACC2 = "#5a2fd6"     # deep purple (button)
-GLOW = "#2a1458"     # top glow tint
-GREEN = "#6ee7b7"
-RED = "#f0587e"
+
+def load_license():
+    try:
+        with open(LICENSE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_license(data):
+    try:
+        with open(LICENSE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 def get_hwid():
-    if winreg:
+    """A stable per-PC id (Windows MachineGuid). Used to lock a key to one device."""
+    if winreg is not None:
         try:
             k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
             v, _ = winreg.QueryValueEx(k, "MachineGuid")
@@ -73,8 +242,7 @@ def get_hwid():
     return os.environ.get("COMPUTERNAME", "unknown")
 
 
-def api(path, data=None, timeout=8):
-    """POST (data dict) or GET. Returns the body text, or DENIED|... on failure."""
+def lic_api(path, data=None, timeout=8):
     url = LICENSE_API_URL.rstrip("/") + path
     try:
         if data is not None:
@@ -88,1389 +256,1411 @@ def api(path, data=None, timeout=8):
         return "DENIED|SERVER UNREACHABLE"
 
 
-def is_frozen():
-    return bool(getattr(sys, "frozen", False))
-
-
-def self_destruct():
-    """Delete this .exe, its config, and any copies with the same name on fixed drives. Then exit."""
-    running = sys.executable if is_frozen() else ""
-    name = os.path.basename(running) if running else ""
-    lines = ["@echo off"]
-    try:
-        if os.path.exists(CONFIG):
-            lines.append('del /f /q "%s" 2>nul' % CONFIG)
-    except Exception:
-        pass
-    if name:
-        for d in string.ascii_uppercase:
-            drv = "%s:\\" % d
-            try:
-                if os.path.exists(drv):
-                    lines.append('for /f "delims=" %%%%F in (\'dir /s /b "%s%s" 2^>nul\') do del /f /q "%%%%F" 2>nul' % (drv, name))
-            except Exception:
-                pass
-    if running:
-        lines += [":w", 'del /f /q "%s" 2>nul' % running,
-                  'if exist "%s" ( ping 127.0.0.1 -n 2 >nul & goto w )' % running]
-    lines.append('del "%~f0"')
-    try:
-        bat = os.path.join(tempfile.gettempdir(), "xzx_fishing_cleanup.bat")
-        with open(bat, "w") as f:
-            f.write("\r\n".join(lines))
-        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
-    except Exception:
-        pass
-
-
-def startup_guard():
-    """A shared copy self-destructs before any login: if the saved HWID isn't this PC, remove it."""
-    try:
-        cfg = load_cfg()
-    except Exception:
-        return
-    saved = cfg.get("_hwid")
-    if saved and saved != get_hwid() and is_frozen():
-        self_destruct()
-        sys.exit(0)
-
-# ---------------------------------------------------------------- input (SendInput) ----
-SendInput = ctypes.windll.user32.SendInput
-PUL = ctypes.POINTER(ctypes.c_ulong)
-
-
-class _KB(ctypes.Structure):
-    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
-                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", PUL)]
-
-
-class _MS(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
-                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", PUL)]
-
-
-class _IN(ctypes.Union):
-    _fields_ = [("ki", _KB), ("mi", _MS)]
-
-
-class _INP(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong), ("u", _IN)]
-
-
-KEYEVENTF_SCANCODE = 0x0008
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_EXTENDED = 0x0001
-
-SCAN = {
-    "q": 0x10, "w": 0x11, "e": 0x12, "r": 0x13, "t": 0x14, "y": 0x15, "u": 0x16,
-    "a": 0x1E, "s": 0x1F, "d": 0x20, "f": 0x21, "g": 0x22, "h": 0x23,
-    "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30, "n": 0x31, "m": 0x32,
-    "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06, "6": 0x07, "7": 0x08,
-    "8": 0x09, "9": 0x0A, "0": 0x0B, "space": 0x39, "shift": 0x2A, "ctrl": 0x1D,
-    "tab": 0x0F, "enter": 0x1C,
-}
-MOUSE = {"mouse_left": (0x0002, 0x0004), "mouse_right": (0x0008, 0x0010), "mouse_middle": (0x0020, 0x0040)}
-
-
-def _send_key(scan, up):
-    flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0)
-    inp = _INP(type=1, u=_IN(ki=_KB(0, scan, flags, 0, None)))
-    SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
-
-
-def _send_mouse(flag):
-    inp = _INP(type=0, u=_IN(mi=_MS(0, 0, 0, flag, 0, None)))
-    SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
-
-
-def press(name, down):
-    """down=True presses, down=False releases. name is a key letter or mouse_left/right/middle."""
-    if name in MOUSE:
-        _send_mouse(MOUSE[name][0] if down else MOUSE[name][1])
-    else:
-        sc = SCAN.get(name.lower())
-        if sc:
-            _send_key(sc, not down)
-
-
-def tap(name):
-    press(name, True)
-    time.sleep(0.015)
-    press(name, False)
-
-
-# ---------------------------------------------------------------- screen capture ----
-class Grabber:
-    def __init__(self):
-        self._sct = mss.mss() if mss else None
-
-    def grab(self, region):
-        """region = (x, y, w, h) -> RGB numpy array (h, w, 3), or None."""
-        x, y, w, h = region
-        if w <= 0 or h <= 0:
-            return None
-        if self._sct:
-            raw = self._sct.grab({"left": x, "top": y, "width": w, "height": h})
-            arr = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
-            return arr
-        img = ImageGrab.grab(bbox=(x, y, x + w, y + h))  # fallback
-        return np.array(img.convert("RGB"))
-
-    def pixel(self, x, y):
-        arr = self.grab((x, y, 1, 1))
-        return tuple(int(v) for v in arr[0, 0]) if arr is not None else (0, 0, 0)
-
-
-def column_mask(arr, rgb, tol, min_pixels):
-    """Boolean array per column: True where at least `min_pixels` match `rgb` within `tol`."""
-    r, g, b = rgb
-    diff = (np.abs(arr[:, :, 0].astype(int) - r) <= tol) & \
-           (np.abs(arr[:, :, 1].astype(int) - g) <= tol) & \
-           (np.abs(arr[:, :, 2].astype(int) - b) <= tol)
-    return diff.sum(axis=0) >= min_pixels
-
-
-# ---------------------------------------------------------------- defaults ----
-DEFAULTS = {
-    # measured off the FiveM bars at 1920x1080 (x, y, w, h). Use "Set region" if yours differ.
-    "region1": [768, 886, 576, 44],       # cast: fill bar + green zone
-    "region2": [800, 884, 320, 56],       # reel: blue bar + fish
-    "col_fill": [138, 90, 18],
-    "col_green": [45, 160, 89],
-    "col_blue": [1, 86, 146],
-    "col_fish": [154, 72, 3],
-    "cast_key": "e",
-    "cast_mode": "green",
-    "cast_hold_s": 0.6,
-    "release_point": 0.0,
-    "release_lead_px": 14,
-    "green_cover": 0.95,
-    "release_latency": 0.03,
-    "reel_mode": "two_key",
-    "left_key": "q",
-    "right_key": "e",
-    "hold_input": "mouse_left",
-    "hold_moves": "right",
-    "deadzone_px": 4,
-    "deadzone_frac": 0.05,
-    "prediction_lead": 0.03,
-    "reel_gain": 0.06,
-    "reel_max_hold": 0.045,
-    "tolerance": 40,
-    "min_pixels": 2,
-    "fish_timeout": 0.3,
-    "end_timeout": 0.3,
-    "auto_recast": True,
-    "prime_key": "1",
-    "prime_delay": 0.4,
-    "claim_key": "e",
-    "claim_delay": 0.02,
-    "claim_presses": 4,
-    "recast_delay": 0.3,
-}
-
-
-def load_cfg():
-    cfg = dict(DEFAULTS)
-    try:
-        with open(CONFIG) as f:
-            cfg.update(json.load(f))
-    except Exception:
-        pass
-    return cfg
-
-
-def save_cfg(cfg):
-    try:
-        with open(CONFIG, "w") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------- worker ----
-class Worker(threading.Thread):
-    def __init__(self, cfg, log):
-        super().__init__(daemon=True)
-        self.cfg = cfg
-        self.log = log
-        self.stop_flag = threading.Event()
-        self.grab = None
-
-    def stop(self):
-        self.stop_flag.set()
-
-    def run(self):
-        c = self.cfg
-        self.grab = Grabber()
-        try:
-            for i in (3, 2, 1):                 # grace so you can click back into the game
-                if self.stop_flag.is_set():
-                    return
-                self.log("Starting in %ds — click into FiveM now…" % i)
-                time.sleep(1)
-            self.log("Go. Looping until you press F6 to stop.")
-            while not self.stop_flag.is_set():          # keeps fishing: press 1, cast, reel, collect, repeat
-                self.cast()
-                if self.stop_flag.is_set():
-                    break
-                self.reel()
-                if self.stop_flag.is_set():
-                    break
-                time.sleep(c["recast_delay"])
-        except Exception as e:
-            self.log("ERROR: %s" % e)
-            self.log(traceback.format_exc().strip().splitlines()[-1])
-        finally:
-            press(c["cast_key"], False)
-            if c["reel_mode"] == "hold":
-                press(c["hold_input"], False)
-
-    # ---- skill check 1: hold the cast key, release on the green ----
-    def cast(self):
-        c = self.cfg
-        reg = tuple(c["region1"])
-        # press the prime key (e.g. 1) to equip the rod / start the cast, BEFORE holding the cast key
-        if c.get("prime_key"):
-            tap(c["prime_key"])
-            self.log("Pressed %s to start the cast." % c["prime_key"])
-            time.sleep(c.get("prime_delay", 0.4))
-        if self.stop_flag.is_set():
-            return
-
-        mode = c.get("cast_mode", "green")
-        if mode == "timed":
-            self.log("Casting (hold %s for %ss)." % (c["cast_key"], c.get("cast_hold_s", 0.6)))
-            press(c["cast_key"], True)
-            time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
-            press(c["cast_key"], False)
-            self.log("Cast released.")
-            return
-
-        if mode == "front":
-            # FRONT mode (set by the Test run): follow the learned charge colour and release a measured
-            # number of px BEFORE the green, so the in-game release lands dead on it.
-            press(c["cast_key"], True)
-            g0 = None
-            lead = int(c.get("release_lead_px", 18))
-            t1 = time.time()
-            hit = False
-            while not self.stop_flag.is_set():
-                a = self.grab.grab(reg)
-                if a is None:
-                    break
-                gc = np.where(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]))[0]
-                if len(gc):
-                    g0 = int(gc.min())
-                fm = column_mask(a, c["col_fill"], c["tolerance"], c["min_pixels"])
-                tr = np.where(fm)[0]
-                if g0 is not None and len(tr):
-                    start = int(tr[0])
-                    front = start
-                    for x in range(start, len(fm)):
-                        if fm[x]:
-                            front = x
-                        else:
-                            break
-                    if front >= g0 - lead:
-                        hit = True
-                        break
-                if time.time() - t1 > 3.0:
-                    time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
-                    break
-                time.sleep(0.002)
-            press(c["cast_key"], False)
-            self.log("Cast released (front).")
-            return
-
-        # GREEN mode: hold the cast key and release the moment the charge starts covering the GREEN.
-        # We watch how much green is visible: it's full at the start, and shrinks as the charge reaches it.
-        # No fill-colour guessing, so it won't fire straight away.
-        press(c["cast_key"], True)
-        baseline = 0
-        t1 = time.time()
-        hit = False
-        cover = float(c.get("green_cover", 0.7))           # release when green drops to this share (lower = release later)
-        while not self.stop_flag.is_set():
-            a = self.grab.grab(reg)
-            if a is None:
-                break
-            gcount = int(column_mask(a, c["col_green"], c["tolerance"], c["min_pixels"]).sum())
-            if gcount > baseline:
-                baseline = gcount                          # remember the green at its fullest (before the charge covers it)
-            # armed only once we've actually seen a solid green marker
-            if baseline >= max(3, c["min_pixels"]) and gcount <= baseline * cover:
-                hit = True
-                break
-            if time.time() - t1 > 3.0:                     # safety: fall back to a timed hold so it still casts
-                time.sleep(max(0.0, float(c.get("cast_hold_s", 0.6))))
-                break
-            time.sleep(0.002)
-        press(c["cast_key"], False)
-        self.log("Released E on the green." if hit else "Cast released (green never seen — re-pick the Green colour).")
-
-    # ---- skill check 2: keep your bar on the fish ----
-    def reel(self):
-        c = self.cfg
-        reg = tuple(c["region2"])
-        w = reg[2]
-        dead = max(c["deadzone_px"], c["deadzone_frac"] * w)
-        # wait for the fish
-        t0 = time.time()
-        while not self.stop_flag.is_set():
-            arr = self.grab.grab(reg)
-            if arr is not None and column_mask(arr, c["col_fish"], c["tolerance"], c["min_pixels"]).any():
-                break
-            if time.time() - t0 > 8:
-                return
-            time.sleep(0.03)
-        if self.stop_flag.is_set():
-            return
-        self.log("Skill check 2 found. Tracking fish.")
-        if c["reel_mode"] == "hold":
-            press(c["hold_input"], False)
-        last_fish, last_t, lost_since = None, time.time(), None
-        while not self.stop_flag.is_set():
-            arr = self.grab.grab(reg)
-            if arr is None:
-                break
-            fish_cols = np.where(column_mask(arr, c["col_fish"], c["tolerance"], c["min_pixels"]))[0]
-            box_cols = np.where(column_mask(arr, c["col_blue"], c["tolerance"], c["min_pixels"]))[0]
-            now = time.time()
-            if not len(fish_cols):
-                # end the reel only when the WHOLE bar is gone (fish AND your box). If the box is still
-                # there, the fish just flickered/moved fast — keep tracking so we don't lose it.
-                if not len(box_cols):
-                    if lost_since is None:
-                        lost_since = now
-                    elif now - lost_since > c.get("end_timeout", 0.3):
-                        break
-                else:
-                    lost_since = None
-                time.sleep(0.006)
-                continue
-            lost_since = None
-            fish = float(fish_cols.mean())
-            box = float(box_cols.mean()) if len(box_cols) else w / 2.0
-            vel = 0.0
-            if last_fish is not None and now > last_t:
-                vel = (fish - last_fish) / (now - last_t)
-            target = fish + vel * c["prediction_lead"]   # aim where the fish is going
-            last_fish, last_t = fish, now
-            diff = target - box                          # +ve: fish is right of your box
-            if abs(diff) <= dead:
-                time.sleep(0.004)
-                continue
-            if c["reel_mode"] == "two_key":
-                # gentle proportional nudge, capped, so it doesn't shoot past the fish
-                key = c["right_key"] if diff > 0 else c["left_key"]
-                gain = float(c.get("reel_gain", 0.06))
-                maxhold = float(c.get("reel_max_hold", 0.045))
-                hold = max(0.004, min(maxhold, abs(diff) / max(1.0, w) * gain))
-                press(key, True)
-                time.sleep(hold)
-                press(key, False)
-                time.sleep(0.012)        # let the box settle before the next correction (stops overshoot wobble)
-            else:  # hold mode: hold the input to move one way, release to drift the other
-                want = (diff > 0) == (c["hold_moves"] == "right")
-                press(c["hold_input"], want)
-                time.sleep(0.003)
-        if c["reel_mode"] == "hold":
-            press(c["hold_input"], False)
-        if self.stop_flag.is_set():
-            return
-        # claim the fish: press the claim key fast, right away, a few times so the prompt is caught
-        time.sleep(c.get("claim_delay", 0.02))
-        ckey = c.get("claim_key", "e")
-        for _ in range(int(c.get("claim_presses", 4))):
-            if self.stop_flag.is_set():
-                break
-            tap(ckey)
-            time.sleep(0.05)
-        self.log("Reel finished — pressed %s to claim." % ckey)
-
-
-# ---------------------------------------------------------------- overlays ----
-def pick_region(root, on_done):
-    """Fullscreen drag-to-select. Calls on_done([x, y, w, h])."""
-    ov = tk.Toplevel(root)
-    ov.attributes("-fullscreen", True)
-    ov.attributes("-alpha", 0.25)
-    ov.configure(bg="black")
-    ov.attributes("-topmost", True)
-    cv = tk.Canvas(ov, cursor="cross", bg="black", highlightthickness=0)
-    cv.pack(fill="both", expand=True)
-    cv.create_text(ov.winfo_screenwidth() // 2, 30, fill="white",
-                   text="Drag a box over the bar  ·  Esc to cancel", font=("Segoe UI", 14))
-    s = {}
-
-    def down(e):
-        s["x"], s["y"] = e.x_root, e.y_root
-        s["r"] = cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#b57bff", width=2)
-
-    def move(e):
-        if "r" in s:
-            cv.coords(s["r"], s["x"] - ov.winfo_rootx(), s["y"] - ov.winfo_rooty(), e.x, e.y)
-
-    def up(e):
-        x0, y0 = s["x"], s["y"]
-        x1, y1 = e.x_root, e.y_root
-        ov.destroy()
-        on_done([min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)])
-
-    cv.bind("<Button-1>", down)
-    cv.bind("<B1-Motion>", move)
-    cv.bind("<ButtonRelease-1>", up)
-    ov.bind("<Escape>", lambda e: ov.destroy())
-
-
-def pick_color(root, grab, on_done):
-    """Fullscreen; the next click samples that pixel. Calls on_done((r, g, b))."""
-    ov = tk.Toplevel(root)
-    ov.attributes("-fullscreen", True)
-    ov.attributes("-alpha", 0.15)
-    ov.configure(bg="black")
-    ov.attributes("-topmost", True)
-    cv = tk.Canvas(ov, cursor="crosshair", bg="black", highlightthickness=0)
-    cv.pack(fill="both", expand=True)
-    cv.create_text(ov.winfo_screenwidth() // 2, 30, fill="white",
-                   text="Click the colour you want  ·  Esc to cancel", font=("Segoe UI", 14))
-
-    def click(e):
-        x, y = e.x_root, e.y_root
-        ov.destroy()
-        root.after(60, lambda: on_done(grab.pixel(x, y)))
-
-    cv.bind("<Button-1>", click)
-    ov.bind("<Escape>", lambda e: ov.destroy())
-
-
-# ---------------------------------------------------------------- GUI ----
-class SetupWindow:
-    """Screenshot your screen, then drag the two boxes and click the colours on the picture."""
-
-    def __init__(self, app):
-        self.app = app
-        self.cfg = app.cfg
-        self.grab = app.grab
-        self.mode = None
-        self.target = None
-        self.shot = None
-        self.scale = 1.0
-        self.rect = None
-        self.start = None
-        self.tkimg = None
-
-        self.win = tk.Toplevel(app.root)
-        self.win.title("Setup for your screen")
-        self.win.configure(bg=BG)
-        self.win.attributes("-topmost", True)
-
-        top = tk.Frame(self.win, bg=BG)
-        top.pack(fill="x", padx=12, pady=(10, 4))
-        tk.Label(top, text="Show a Cast or Fishing bar in game, then hit Auto-detect. Do it once for each bar.",
-                 bg=BG, fg=TXT, font=("Segoe UI", 9)).pack(side="left")
-        tk.Button(top, text="✨ Auto-detect (4s)", command=self.capture, bg="#5a2fd6", fg="white",
-                  relief="flat", font=("Segoe UI", 9, "bold")).pack(side="right")
-
-        tools = tk.Frame(self.win, bg=BG)
-        tools.pack(fill="x", padx=12)
-        for text, mode, tgt in (("① Cast box", "region", "region1"), ("② Fishing box", "region", "region2"),
-                                ("Green", "color", "col_green"), ("Fill bar", "color", "col_fill"),
-                                ("Fish", "color", "col_fish"), ("Your bar", "color", "col_blue")):
-            tk.Button(tools, text=text, bg=INPUT, fg=TXT, relief="flat", font=("Segoe UI", 8, "bold"),
-                      command=lambda m=mode, t=tgt: self.set_mode(m, t)).pack(side="left", padx=3, pady=4)
-
-        self.status = tk.Label(self.win, text="Click “Capture screen” first.", bg=BG, fg=SUB, font=("Segoe UI", 9))
-        self.status.pack(anchor="w", padx=12)
-        self.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0, width=900, height=500)
-        self.canvas.pack(padx=12, pady=8)
-        self.canvas.bind("<Button-1>", self.on_down)
-        self.canvas.bind("<B1-Motion>", self.on_move)
-        self.canvas.bind("<ButtonRelease-1>", self.on_up)
-        tk.Button(self.win, text="Save & close", command=self.save, bg=INPUT, fg=TXT, relief="flat",
-                  font=("Segoe UI", 9, "bold")).pack(pady=(0, 12))
-
-    def capture(self):
-        self.status.config(text="Capturing in 4s — switch to the game and show a bar…")
-        self.win.update()
-        self.win.withdraw()
-        self.app.root.withdraw()
-        self.win.after(4000, self._grab)
-
-    def _grab(self):
-        sw, sh = self.app.root.winfo_screenwidth(), self.app.root.winfo_screenheight()
-        arr = self.grab.grab((0, 0, sw, sh))
-        self.app.root.deiconify()
-        self.win.deiconify()
-        self.win.lift()
-        if arr is None:
-            self.status.config(text="Capture failed.")
-            return
-        self.shot = Image.fromarray(arr)
-        self.scale = min(1.0, 1200.0 / self.shot.width)
-        disp = self.shot.resize((int(self.shot.width * self.scale), int(self.shot.height * self.scale)))
-        self.tkimg = ImageTk.PhotoImage(disp)
-        self.canvas.config(width=disp.width, height=disp.height)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tkimg)
-        self._auto()
-
-    def _auto(self):
-        """Find the bar + colours from the screenshot. Both bars live in the same panel (bottom-centre),
-        so the cast bar fixes BOTH regions; the fishing colours are only read inside that panel."""
-        arr = np.array(self.shot.convert("RGB"))
-        H, W, _ = arr.shape
-
-        def med(a, ys, xs):
-            return [int(np.median(a[ys, xs, 0])), int(np.median(a[ys, xs, 1])), int(np.median(a[ys, xs, 2]))]
-
-        # only ever look in the bottom-centre panel, never the scene (sky/water/clothes are blue at night)
-        bx1, bx2 = int(W * 0.26), int(W * 0.74)
-        by1, by2 = int(H * 0.74), int(H * 0.97)
-        sub = arr[by1:by2, bx1:bx2]
-        sr, sg, sb = sub[:, :, 0].astype(int), sub[:, :, 1].astype(int), sub[:, :, 2].astype(int)
-        done = []
-
-        # GREEN zone -> the Cast Power bar. Anchors the bar's position for BOTH skill checks.
-        green = (sg > 110) & (sg - sr > 30) & (sg - sb > 30)
-        gy, gx = np.where(green)
-        if len(gx) > 10:
-            cx = bx1 + int(np.median(gx))
-            cy = by1 + int(np.median(gy))
-            x1, x2 = max(0, cx - 340), min(W, cx + 340)
-            self.cfg["region1"] = [x1, max(0, cy - 26), x2 - x1, 52]
-            self.cfg["region2"] = [x1, max(0, cy - 36), x2 - x1, 74]   # fishing bar: same place, taller
-            self.cfg["col_green"] = med(sub, gy, gx)
-            row = arr[cy, x1:x2]
-            brown = (row[:, 0] > 75) & (row[:, 1] > 50) & (row[:, 2] < 95) & (row[:, 0] - row[:, 2] > 18)
-            if brown.any():
-                bi = np.where(brown)[0]
-                self.cfg["col_fill"] = [int(np.median(row[bi, 0])), int(np.median(row[bi, 1])), int(np.median(row[bi, 2]))]
-            done.append("Cast bar")
-
-        # FISH orange + your BLUE bar -> only inside the fishing region (the panel), so the scene can't fool it
-        rx, ry, rw, rh = self.cfg["region2"]
-        p = arr[ry:ry + rh, rx:rx + rw]
-        if p.size:
-            pr, pg, pb = p[:, :, 0].astype(int), p[:, :, 1].astype(int), p[:, :, 2].astype(int)
-            orange = (pr > 150) & (pr - pb > 55) & (pg > 40) & (pg < pr)
-            blue = (pb > 110) & (pb >= pr) & (pb - pr > 35) & (pb >= pg - 20)
-            oy, ox = np.where(orange)
-            byi, bxi = np.where(blue)
-            got = []
-            if len(ox) > 5:
-                self.cfg["col_fish"] = med(p, oy, ox)
-                got.append("fish")
-            if len(bxi) > 12:
-                self.cfg["col_blue"] = med(p, byi, bxi)
-                got.append("your bar")
-            if got:
-                done.append("Fishing " + "+".join(got))
-
-        save_cfg(self.cfg)
-        if done:
-            self.status.config(text="Got: " + " · ".join(done) + ".   Capture the other bar if needed, then Save & close.")
-            self._draw_regions()
-        else:
-            self.status.config(text="No bar spotted in the centre. Make sure a Cast or Fishing bar is clearly on screen, "
-                                    "then Auto-detect again (or set it by hand with the buttons).")
-
-    def _draw_regions(self):
-        for key, col, lbl in (("region1", ACC, "Cast"), ("region2", GREEN, "Fishing")):
-            x, y, w, h = self.cfg[key]
-            s = self.scale
-            self.canvas.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline=col, width=2)
-            self.canvas.create_text(x * s + 4, y * s - 8, anchor="w", text=lbl, fill=col, font=("Segoe UI", 9, "bold"))
-
-    def set_mode(self, mode, target):
-        self.mode = mode
-        self.target = target
-        self.status.config(text=("Drag a box over it." if mode == "region" else "Click the colour.") + "  (" + target + ")")
-
-    def on_down(self, e):
-        if self.shot is None or self.mode is None:
-            return
-        if self.mode == "region":
-            self.start = (e.x, e.y)
-            self.rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline=ACC, width=2)
-        else:
-            self._pick_at(e.x, e.y)
-
-    def on_move(self, e):
-        if self.mode == "region" and self.rect and self.start:
-            self.canvas.coords(self.rect, self.start[0], self.start[1], e.x, e.y)
-
-    def on_up(self, e):
-        if self.mode == "region" and self.start:
-            x0, y0 = self.start
-            rx, ry = int(min(x0, e.x) / self.scale), int(min(y0, e.y) / self.scale)
-            rw, rh = int(abs(e.x - x0) / self.scale), int(abs(e.y - y0) / self.scale)
-            if rw > 3 and rh > 3:
-                self.cfg[self.target] = [rx, ry, rw, rh]
-                save_cfg(self.cfg)
-                self.status.config(text="%s set: %dx%d @ %d,%d" % (self.target, rw, rh, rx, ry))
-            self.start = None
-            self.rect = None
-
-    def _pick_at(self, cx, cy):
-        ix, iy = int(cx / self.scale), int(cy / self.scale)
-        try:
-            rgb = self.shot.getpixel((ix, iy))[:3]
-        except Exception:
-            return
-        self.cfg[self.target] = list(rgb)
-        save_cfg(self.cfg)
-        self.status.config(text="%s colour: %s" % (self.target, tuple(rgb)))
-
-    def save(self):
-        for k in ("region1", "region2"):
-            if k in self.app.region_lbl:
-                self.app.region_lbl[k].config(text=self.app._region_text(k))
-        for k in ("col_fill", "col_green", "col_blue", "col_fish"):
-            if k in self.app.region_lbl:
-                self.app.region_lbl[k].config(bg=self.app._hex(k))
-        self.app.log("Setup saved for your screen.")
-        self.win.destroy()
-
-
-class App:
-    def __init__(self, lic=None):
-        self.cfg = load_cfg()
-        if not self.cfg.get("_green_cast"):   # move existing users onto the green-tracking cast once
-            self.cfg["cast_mode"] = "green"
-            self.cfg["_green_cast"] = True
-            save_cfg(self.cfg)
-        if not self.cfg.get("_gc_v3"):        # release as soon as the green moves at all (beats overshoot)
-            self.cfg["green_cover"] = 0.95
-            self.cfg["_gc_v3"] = True
-            save_cfg(self.cfg)
-        self.lic = lic or {}
-        self.grab = Grabber()
-        self.worker = None
-        self.logq = queue.Queue()
-        self._last_copy_sig = ""
-
-        self.casts = 0
-        self.catches = 0
-        self.root = tk.Tk()
-        self.root.title("XZX Fishing Macro")
-        self.root.overrideredirect(True)          # borderless, like the other XZX macros
-        self.root.configure(bg=BG)
-        w, h = 470, 852
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        self.root.geometry("%dx%d+%d+%d" % (w, h, (sw - w) // 2, (sh - h) // 3))
-        self.root.attributes("-topmost", True)
-        self.vars = {}
-        self._build()
-        self.root.after(120, self._drain_log)
-        self.root.bind("<F6>", lambda e: self.toggle())
-        threading.Thread(target=self._hotkey_loop, daemon=True).start()
-        if self.lic.get("key"):
-            threading.Thread(target=self._heartbeat, daemon=True).start()
-
-    def _hotkey_loop(self):
-        """System-wide F6 start/stop, so you can trigger it while FiveM is focused."""
-        try:
-            u = ctypes.windll.user32
-            if not u.RegisterHotKey(None, 1, 0, 0x75):   # 0x75 = VK_F6
-                return
-            msg = wintypes.MSG()
-            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-                if msg.message == 0x0312:                # WM_HOTKEY
-                    try:
-                        self.root.after(0, self.toggle)
-                    except Exception:
-                        break
-        except Exception:
-            pass
-
-    def _round_rect(self, cv, x1, y1, x2, y2, r, fill):
-        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        return cv.create_polygon(pts, smooth=True, splinesteps=24,
-                                 fill=fill, outline=fill, tags="rr")
-
-    def _vgrad(self, cv, w, h, c1, c2, steps=48):
-        cv.delete("grad")
-        r1, g1, b1 = self.root.winfo_rgb(c1)
-        r2, g2, b2 = self.root.winfo_rgb(c2)
-        for i in range(steps):
-            t = i / (steps - 1)
-            r = int((r1 + (r2 - r1) * t) / 256)
-            g = int((g1 + (g2 - g1) * t) / 256)
-            b = int((b1 + (b2 - b1) * t) / 256)
-            y0 = int(h * i / steps)
-            y1 = int(h * (i + 1) / steps) + 1
-            cv.create_rectangle(0, y0, w, y1, outline="", fill="#%02x%02x%02x" % (r, g, b), tags="grad")
-        cv.tag_lower("grad")
-
-    def _paint_power(self):
-        cv = getattr(self, "powerbar", None)
-        if not cv:
-            return
-        cv.delete("all")
-        w = cv.winfo_width()
-        if w <= 1:
-            return
-        running = bool(self.worker and self.worker.is_alive())
-        self._round_rect(cv, 0, 0, w, 8, 4, INPUT)
-        if running:
-            self._round_rect(cv, 0, 0, w, 8, 4, GREEN)
-        else:
-            self._round_rect(cv, 0, 0, max(8, int(w * 0.18)), 8, 4, ACC)
-
-    def _card(self, parent, pad=14):
-        """A rounded panel (XZX Alt Click look). Returns the inner frame to fill."""
-        wrap = tk.Frame(parent, bg=BG)
-        wrap.pack(fill="x", padx=12, pady=6)
-        cv = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0, height=10)
-        cv.pack(fill="x")
-        inner = tk.Frame(cv, bg=CARD)
-        win = cv.create_window((pad, pad), window=inner, anchor="nw")
-
-        def _redraw(_=None):
-            w = cv.winfo_width()
-            if w <= 1:
-                return
-            inner.update_idletasks()
-            ih = inner.winfo_reqheight()
-            cv.configure(height=ih + pad * 2)
-            cv.itemconfigure(win, width=w - pad * 2)
-            cv.delete("rr")
-            self._round_rect(cv, 1, 1, w - 2, ih + pad * 2 - 1, 16, CARD)
-            cv.tag_lower("rr")
-        inner.bind("<Configure>", _redraw)
-        cv.bind("<Configure>", _redraw)
-        return inner
-
-    def _tile(self, parent, name):
-        """A small rounded stat tile. Returns the value label."""
-        cv = tk.Canvas(parent, bg=BG, highlightthickness=0, bd=0, height=62, width=10)
-        cv.pack(side="left", expand=True, fill="x", padx=4)
-        inner = tk.Frame(cv, bg=CARD)
-        win = cv.create_window((0, 0), window=inner, anchor="nw")
-        tk.Label(inner, text=name, bg=CARD, fg=DIM,
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=12, pady=(11, 0))
-        val = tk.Label(inner, text="0", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 16))
-        val.pack(anchor="w", padx=12, pady=(0, 11))
-
-        def _redraw(_=None):
-            w = cv.winfo_width()
-            if w <= 1:
-                return
-            cv.itemconfigure(win, width=w)
-            cv.delete("rr")
-            self._round_rect(cv, 1, 1, w - 2, 61, 14, CARD)
-            cv.tag_lower("rr")
-        cv.bind("<Configure>", _redraw)
-        return val
-
-    def _drag_bind(self, widget):
-        widget.bind("<Button-1>", lambda e: setattr(self, "_drag", (e.x_root, e.y_root,
-                    self.root.winfo_x(), self.root.winfo_y())))
-        widget.bind("<B1-Motion>", self._on_drag)
-
-    def _on_drag(self, e):
-        if hasattr(self, "_drag"):
-            x0, y0, wx, wy = self._drag
-            self.root.geometry("+%d+%d" % (wx + e.x_root - x0, wy + e.y_root - y0))
-
-    # ---- licence heartbeat: logs out / self-destructs when the key is pulled, and reports copies ----
-    def _heartbeat(self):
-        self._report_copies()
-        while True:
-            time.sleep(60)
-            code = self.lic.get("key")
-            if not code:
-                continue
-            r = api("/api/check", {"code": code, "session": self.lic.get("session", ""),
+def run_login():
+    """Discord link + access key. Returns {"key","session"} on success, or None if cancelled.
+    A key locked to another PC simply refuses to run here; nothing on the computer is changed."""
+    T = THEME
+    saved = load_license()
+    if saved.get("key"):                           # already activated on this PC and still valid -> skip login
+        r = lic_api("/api/check", {"code": saved["key"], "session": saved.get("session", ""),
                                    "product": PRODUCT, "hwid": get_hwid()})
-            if r.startswith("REVOKED|"):
-                self.root.after(0, lambda rsn=r.split("|", 1)[1]: self._revoked(rsn))
-                return
-            self._report_copies()
+        if not r.startswith("REVOKED|") and not r.startswith("DENIED|"):
+            return {"key": saved["key"], "session": saved.get("session", "")}
 
-    def _revoked(self, reason):
-        if self.worker:
-            self.worker.stop()
-        remove = any(k in reason for k in ("DISABLED", "DELETED", "EXPIRED", "DEVICE"))
-        try:
-            messagebox.showwarning("XZX Fishing", "You've been logged out.\n\n%s\n\n%s" % (
-                reason, "This copy is being removed." if remove else
-                ("Open a ticket in " + DISCORD_INVITE + " if this is a mistake.")))
-        except Exception:
-            pass
-        if remove:
-            self_destruct()
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-        os._exit(0)
-
-    def _report_copies(self):
-        if not is_frozen():
-            return
-        name = os.path.basename(sys.executable)
-        running = sys.executable.lower()
-        found = []
-        roots = [os.path.dirname(sys.executable)]
-        up = os.environ.get("USERPROFILE", "")
-        if up:
-            for s in ("Desktop", "Downloads", "Documents", "OneDrive\\Desktop", "OneDrive\\Downloads"):
-                roots.append(os.path.join(up, s))
-        try:
-            for root in roots:
-                if not os.path.isdir(root):
-                    continue
-                for dp, _dirs, files in os.walk(root):
-                    for fn in files:
-                        if fn.lower() == name.lower():
-                            p = os.path.join(dp, fn)
-                            if p.lower() != running:
-                                found.append(p)
-                    if len(found) > 50:
-                        break
-        except Exception:
-            pass
-        if not found:
-            self._last_copy_sig = ""
-            return
-        sig = "|".join(sorted(p.lower() for p in found))
-        if sig == self._last_copy_sig:
-            return
-        self._last_copy_sig = sig
-        api("/api/report", {"code": self.lic.get("key", ""), "session": self.lic.get("session", ""),
-                            "product": PRODUCT, "count": len(found), "hwid": get_hwid(),
-                            "paths": "\n".join(found)[:1500]})
-
-    def _build(self):
-        self.region_lbl = {}
-
-        # ---- header bar with purple glow (drag to move, X to close) ----
-        W = 470
-        hdr = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0, height=78)
-        hdr.pack(fill="x")
-        self._vgrad(hdr, W, 78, GLOW, BG)
-        hdr.create_text(22, 30, text="XZX", anchor="w", fill=ACC,
-                        font=("Segoe UI Semibold", 22, "bold"))
-        hdr.create_text(78, 24, text="Fishing Macro", anchor="w", fill=TXT,
-                        font=("Segoe UI Semibold", 14))
-        hdr.create_text(79, 48, text="Auto cast · track · collect", anchor="w", fill=SUB,
-                        font=("Segoe UI", 8))
-        close = tk.Label(hdr, text="✕", bg=GLOW, fg=SUB, font=("Segoe UI", 12))
-        close.bind("<Button-1>", lambda e: self._close())
-        hdr.create_window(W - 18, 20, window=close)
-        self.pill = tk.Label(hdr, text="IDLE", bg=INPUT, fg=SUB,
-                             font=("Segoe UI", 8, "bold"), padx=10, pady=3)
-        hdr.create_window(W - 50, 20, window=self.pill, anchor="e")
-        self._drag_bind(hdr)
-
-        # ---- hero status card ----
-        hero = self._card(self.root, pad=14)
-        top = tk.Frame(hero, bg=CARD)
-        top.pack(fill="x")
-        left = tk.Frame(top, bg=CARD)
-        left.pack(side="left", anchor="w")
-        tk.Label(left, text="STATUS", bg=CARD, fg=DIM, font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.state_lbl = tk.Label(left, text="READY", bg=CARD, fg=TXT, font=("Segoe UI Semibold", 22))
-        self.state_lbl.pack(anchor="w")
-        tk.Label(left, text="Link set · press START or F6", bg=CARD, fg=SUB,
-                 font=("Segoe UI", 9)).pack(anchor="w")
-        # power bar (accent while running)
-        self.powerbar = tk.Canvas(hero, bg=CARD, highlightthickness=0, bd=0, height=8)
-        self.powerbar.pack(fill="x", pady=(12, 0))
-        self.powerbar.bind("<Configure>", lambda e: self._paint_power())
-
-        # ---- stat tiles: casts / catches ----
-        stats = tk.Frame(self.root, bg=BG)
-        stats.pack(fill="x", padx=8)
-        self.stat_lbl = {}
-        for key, name in (("casts", "CASTS"), ("catches", "CATCHES")):
-            self.stat_lbl[key] = self._tile(stats, name)
-
-        # ---- START / STOP ----
-        bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=12, pady=8)
-        self.btn = tk.Button(bar, text="▶  START", command=self.toggle, bg=ACC2, fg="white",
-                             activebackground=ACC, activeforeground="white", relief="flat",
-                             font=("Segoe UI Semibold", 12))
-        self.btn.pack(side="left", expand=True, fill="x", ipady=12, padx=(0, 4))
-        self.stopbtn = tk.Button(bar, text="■  STOP", command=self.stop, bg=INPUT, fg=TXT,
-                                 activebackground=CARD, activeforeground=TXT, relief="flat",
-                                 font=("Segoe UI Semibold", 12))
-        self.stopbtn.pack(side="left", expand=True, fill="x", ipady=8, padx=(4, 0))
-
-        # ---- regions + colours ----
-        setup = self._card(self.root, pad=12)
-        tk.Label(setup, text="REGIONS & COLOURS", bg=CARD, fg="#6f6489",
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        for key, name in (("region1", "Skill check 1 (fill + green)"),
-                          ("region2", "Skill check 2 (fish + bar)")):
-            row = tk.Frame(setup, bg=CARD)
-            row.pack(fill="x", pady=3)
-            tk.Label(row, text=name, bg=CARD, fg=TXT, width=24, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-            self.region_lbl[key] = tk.Label(row, text=self._region_text(key), bg=CARD, fg=SUB,
-                                            width=14, anchor="w", font=("Consolas", 8))
-            self.region_lbl[key].pack(side="left")
-            self._chip(row, "Set", lambda k=key: self._set_region(k)).pack(side="right")
-        for key, name in (("col_fill", "Filling bar"), ("col_green", "Green zone"),
-                          ("col_blue", "Blue bar (yours)"), ("col_fish", "Orange fish")):
-            row = tk.Frame(setup, bg=CARD)
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text=name, bg=CARD, fg=TXT, width=20, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-            sw = tk.Label(row, text="   ", bg=self._hex(key), relief="flat", width=4)
-            sw.pack(side="left", padx=6)
-            self.region_lbl[key] = sw
-            self._chip(row, "Pick", lambda k=key: self._pick_color(k)).pack(side="right")
-
-        # ---- settings (scrollable so every field fits) ----
-        sc = self._card(self.root, pad=10)
-        tk.Label(sc, text="SETTINGS", bg=CARD, fg="#6f6489", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        cv = tk.Canvas(sc, bg=CARD, highlightthickness=0, height=168)
-        cv.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(sc, orient="vertical", command=cv.yview)
-        sb.pack(side="right", fill="y")
-        cv.configure(yscrollcommand=sb.set)
-        box = tk.Frame(cv, bg=CARD)
-        cv.create_window((0, 0), window=box, anchor="nw", width=392)
-        box.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-
-        self._num(box, "cast_key", "Cast key (hold)")
-        self._choice(box, "cast_mode", "Cast mode", ["front", "green", "timed"])
-        self._num(box, "cast_hold_s", "Hold E for (s) ← tune to green")
-        self._num(box, "release_point", "Release point in green (0-1)")
-        self._num(box, "green_cover", "Green release (0-1) ← lower = later")
-        self._num(box, "release_latency", "Release latency comp (s)")
-        self._choice(box, "reel_mode", "Reel mode", ["two_key", "hold"])
-        self._num(box, "left_key", "Left key")
-        self._num(box, "right_key", "Right key")
-        self._choice(box, "hold_input", "Hold-mode input", ["mouse_left", "mouse_right", "mouse_middle"])
-        self._choice(box, "hold_moves", "Hold moves bar", ["right", "left"])
-        self._num(box, "deadzone_px", "Deadzone min (px)")
-        self._num(box, "deadzone_frac", "Deadzone (fraction)")
-        self._num(box, "prediction_lead", "Prediction lead (s)")
-        self._num(box, "reel_gain", "Reel push strength")
-        self._num(box, "reel_max_hold", "Reel max push (s)")
-        self._num(box, "tolerance", "Colour tolerance")
-        self._num(box, "min_pixels", "Min pixels / column")
-        self._num(box, "fish_timeout", "Fish lost timeout (s)")
-        self._check(box, "auto_recast", "Auto recast after reel")
-        self._num(box, "prime_key", "Prime key (pressed before cast)")
-        self._num(box, "prime_delay", "Prime delay (s)")
-        self._num(box, "claim_key", "Claim key (after catch)")
-        self._num(box, "claim_delay", "Claim delay (s)")
-        self._num(box, "claim_presses", "Claim presses")
-        self._num(box, "recast_delay", "Delay between runs (s)")
-
-        # ---- tools strip ----
-        tk.Label(self.root, text="TOOLS   ·   F6 starts / stops anywhere", bg=BG, fg=DIM,
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=20, pady=(4, 2))
-        foot = tk.Frame(self.root, bg=BG)
-        foot.pack(fill="x", padx=18, pady=(0, 4))
-        self._chip(foot, "⚙ Setup", lambda: SetupWindow(self)).pack(side="left")
-        self._chip(foot, "🎯 Test run", self._autotune).pack(side="left", padx=6)
-        self._chip(foot, "Test", self._test).pack(side="left", padx=6)
-        self._chip(foot, "Preview", self._preview).pack(side="left")
-
-        self.logbox = tk.Text(self.root, height=5, bg="#070510", fg=GREEN, bd=0,
-                              insertbackground=GREEN, font=("Consolas", 9))
-        self.logbox.pack(fill="both", expand=True, padx=14, pady=(4, 6))
-        tk.Label(self.root, text="XZX Macro  ·  by Coop", bg=BG, fg=DIM,
-                 font=("Segoe UI", 7)).pack(pady=(0, 10))
-        self.log("Ready. Set the two regions, pick the colours, then START.")
-        self.root.after(80, self._paint_power)
-
-    def _chip(self, parent, text, cmd):
-        return tk.Button(parent, text=text, command=cmd, bg=INPUT, fg=TXT, relief="flat",
-                         activebackground=CARD, activeforeground=TXT, font=("Segoe UI", 8, "bold"), padx=10)
-
-    # ----- small widget helpers -----
-    def _num(self, parent, key, label):
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=1)
-        tk.Label(row, text=label, bg=CARD, fg=TXT, width=26, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-        v = tk.StringVar(value=str(self.cfg[key]))
-        self.vars[key] = v
-        tk.Entry(row, textvariable=v, width=10, bg=INPUT, fg=TXT, insertbackground=TXT,
-                 relief="flat", justify="center").pack(side="right", ipady=2)
-        v.trace_add("write", lambda *a, k=key: self._on_change(k))
-
-    def _choice(self, parent, key, label, opts):
-        row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", pady=1)
-        tk.Label(row, text=label, bg=CARD, fg=TXT, width=26, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-        v = tk.StringVar(value=str(self.cfg[key]))
-        self.vars[key] = v
-        ttk.Combobox(row, textvariable=v, values=opts, width=11, state="readonly").pack(side="right")
-        v.trace_add("write", lambda *a, k=key: self._on_change(k))
-
-    def _check(self, parent, key, label):
-        v = tk.BooleanVar(value=bool(self.cfg[key]))
-        self.vars[key] = v
-        tk.Checkbutton(parent, text=label, variable=v, bg=CARD, fg=TXT, anchor="w",
-                       selectcolor=INPUT, activebackground=CARD, activeforeground=TXT,
-                       font=("Segoe UI", 9), command=lambda k=key: self._on_change(k)).pack(fill="x", pady=1)
-
-    def _close(self):
-        if self.worker:
-            self.worker.stop()
-        self.root.destroy()
-        os._exit(0)
-
-    def _on_change(self, key):
-        v = self.vars[key].get()
-        if key in ("release_point", "release_latency", "deadzone_frac", "prediction_lead",
-                   "fish_timeout", "recast_delay", "prime_delay", "cast_hold_s", "claim_delay", "reel_gain", "reel_max_hold"):
-            try:
-                v = float(v)
-            except ValueError:
-                return
-        elif key in ("deadzone_px", "tolerance", "min_pixels"):
-            try:
-                v = int(float(v))
-            except ValueError:
-                return
-        self.cfg[key] = v
-        save_cfg(self.cfg)
-
-    def _region_text(self, key):
-        x, y, w, h = self.cfg[key]
-        return "%dx%d @ %d,%d" % (w, h, x, y)
-
-    def _hex(self, key):
-        r, g, b = self.cfg[key]
-        return "#%02x%02x%02x" % (r, g, b)
-
-    def _set_region(self, key):
-        self.root.withdraw()
-        time.sleep(0.2)
-
-        def done(reg):
-            if reg[2] > 3 and reg[3] > 3:
-                self.cfg[key] = reg
-                save_cfg(self.cfg)
-                self.region_lbl[key].config(text=self._region_text(key))
-                self.log("%s region set: %s" % (key, self._region_text(key)))
-            self.root.deiconify()
-        pick_region(self.root, done)
-
-    def _pick_color(self, key):
-        self.root.withdraw()
-        time.sleep(0.2)
-
-        def done(rgb):
-            self.cfg[key] = list(rgb)
-            save_cfg(self.cfg)
-            self.region_lbl[key].config(bg=self._hex(key))
-            self.log("%s colour: %s" % (key, rgb))
-            self.root.deiconify()
-        pick_color(self.root, self.grab, done)
-
-    # ----- actions -----
-    def toggle(self):
-        if self.worker and self.worker.is_alive():
-            self.stop()
-        else:
-            self.worker = Worker(self.cfg, self.log)
-            self.worker.start()
-            self.btn.config(text="▶  RUNNING")
-            self.pill.config(text="RUNNING", fg=GREEN)
-            self.state_lbl.config(text="RUNNING", fg=GREEN)
-            self._paint_power()
-            self.log("Started.")
-
-    def stop(self):
-        if self.worker:
-            self.worker.stop()
-            self.worker = None
-        self.btn.config(text="▶  START")
-        self.pill.config(text="IDLE", fg=SUB)
-        self.state_lbl.config(text="READY", fg=TXT)
-        self._paint_power()
-        self.log("Stopped.")
-
-    def _autotune(self):
-        if self.worker and self.worker.is_alive():
-            self.log("Stop the macro first, then Test run.")
-            return
-        threading.Thread(target=self._autotune_run, daemon=True).start()
-
-    def _autotune_run(self):
-        """Test run: do one cast, LEARN the charge colour by watching it grow, measure its speed,
-        and set the release lead so the cast lands on green. Switches cast to the precise 'front' mode."""
-        c = self.cfg
-        g = Grabber()
-        reg = tuple(c["region1"])
-        for i in (3, 2, 1):
-            self.log("Test run: switch to FiveM and get ready… %d" % i)
-            time.sleep(1)
-        if c.get("prime_key"):
-            tap(c["prime_key"])
-            time.sleep(c.get("prime_delay", 0.4))
-        base = g.grab(reg)
-        if base is None:
-            self.log("Test run: couldn't capture the screen.")
-            return
-        press(c["cast_key"], True)
-        frames, times = [], []
-        t0 = time.time()
-        while time.time() - t0 < 1.4:
-            a = g.grab(reg)
-            if a is not None:
-                frames.append(a.astype(int))
-                times.append(time.time() - t0)
-            time.sleep(0.02)
-        press(c["cast_key"], False)
-        if len(frames) < 5:
-            self.log("Test run: not enough frames — try again.")
-            return
-        # the charge = pixels that got much brighter from the start to the end of the hold
-        b = base.astype(int)
-        late = frames[-1]
-        bright = late.sum(axis=2) - b.sum(axis=2)
-        ys, xs = np.where(bright > 90)
-        if len(xs) < 20:
-            self.log("Test run: couldn't see the charge grow. Make sure the Cast bar came up during the run.")
-            return
-        col = [int(np.median(late[ys, xs, ch])) for ch in range(3)]
-        self.cfg["col_fill"] = col
-        # measure the charge speed from how the fill front advanced across the frames
-        fronts = []
-        for a in frames:
-            fm = column_mask(a.astype(np.uint8), col, c["tolerance"], c["min_pixels"])
-            tr = np.where(fm)[0]
-            if len(tr):
-                start = int(tr[0])
-                front = start
-                for x in range(start, len(fm)):
-                    if fm[x]:
-                        front = x
-                    else:
-                        break
-                fronts.append(front)
-            else:
-                fronts.append(0)
-        spd = 0.0
-        if fronts[-1] > fronts[0] and times[-1] > times[0]:
-            spd = (fronts[-1] - fronts[0]) / (times[-1] - times[0])   # px per second
-        lead = int(min(70, max(8, spd * 0.06)))                      # release ~60 ms of travel early
-        self.cfg["release_lead_px"] = lead
-        self.cfg["cast_mode"] = "front"
-        save_cfg(self.cfg)
-        self.root.after(0, lambda: self.vars["cast_mode"].set("front") if "cast_mode" in self.vars else None)
-        self.log("Test run done ✓  Learned charge colour %s, speed %d px/s, release lead %d px. Cast set to 'front'." % (
-            tuple(col), int(spd), lead))
-
-    def _test(self):
-        c = self.cfg
-        a1 = self.grab.grab(tuple(c["region1"]))
-        a2 = self.grab.grab(tuple(c["region2"]))
-        g = int(column_mask(a1, c["col_green"], c["tolerance"], c["min_pixels"]).sum()) if a1 is not None else 0
-        fl = int(column_mask(a1, c["col_fill"], c["tolerance"], c["min_pixels"]).sum()) if a1 is not None else 0
-        fi = int(column_mask(a2, c["col_fish"], c["tolerance"], c["min_pixels"]).sum()) if a2 is not None else 0
-        bx = int(column_mask(a2, c["col_blue"], c["tolerance"], c["min_pixels"]).sum()) if a2 is not None else 0
-        self.log("Screen %dx%d.  region1=%s  region2=%s" % (
-            self.root.winfo_screenwidth(), self.root.winfo_screenheight(), c["region1"], c["region2"]))
-        self.log("Test -> green:%d  fill:%d  fish:%d  blue:%d  (a number > 0 means it sees that colour)" % (g, fl, fi, bx))
-        if g == 0 and fl == 0 and fi == 0 and bx == 0:
-            self.log("Saw NOTHING. Open a fishing bar on screen, then: 1) Set each region over its bar  2) Pick each colour.")
-        elif g == 0 and fi == 0:
-            self.log("Cast green / fish not seen — Set the regions over the bars and re-Pick those colours.")
-        else:
-            self.log("Detection OK. If a key isn't landing in game, run the .exe as administrator.")
-
-    def _preview(self):
-        win = tk.Toplevel(self.root)
-        win.title("Live preview")
-        win.configure(bg="black")
-        lbl = tk.Label(win, bg="black")
-        lbl.pack()
-
-        def tick():
-            if not win.winfo_exists():
-                return
-            crops = []
-            for key in ("region1", "region2"):
-                a = self.grab.grab(tuple(self.cfg[key]))
-                if a is not None:
-                    im = Image.fromarray(a)
-                    scale = max(1, 760 // max(1, im.width))
-                    im = im.resize((im.width * scale, im.height * scale), Image.NEAREST)
-                    crops.append(im)
-            if crops:
-                h = sum(im.height for im in crops) + 8
-                w = max(im.width for im in crops)
-                sheet = Image.new("RGB", (w, h), "black")
-                y = 0
-                for im in crops:
-                    sheet.paste(im, (0, y))
-                    y += im.height + 8
-                tkimg = ImageTk.PhotoImage(sheet)
-                lbl.config(image=tkimg)
-                lbl.image = tkimg
-            win.after(120, tick)
-        tick()
-
-    def log(self, msg):
-        self.logq.put(msg)
-
-    def _drain_log(self):
-        try:
-            while True:
-                msg = self.logq.get_nowait()
-                self.logbox.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
-                self.logbox.see("end")
-                if "Cast released" in msg:
-                    self.casts += 1
-                    self.stat_lbl["casts"].config(text=str(self.casts))
-                elif "Reel finished" in msg:
-                    self.catches += 1
-                    self.stat_lbl["catches"].config(text=str(self.catches))
-                if "Skill check 1" in msg:
-                    self.state_lbl.config(text="CASTING", fg=ACC)
-                elif "Tracking fish" in msg:
-                    self.state_lbl.config(text="REELING", fg=GREEN)
-        except queue.Empty:
-            pass
-        self.root.after(120, self._drain_log)
-
-    def run(self):
-        self.root.mainloop()
-        if self.worker:
-            self.worker.stop()
-
-
-def run_login(cfg):
-    """XZX login: link Discord, enter the access key. Returns {session, key} or None."""
     result = {}
-    state = {"session": cfg.get("_session", ""), "link": "none"}
-
+    state = {"session": saved.get("session", ""), "link": "none"}
     win = tk.Tk()
-    win.title("XZX Fishing — Login")
-    win.configure(bg=BG)
-    win.geometry("420x400")
+    apply_theme(win)
+    win.title(APP_TITLE + " - Login")
+    win.configure(bg=T["bg"])
+    win.geometry("420x360")
     win.resizable(False, False)
 
-    def _lgrad(cv, w, h, c1, c2, steps=48):
-        r1, g1, b1 = win.winfo_rgb(c1)
-        r2, g2, b2 = win.winfo_rgb(c2)
-        for i in range(steps):
-            t = i / (steps - 1)
-            col = "#%02x%02x%02x" % (int((r1 + (r2 - r1) * t) / 256),
-                                     int((g1 + (g2 - g1) * t) / 256),
-                                     int((b1 + (b2 - b1) * t) / 256))
-            cv.create_rectangle(0, int(h * i / steps), w, int(h * (i + 1) / steps) + 1,
-                                outline="", fill=col)
+    tk.Label(win, text="XZX", bg=T["bg"], fg=T["accent"], font=("Segoe UI Semibold", 26, "bold")).pack(pady=(22, 0))
+    tk.Label(win, text="Fishing Macro", bg=T["bg"], fg=T["fg"], font=("Segoe UI Semibold", 13)).pack()
+    tk.Label(win, text="Link your Discord, then enter your key", bg=T["bg"], fg=T["muted"],
+             font=("Segoe UI", 9)).pack(pady=(4, 0))
 
-    head = tk.Canvas(win, bg=BG, highlightthickness=0, bd=0, height=96)
-    head.pack(fill="x")
-    _lgrad(head, 420, 96, GLOW, BG)
-    head.create_text(210, 40, text="XZX", fill=ACC, font=("Segoe UI Semibold", 26, "bold"))
-    head.create_text(210, 70, text="Fishing Macro", fill=TXT, font=("Segoe UI Semibold", 13))
-    tk.Label(win, text="Link your Discord, then enter your key", bg=BG, fg=SUB,
-             font=("Segoe UI", 9)).pack(pady=(6, 0))
-
-    discord_btn = tk.Button(win, text="Link Discord account", bg=INPUT, fg=TXT,
-                            activebackground=CARD, activeforeground=TXT, relief="flat",
-                            font=("Segoe UI", 10), width=30)
-    discord_btn.pack(pady=(18, 10), ipady=6)
-
-    key_var = tk.StringVar(value=cfg.get("_key", ""))
-    entry = tk.Entry(win, textvariable=key_var, bg=INPUT, fg=TXT, insertbackground=TXT,
+    discord_btn = tk.Button(win, text="Link Discord account", bg=T["panel2"], fg=T["fg"],
+                            relief="flat", font=("Segoe UI", 10), width=30)
+    discord_btn.pack(pady=(16, 8), ipady=5)
+    key_var = tk.StringVar(value=saved.get("key", ""))
+    entry = tk.Entry(win, textvariable=key_var, bg=T["panel2"], fg=T["fg"], insertbackground=T["fg"],
                      justify="center", font=("Consolas", 12), width=26)
-    entry.pack(ipady=6)
-
+    entry.pack(ipady=5)
     unlock = tk.Button(win, text="Unlock", bg="#5a2fd6", fg="white", relief="flat",
-                       activebackground=ACC, font=("Segoe UI", 11, "bold"), width=30)
-    unlock.pack(pady=12, ipady=6)
+                       font=("Segoe UI", 11, "bold"), width=30)
+    unlock.pack(pady=12, ipady=5)
+    status = tk.Label(win, text="", bg=T["bg"], fg=T["muted"], font=("Segoe UI", 9), wraplength=380)
+    status.pack()
+    tk.Button(win, text="Need help?  Join " + DISCORD_INVITE, bg=T["bg"], fg=T["accent"],
+              relief="flat", bd=0, command=lambda: webbrowser.open("https://" + DISCORD_INVITE)).pack(pady=(6, 0))
 
-    status = tk.Label(win, text="", bg=BG, fg=SUB, font=("Segoe UI", 9), wraplength=380)
-    status.pack(pady=4)
-    tk.Button(win, text="Need help?  Join " + DISCORD_INVITE, bg=BG, fg=ACC, relief="flat",
-              activebackground=BG, activeforeground=ACC, bd=0,
-              command=lambda: webbrowser.open("https://" + DISCORD_INVITE)).pack(pady=(6, 0))
-
-    def set_status(t, color=SUB):
-        status.config(text=t, fg=color)
+    def set_status(t, c=None):
+        status.config(text=t, fg=c or T["muted"])
 
     def poll():
         if state["link"] == "linked" or not state["session"]:
             return
-        r = api("/api/auth/status?s=" + urllib.parse.quote(state["session"]))
+        r = lic_api("/api/auth/status?s=" + urllib.parse.quote(state["session"]))
         if r.startswith("LINKED|"):
             parts = r.split("|")
             state["link"] = "linked"
             discord_btn.config(text="✓ Linked as " + (parts[1] if len(parts) > 1 else "you"))
-            set_status("Linked. Enter your key and press Unlock.", GREEN)
+            set_status("Linked. Enter your key and press Unlock.", T["green"])
         elif r == "PENDING":
-            set_status("Waiting for Discord…")
+            set_status("Waiting for Discord...")
             win.after(1500, poll)
-        elif r.startswith("ERROR|"):
-            set_status(r.split("|", 1)[1], RED)
         elif r == "OFF":
             state["link"] = "off"
         else:
-            set_status("Link expired — click Link Discord again.", RED)
+            set_status("Link expired - click Link Discord again.", T["red"])
 
     def do_link():
-        r = api("/api/auth/new", {})
+        r = lic_api("/api/auth/new", {})
         if r.startswith("OK|"):
             _, sess, url = r.split("|", 2)
             state["session"] = sess
             webbrowser.open(url)
-            set_status("Finish linking in your browser…")
+            set_status("Finish linking in your browser...")
             win.after(1500, poll)
         elif r.startswith("OFF"):
             state["link"] = "off"
-            set_status("Discord linking is off — just enter your key.", ACC)
+            set_status("Discord linking is off - just enter your key.", T["accent"])
         else:
-            set_status("Couldn't start linking. Try again.", RED)
+            set_status("Couldn't start linking. Try again.", T["red"])
 
     def do_unlock():
         code = key_var.get().strip()
         if not code:
-            set_status("Enter your access key.", RED)
+            set_status("Enter your access key.", T["red"])
             return
-        set_status("Checking licence…")
+        set_status("Checking licence...")
         win.update_idletasks()
-        r = api("/api/activate", {"code": code, "session": state["session"],
-                                  "product": PRODUCT, "hwid": get_hwid()})
+        r = lic_api("/api/activate", {"code": code, "session": state["session"],
+                                      "product": PRODUCT, "hwid": get_hwid()})
         if r.startswith("OK|"):
-            cfg["_session"] = state["session"]
-            cfg["_key"] = code
-            cfg["_hwid"] = get_hwid()
-            save_cfg(cfg)
-            result["session"] = state["session"]
+            save_license({"key": code, "session": state["session"], "hwid": get_hwid()})
             result["key"] = code
+            result["session"] = state["session"]
             win.destroy()
             return
         msg = r.split("|", 1)[1] if "|" in r else r
         if "LOCKED TO ANOTHER DEVICE" in msg:
-            set_status("This key is locked to another PC — removing this copy…", RED)
-            win.update_idletasks()
-            self_destruct()
-            win.after(1500, lambda: os._exit(0))
+            set_status("This key is locked to another PC, so it won't run here.", T["red"])
         else:
-            set_status("Access denied: " + msg, RED)
-            key_var.set("")
+            set_status("Access denied: " + msg, T["red"])
+        key_var.set("")
 
     discord_btn.config(command=do_link)
     unlock.config(command=do_unlock)
     entry.bind("<Return>", lambda e: do_unlock())
-
     if state["session"]:
-        set_status("Checking your Discord link…")
         win.after(400, poll)
-
     win.mainloop()
-    return result if result.get("key") else None
+    return result or None
+
+
+# --------------------------------------------------------------------------
+# Input
+# --------------------------------------------------------------------------
+class Inputs:
+    def __init__(self):
+        self.held = set()
+        self.pdi = None
+        try:
+            import pydirectinput
+            pydirectinput.PAUSE = 0
+            pydirectinput.FAILSAFE = False
+            self.pdi = pydirectinput
+        except Exception:
+            pass
+        from pynput.keyboard import Controller as KC, Key
+        from pynput.mouse import Controller as MC, Button
+        self.kb, self.ms, self.Key, self.Button = KC(), MC(), Key, Button
+
+    def _pk(self, name):
+        if len(name) == 1:
+            return name
+        return getattr(self.Key, name, name)
+
+    def down(self, name):
+        if name in self.held:
+            return
+        self.held.add(name)
+        if name == "mouse_left":
+            self.pdi.mouseDown() if self.pdi else self.ms.press(self.Button.left)
+        else:
+            self.pdi.keyDown(name) if self.pdi else self.kb.press(self._pk(name))
+
+    def up(self, name):
+        if name not in self.held:
+            return
+        self.held.discard(name)
+        if name == "mouse_left":
+            self.pdi.mouseUp() if self.pdi else self.ms.release(self.Button.left)
+        else:
+            self.pdi.keyUp(name) if self.pdi else self.kb.release(self._pk(name))
+
+    def tap(self, name, dur=0.05):
+        self.down(name)
+        time.sleep(dur)
+        self.up(name)
+
+    def drive(self, direction, left, right):
+        """direction: -1 = left key, +1 = right key, 0 = release both."""
+        if direction > 0:
+            self.up(left)
+            self.down(right)
+        elif direction < 0:
+            self.up(right)
+            self.down(left)
+        else:
+            self.up(left)
+            self.up(right)
+
+    def release_all(self):
+        for n in list(self.held):
+            self.up(n)
+
+
+# --------------------------------------------------------------------------
+# Detection helpers
+# --------------------------------------------------------------------------
+def grab(sct, region):
+    shot = sct.grab(region)
+    arr = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(shot.height, shot.width, 4)
+    return arr[:, :, [2, 1, 0]]  # RGB
+
+
+def color_mask(img, color, tol):
+    diff = np.abs(img.astype(np.int16) - np.array(color, dtype=np.int16))
+    return diff.max(axis=2) <= tol
+
+
+def x_extent(mask, min_px):
+    cols = np.where(mask.sum(axis=0) >= min_px)[0]
+    if len(cols) == 0:
+        return None
+    return int(cols[0]), int(cols[-1])
+
+
+def runs(bool_arr, gap=6):
+    """Contiguous runs of True (gaps up to `gap` px are bridged)."""
+    idx = np.where(bool_arr)[0]
+    if len(idx) == 0:
+        return []
+    out, start, prev = [], idx[0], idx[0]
+    for i in idx[1:]:
+        if i - prev > gap:
+            out.append((int(start), int(prev)))
+            start = i
+        prev = i
+    out.append((int(start), int(prev)))
+    return out
+
+
+def green_mask(img, col, tol, mode="auto"):
+    cm = color_mask(img, col["green"], tol)
+    if mode == "color":
+        return cm
+    a = img.astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    return cm | ((g >= 90) & (g > r * 1.35 + 10) & (g > b * 1.15 + 5))   # any "green-looking" pixel
+
+
+def find_green_zone(img, col, tol, minpx, mode="auto"):
+    """Returns (x0, x1, y0, y1) of the green target square, or None."""
+    gm = green_mask(img, col, tol, mode)
+    colcount = gm.sum(axis=0)
+    if colcount.size == 0 or colcount.max() < max(4, minpx * 2):
+        return None
+    cols = colcount >= max(minpx, colcount.max() * 0.5)
+    r = runs(cols, gap=2)
+    if not r:
+        return None
+    x0, x1 = max(r, key=lambda t: t[1] - t[0])
+    if x1 - x0 < 3:
+        return None
+    rowc = gm[:, x0:x1 + 1].sum(axis=1)
+    ridx = np.where(rowc >= max(1, (x1 - x0 + 1) * 0.5))[0]
+    if len(ridx) == 0:
+        return None
+    y0, y1 = int(ridx[0]), int(ridx[-1])
+    # must be a SOLID block (not a thin outline or green text like a timer badge)
+    if y1 - y0 < 4 or gm[y0:y1 + 1, x0:x1 + 1].mean() < 0.6:
+        return None
+    return int(x0), int(x1), y0, y1
+
+
+def fill_edge_diff(img, base, thresh):
+    """Right edge of the filling bar = right end of the biggest block of pixels that
+    changed vs. the empty-bar snapshot. Works for ANY fill color."""
+    d = np.abs(img.astype(np.int16) - base.astype(np.int16)).max(axis=2) > thresh
+    r = runs(d.mean(axis=0) >= 0.2, gap=6)
+    if not r:
+        return None
+    return max(r, key=lambda t: t[1] - t[0])[1]
+
+
+def fill_edge(img, base, col, tol, minpx, mode, thresh):
+    if mode == "color" or base is None:
+        f = x_extent(color_mask(img, col["fill"], tol), minpx)
+        return f[1] if f else None
+    return fill_edge_diff(img, base, thresh)
+
+
+def find_bar_and_fish(img, col, tol, minpx, use_red=True):
+    """
+    Finds your blue bar and the TARGET it must stay on.
+    Returns (bar, target_x, rows, kind, target_extent):
+      bar           = (x0, x1) of the blue box
+      target_x      = centre of the target (orange fish icon, or the red mystery BOX)
+      rows          = (y0, y1) rows of the blue bar
+      kind          = "orange" or "red"
+      target_extent = (x0, x1) of the target, for the preview
+    The target is ONLY searched in the same rows as the blue bar, so the orange
+    progress bar below is ignored. If the red box sits on top of the blue bar and splits
+    it into two pieces, the pieces are joined back together.
+    """
+    none = (None, None, None, None, None)
+    bm = color_mask(img, col["blue"], tol)
+    rowsum = bm.sum(axis=1)
+    if rowsum.size == 0 or rowsum.max() < max(minpx, 8):
+        return none
+    ridx = np.where(rowsum >= max(minpx, rowsum.max() * 0.5))[0]
+    y0, y1 = int(ridx[0]), int(ridx[-1])
+    sub = img[y0:y1 + 1]
+
+    # ---- target: red box (mystery) or orange fish
+    om = color_mask(sub, col["orange"], tol)
+    rm = np.zeros_like(om)
+    if use_red:
+        a_ = sub.astype(np.int16)
+        rr, gg, bb = a_[..., 0], a_[..., 1], a_[..., 2]
+        rm = color_mask(sub, col["red"], tol) | ((rr >= 110) & (gg < rr * 0.38) & (bb < rr * 0.38))
+    if use_red and rm.sum() >= 12 and rm.sum() > om.sum():
+        tm, kind = rm, "red"
+    else:
+        tm, kind = om, "orange"
+    tcols = tm.sum(axis=0)
+
+    # ---- blue bar extent (rejoin pieces separated by the target sitting on top of the bar)
+    colsb = bm[y0:y1 + 1].sum(axis=0) >= max(2, (y1 - y0 + 1) * 0.3)
+    r = runs(colsb)
+    if not r:
+        return none
+    merged = [r[0]]
+    for a0, b0 in r[1:]:
+        pa, pb = merged[-1]
+        if a0 - pb > 1 and (tcols[pb + 1:a0] > 0).mean() >= 0.6:
+            merged[-1] = (pa, b0)
+        else:
+            merged.append((a0, b0))
+    bar = max(merged, key=lambda t: t[1] - t[0])
+
+    if tcols.sum() < 12:
+        return bar, None, (y0, y1), None, None
+    xs = np.arange(len(tcols))
+    target_x = float((xs * tcols).sum() / tcols.sum())
+    strong = np.where(tcols >= max(1, tcols.max() * 0.2))[0]
+    return bar, target_x, (y0, y1), kind, (int(strong[0]), int(strong[-1]))
+
+
+# --------------------------------------------------------------------------
+# Bot
+# --------------------------------------------------------------------------
+class Bot(threading.Thread):
+    def __init__(self, cfg, log, on_tune=None):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.log = log
+        self.on_tune = on_tune
+        self.status = "Starting..."
+        self.stop_flag = threading.Event()
+        self.inp = Inputs()
+
+    def stop(self):
+        self.stop_flag.set()
+
+    def wait(self, sec):
+        end = time.perf_counter() + sec
+        while time.perf_counter() < end and not self.stop_flag.is_set():
+            time.sleep(0.05)
+
+    def settle_ui(self, sct, region, z, col, tol, minpx):
+        """Wait for the skill-check panel to finish animating in; returns (zone, frame, still_visible)."""
+        c = self.cfg
+        end = time.perf_counter() + 0.7
+        prev, stable, img, seen = None, 0, None, True
+        while time.perf_counter() < end and not self.stop_flag.is_set():
+            img = grab(sct, region)
+            z2 = find_green_zone(img, col, tol, minpx, c["green_detect"])
+            seen = z2 is not None
+            if not seen:
+                prev, stable = None, 0
+                time.sleep(0.008)
+                continue
+            cur = img[z2[2]:z2[3] + 1].astype(np.int16)
+            if prev is not None and prev.shape == cur.shape and np.abs(cur - prev).max() <= 20 \
+                    and abs(z2[0] - z[0]) <= 1:
+                stable += 1
+            else:
+                stable = 0
+            prev, z = cur, z2
+            if stable >= 2:
+                break
+            time.sleep(0.008)
+        return z, img, seen
+
+    def write_trace(self, zone, target, lat, trace, note):
+        try:
+            path = os.path.join(os.path.dirname(CONFIG_FILE), "cast_trace.txt")
+            t0 = trace[0][0] if trace else 0
+            pts = " ".join(f"{(t - t0) * 1000:.0f}ms:{e}" for t, e in trace)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} zone={zone} target={target:.1f} latency={lat} {note}\n  {pts}\n")
+        except Exception:
+            pass
+
+    def do_cast(self, equip, pre=False):
+        """[pre-cast key] -> [equip rod] -> cast action. `pre` is True for re-casts."""
+        c = self.cfg
+        if pre and c["pre_cast_press"] and c["pre_cast_key"]:
+            self.inp.tap(c["pre_cast_key"], 0.08)
+            self.log(f"Pressed {c['pre_cast_key'].upper()} before recasting.")
+            self.wait(float(c["pre_cast_delay"]))
+            if self.stop_flag.is_set():
+                return
+        if equip and c["equip_rod"]:
+            slot = str(max(1, min(9, int(c["rod_slot"]))))
+            self.inp.tap(slot, 0.06)
+            self.log(f"Equipped rod (hotbar {slot}).")
+            self.wait(0.7)
+        if self.stop_flag.is_set():
+            return
+        self.inp.tap(c["cast_action"], 0.08)
+        self.log(f"Cast ({c['cast_action']}). Waiting for skill check...")
+
+    def run(self):
+        c = self.cfg
+        col = c["colors"]
+        tol, minpx = int(c["tolerance"]), int(c["min_pixels"])
+        r1, r2 = c["region1"], c["region2"]
+        reel_in = c["reel_input"]
+        hold_right = c["hold_moves"] == "right"
+
+        state = "WAIT"
+        cooldown_until = 0.0
+        zone = None
+        charge_start = 0.0
+        prev_edge, prev_t = None, None
+        fish_prev = bar_prev = None
+        fish_v = bar_v = 0.0
+        direction = 0
+        last_fish_seen = 0.0
+        last_t = time.perf_counter()
+        use_red = bool(c["red_enabled"])
+        band = baseline = None
+        samples = []
+        peak = 0
+        release_info = {}
+        settle_start = 0.0
+        mystery_logged = False
+        try:                                   # 1 ms timer resolution on Windows
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+        trace = []
+        awaiting1 = None      # time we last cast and are waiting for skill check 1
+        bite_since = None     # time skill check 1 finished and we're waiting for a bite
+        self.log("Macro running.")
+
+        try:
+            delay = float(c["start_delay"])
+            if delay > 0:
+                self.log(f"Starting in {delay:g}s - click into the game window now!")
+                self.wait(delay)
+            if c["auto_cast_on_start"] and not self.stop_flag.is_set():
+                self.do_cast(True)
+                awaiting1 = time.perf_counter()
+            with mss.mss() as sct:
+                while not self.stop_flag.is_set():
+                    now = time.perf_counter()
+
+                    # ---------------- WAIT ----------------
+                    if state == "WAIT":
+                        self.status = "Waiting for a skill check"
+                        if r1 and now >= cooldown_until:
+                            img = grab(sct, r1)
+                            z = find_green_zone(img, col, tol, minpx, c["green_detect"])
+                            if z:
+                                # let the panel finish animating, then snapshot the EMPTY bar
+                                z, img, seen = self.settle_ui(sct, r1, z, col, tol, minpx)
+                                if seen and not self.stop_flag.is_set():
+                                    zone = (z[0], z[1])
+                                    y0, y1 = z[2], z[3]
+                                    mid = (y0 + y1) // 2
+                                    hh = max(3, min(24, y1 - y0 + 1))          # strip across the bar = fast capture
+                                    ya = max(0, mid - hh // 2)
+                                    yb = min(img.shape[0] - 1, ya + hh - 1)
+                                    band = {"left": r1["left"], "top": r1["top"] + ya,
+                                            "width": r1["width"], "height": yb - ya + 1}
+                                    baseline = img[ya:yb + 1].copy()
+                                    awaiting1 = None
+                                    self.log(f"Skill check 1 found - green zone x={zone[0]}..{zone[1]} "
+                                             f"(centre {sum(zone) / 2:.0f}). Holding {c['cast_key'].upper()}")
+                                    self.inp.down(c["cast_key"])
+                                    charge_start = time.perf_counter()
+                                    samples = []
+                                    trace = []
+                                    peak = 0
+                                    state = "CHARGE"
+                                    continue
+                        if r2:
+                            img = grab(sct, r2)
+                            b, fx, _, kind, _ext = find_bar_and_fish(img, col, tol, minpx, use_red)
+                            if b and fx is not None:
+                                awaiting1 = bite_since = None
+                                mystery_logged = kind == "red"
+                                self.log("Skill check 2 found - RED MYSTERY BOX! Tracking it."
+                                         if kind == "red" else "Skill check 2 found. Tracking fish.")
+                                fish_prev = bar_prev = None
+                                fish_v = bar_v = 0.0
+                                direction = 0
+                                last_fish_seen = now
+                                last_t = now
+                                state = "TRACK"
+                                continue
+
+                        t1, tb = float(c["check1_timeout"]), float(c["bite_timeout"])
+                        if awaiting1 and t1 > 0 and now - awaiting1 > t1:
+                            self.log("No skill check appeared - casting again.")
+                            self.do_cast(c["re_equip_each_cast"], pre=True)
+                            awaiting1 = time.perf_counter()
+                        elif bite_since and tb > 0 and now - bite_since > tb:
+                            self.log("No bite for a long time - recasting.")
+                            self.do_cast(c["re_equip_each_cast"], pre=True)
+                            bite_since = None
+                            awaiting1 = time.perf_counter()
+                        time.sleep(0.02)                        # idle: ~50 checks/sec, light on the CPU
+
+                    # ---------------- CHARGE ----------------
+                    elif state == "CHARGE":
+                        self.status = "Skill check 1 - charging the cast"
+                        img = grab(sct, band)                  # thin strip = very fast
+                        t_now = time.perf_counter()
+                        edge = fill_edge(img, baseline, col, tol, minpx, c["fill_detect"], int(c["diff_threshold"]))
+                        target = zone[0] + (zone[1] - zone[0]) * float(c["release_at"])
+                        lat = float(c["release_latency"])
+                        do_release = False
+                        if edge is not None:
+                            if samples and edge - samples[-1][1] > 120:
+                                edge = None                    # impossible jump = glitch, ignore this frame
+                            elif samples and edge < samples[-1][1] - 30:
+                                samples = []                   # bar looped back to the start: re-measure
+                        if edge is not None:
+                            if samples:
+                                edge = max(edge, samples[-1][1])
+                            samples.append((t_now, edge))
+                            trace.append((t_now, edge))
+                            samples = [sm for sm in samples if t_now - sm[0] <= 0.15]   # last 150 ms
+                            vel = 0.0
+                            if edge >= target:
+                                do_release = True               # already there -> release immediately
+                            elif len(samples) >= 3 and samples[-1][0] - samples[0][0] >= 0.04:
+                                ts = np.array([t for t, _ in samples])
+                                es = np.array([e for _, e in samples], dtype=float)
+                                vel, icpt = np.polyfit(ts - ts[0], es, 1)
+                                if vel > 30:
+                                    # when will the bar cross the target, and when must we let go?
+                                    t_release = ts[0] + (target - icpt) / vel - lat
+                                    frame_dt = (ts[-1] - ts[0]) / (len(ts) - 1)
+                                    if t_release <= t_now + frame_dt:
+                                        end_wait = min(t_release, time.perf_counter() + 0.06)
+                                        while time.perf_counter() < end_wait:
+                                            pass                # spin for sub-frame precision
+                                        do_release = True
+                            if do_release:
+                                t_rel = time.perf_counter()
+                                self.inp.up(c["cast_key"])
+                                release_info = {"edge": edge, "vel": float(vel), "target": target, "lat": lat}
+                                peak = edge
+                                bite_since = t_rel
+                                settle_start = t_rel
+                                state = "SETTLE"
+                                continue
+                        if t_now - charge_start > 6:
+                            self.inp.up(c["cast_key"])
+                            why = ("never saw the bar fill - check the region, or try Fill detection = color"
+                                   if not samples else "bar never reached the green zone")
+                            self.log(f"Cast timed out: {why}.")
+                            if c["debug_trace"] and trace:
+                                self.write_trace(zone, target, lat, trace, "TIMEOUT")
+                            cooldown_until = t_now + 1.5
+                            state = "WAIT"
+
+                    # ---------------- SETTLE (see where the bar really stopped) ----------------
+                    elif state == "SETTLE":
+                        self.status = "Skill check 1 - released"
+                        img = grab(sct, band)
+                        edge = fill_edge(img, baseline, col, tol, minpx, c["fill_detect"], int(c["diff_threshold"]))
+                        if edge is not None:
+                            peak = max(peak, edge)
+                        if now - settle_start > 0.25:
+                            ri = release_info
+                            expected = ri["edge"] + max(ri["vel"], 0) * ri["lat"]
+                            measurable = peak - ri["edge"] >= 3        # did the bar visibly keep moving after release?
+                            exp_in = zone[0] <= expected <= zone[1]
+                            if measurable:
+                                inside = zone[0] <= peak <= zone[1]
+                                verdict = ("INSIDE the green" if inside else
+                                           "overshot the green" if peak > zone[1] else "stopped short of the green")
+                                self.log(f"Released at x={ri['edge']}, bar stopped at x={peak}, "
+                                         f"green x={zone[0]}..{zone[1]} -> {verdict}")
+                            else:
+                                self.log(f"Released at x={ri['edge']} (speed {ri['vel']:.0f}px/s), expected stop "
+                                         f"x~{expected:.0f}, green x={zone[0]}..{zone[1]} -> "
+                                         f"{'on target' if exp_in else 'OFF target - adjust release latency'}")
+                            if c["auto_tune"] and measurable and ri["vel"] > 20:
+                                new_lat = ri["lat"] + 0.6 * (peak - ri["target"]) / ri["vel"]
+                                new_lat = round(max(0.0, min(0.35, new_lat)), 3)
+                                if abs(new_lat - ri["lat"]) >= 0.004:
+                                    c["release_latency"] = new_lat
+                                    self.log(f"Auto-tune: release timing {ri['lat']} -> {new_lat}s")
+                                    if self.on_tune:
+                                        self.on_tune(new_lat)
+                            if c["debug_trace"] and trace:
+                                self.write_trace(zone, ri["target"], ri["lat"], trace,
+                                                 f"released_at={ri['edge']} vel={ri['vel']:.0f} expected={expected:.0f}")
+                            cooldown_until = time.perf_counter() + 1.5
+                            state = "WAIT"
+
+                    # ---------------- TRACK ----------------
+                    elif state == "TRACK":
+                        self.status = "Skill check 2 - reeling" + (" (RED mystery box)" if mystery_logged else "")
+                        img = grab(sct, r2)
+                        bar, fish_c, _, kind, _ext = find_bar_and_fish(img, col, tol, minpx, use_red)
+                        if kind == "red" and not mystery_logged:
+                            mystery_logged = True
+                            self.log("Target turned RED (mystery box) - still tracking.")
+                        dt = max(now - last_t, 1e-3)
+                        last_t = now
+
+                        if fish_c is not None:
+                            last_fish_seen = now
+                        if bar and fish_c is not None:
+                            bar_c = (bar[0] + bar[1]) / 2
+                            bar_w = bar[1] - bar[0]
+                            if fish_prev is not None:
+                                fish_v = 0.5 * fish_v + 0.5 * (fish_c - fish_prev) / dt
+                                bar_v = 0.5 * bar_v + 0.5 * (bar_c - bar_prev) / dt
+                            fish_prev, bar_prev = fish_c, bar_c
+
+                            lead = float(c["lead"])
+                            err = (fish_c + fish_v * lead) - (bar_c + bar_v * lead)
+                            dz = max(float(c["deadzone"]), float(c["deadzone_frac"]) * bar_w)
+
+                            # hysteresis: start moving past the deadzone, keep going until we cross the target
+                            if direction == 0:
+                                if err > dz:
+                                    direction = 1
+                                elif err < -dz:
+                                    direction = -1
+                            elif direction * err <= 0:
+                                direction = 0
+
+                            if c["reel_mode"] == "two_key":
+                                self.inp.drive(direction, c["left_key"], c["right_key"])
+                            else:
+                                move_right = direction > 0
+                                hold = move_right if hold_right else (direction < 0)
+                                if direction == 0:
+                                    self.inp.up(reel_in)
+                                elif hold:
+                                    self.inp.down(reel_in)
+                                else:
+                                    self.inp.up(reel_in)
+
+                        if now - last_fish_seen > float(c["lost_timeout"]):
+                            self.inp.release_all()
+                            self.log("Reel finished.")
+                            bite_since = None
+                            if c["auto_recast"]:
+                                self.wait(float(c["recast_delay"]))
+                                if not self.stop_flag.is_set():
+                                    self.do_cast(c["re_equip_each_cast"], pre=True)
+                                    awaiting1 = time.perf_counter()
+                            cooldown_until = 0.0               # skill check 1 can appear right after the cast
+                            state = "WAIT"
+                        time.sleep(0.002)
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+        finally:
+            self.inp.release_all()
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+            self.log("Macro stopped.")
+
+
+# --------------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------------
+APP_TITLE = "XZX Fishing"
+THEME = {"bg": "#0b0614", "panel": "#160d28", "panel2": "#241940", "fg": "#f4eeff", "muted": "#a99cc4",
+         "accent": "#b57bff", "green": "#6ee7b7", "red": "#f0587e", "border": "#2e2250", "log": "#070510"}
+
+
+def apply_theme(root):
+    T = THEME
+    st = ttk.Style(root)
+    try:
+        st.theme_use("clam")
+    except Exception:
+        pass
+    root.configure(bg=T["bg"])
+    st.configure(".", background=T["bg"], foreground=T["fg"], fieldbackground=T["panel2"],
+                 bordercolor=T["border"], lightcolor=T["border"], darkcolor=T["border"],
+                 troughcolor=T["panel"], focuscolor=T["bg"], font=("Segoe UI", 9))
+    st.configure("TFrame", background=T["bg"])
+    st.configure("TLabel", background=T["bg"], foreground=T["fg"])
+    st.configure("Muted.TLabel", foreground=T["muted"])
+    st.configure("Title.TLabel", font=("Segoe UI Semibold", 15))
+    st.configure("TLabelframe", background=T["bg"], bordercolor=T["border"])
+    st.configure("TLabelframe.Label", background=T["bg"], foreground=T["accent"], font=("Segoe UI Semibold", 9))
+    st.configure("TButton", background=T["panel2"], foreground=T["fg"], padding=(10, 5), borderwidth=1, relief="flat")
+    st.map("TButton", background=[("active", "#333b4a"), ("pressed", "#3b4558")])
+    st.configure("Start.TButton", background="#5a2fd6", foreground="#ffffff", font=("Segoe UI Semibold", 12), padding=(12, 9))
+    st.map("Start.TButton", background=[("active", "#b57bff"), ("pressed", "#4a24c0")])
+    st.configure("Stop.TButton", background=T["red"], foreground="#ffffff", font=("Segoe UI Semibold", 12), padding=(12, 9))
+    st.map("Stop.TButton", background=[("active", "#f76363"), ("pressed", "#dc2626")])
+    st.configure("TNotebook", background=T["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+    st.configure("TNotebook.Tab", background=T["panel"], foreground=T["muted"], padding=(16, 7), borderwidth=0)
+    st.map("TNotebook.Tab", background=[("selected", T["panel2"])], foreground=[("selected", T["fg"])])
+    st.configure("TEntry", fieldbackground=T["panel2"], foreground=T["fg"], insertcolor=T["fg"], padding=3)
+    st.configure("TCombobox", fieldbackground=T["panel2"], background=T["panel2"], foreground=T["fg"],
+                 arrowcolor=T["fg"], padding=3)
+    st.map("TCombobox", fieldbackground=[("readonly", T["panel2"])], foreground=[("readonly", T["fg"])])
+    st.configure("TCheckbutton", background=T["bg"], foreground=T["fg"])
+    st.map("TCheckbutton", background=[("active", T["bg"])],
+           indicatorbackground=[("selected", T["accent"]), ("!selected", T["panel2"])])
+    st.configure("Vertical.TScrollbar", background="#3a2a60", troughcolor=T["panel"], bordercolor=T["panel"],
+                 arrowcolor=T["fg"], lightcolor="#3a2a60", darkcolor="#3a2a60", gripcount=0)
+    st.map("Vertical.TScrollbar", background=[("active", "#4a3680")])
+    st.configure("TCheckbutton", indicatorbackground=T["panel2"], indicatorforeground=T["accent"])
+    root.option_add("*TCombobox*Listbox.background", T["panel2"])
+    root.option_add("*TCombobox*Listbox.foreground", T["fg"])
+    root.option_add("*TCombobox*Listbox.selectBackground", T["accent"])
+
+
+def acquire_single_instance():
+    """Only one copy at a time (two copies = two macros fighting over your keyboard)."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.CreateMutexW(None, False, "Local\\FishingMacro_SingleInstance_v1")
+        if k32.GetLastError() == 183:        # ERROR_ALREADY_EXISTS
+            return None
+        return handle
+    except Exception:
+        return True                           # not Windows / can't check -> allow
+
+
+class App:
+    LOG_LINES = 400
+
+    def __init__(self, license=None):
+        self.cfg, self.first_run = load_config()
+        self.license = license or {}
+        self.bot = None
+        self.logq = queue.Queue()          # bot/hotkey threads -> window. Tk itself is only touched
+        self.cmdq = queue.Queue()          # from the main thread, so nothing can hang or get stuck.
+        self.vars, self.swatches, self.bools, self.reg_lbl = {}, {}, {}, {}
+        self.preview_win = None
+        self.overlay = None
+        self._shown = (None, None)
+        self.hk = None
+
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE)
+        self.scale = self.get_scale()
+        apply_theme(self.root)
+        self.set_icon()
+        self.place_window()
+        self.build_ui()
+        self.setup_hotkeys()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(60, self.tick)
+        if self.license.get("key"):
+            threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _heartbeat(self):
+        """Every 60s, re-check the key. If it's disabled / expired / locked to another PC,
+        stop the macro and close the app. Nothing on the computer is touched."""
+        while True:
+            time.sleep(60)
+            code = self.license.get("key")
+            if not code:
+                continue
+            r = lic_api("/api/check", {"code": code, "session": self.license.get("session", ""),
+                                       "product": PRODUCT, "hwid": get_hwid()})
+            if r.startswith("REVOKED|"):
+                self.cmdq.put(("revoked", r.split("|", 1)[1]))
+                return
+
+    # ------------------------------------------------------------------ window
+    def get_scale(self):
+        try:
+            return max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        except Exception:
+            return 1.0
+
+    def set_icon(self):
+        try:
+            self.root.iconbitmap(os.path.join(BUNDLE_DIR, "icon.ico"))
+        except Exception:
+            pass
+
+    def place_window(self):
+        r, k = self.root, self.scale
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        w, h = min(int(700 * k), sw - 40), min(int(790 * k), sh - 90)
+        x, y = (sw - w) // 2, max(10, (sh - h) // 3)
+        geo = self.cfg.get("window_geometry")
+        try:
+            gx, gy, gw, gh = [int(v) for v in geo]
+            if -20 <= gx <= sw - 150 and 0 <= gy <= sh - 100:      # only reuse if it's actually on screen
+                x, y = gx, gy
+                w, h = min(max(gw, int(600 * k)), sw), min(max(gh, int(560 * k)), sh)
+        except Exception:
+            pass
+        r.geometry(f"{w}x{h}+{x}+{y}")
+        r.minsize(int(600 * k), int(540 * k))
+        r.attributes("-topmost", bool(self.cfg.get("always_on_top")))
+
+    def show_window(self):
+        r = self.root
+        try:
+            r.deiconify()
+            r.lift()
+            r.attributes("-topmost", True)                       # pop to front once...
+            r.after(250, lambda: r.attributes("-topmost", bool(self.cfg.get("always_on_top"))))   # ...then let go
+            r.focus_force()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ UI
+    def build_ui(self):
+        T, r = THEME, self.root
+        pad = {"padx": 12, "pady": 4}
+
+        # ---- header with live status
+        head = ttk.Frame(r)
+        head.pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(head, text="XZX", bg=T["bg"], fg=T["accent"], font=("Segoe UI Semibold", 16, "bold")).pack(side="left")
+        ttk.Label(head, text="Fishing", style="Title.TLabel").pack(side="left", padx=(6, 0))
+        right = ttk.Frame(head)
+        right.pack(side="right")
+        self.status_lbl = tk.Label(right, text="\u25cf STOPPED", bg=T["bg"], fg=T["muted"],
+                                   font=("Segoe UI Semibold", 11))
+        self.status_lbl.pack(anchor="e")
+        self.detail_lbl = tk.Label(right, text="Press F6 to start", bg=T["bg"], fg=T["muted"], font=("Segoe UI", 9))
+        self.detail_lbl.pack(anchor="e")
+
+        nb = ttk.Notebook(r)
+        nb.pack(fill="x", **pad)
+        self.nb = nb
+        tabs = {}
+        for key, title in (("setup", "  Setup  "), ("cast", "  Rod & casting  "),
+                           ("skill", "  Skill checks  "), ("app", "  App  ")):
+            tabs[key] = ttk.Frame(nb)
+            nb.add(tabs[key], text=title)
+
+        # ---- Setup tab: regions + colors
+        f = ttk.LabelFrame(tabs["setup"], text="1. Screen regions (drag a box around each skill check)")
+        f.pack(fill="x", **pad)
+        for key, name in (("region1", "Skill check 1 (cast bar: fill + green zone)"),
+                          ("region2", "Skill check 2 (blue bar + fish)")):
+            row = ttk.Frame(f)
+            row.pack(fill="x", padx=6, pady=3)
+            ttk.Label(row, text=name, width=38).pack(side="left")
+            lbl = ttk.Label(row, text=self.fmt_region(self.cfg[key]), width=22, style="Muted.TLabel")
+            lbl.pack(side="left")
+            self.reg_lbl[key] = lbl
+            ttk.Button(row, text="Set region",
+                       command=lambda k=key: self.capture("region", k)).pack(side="right")
+
+        f = ttk.LabelFrame(tabs["setup"], text="2. Colors (click Pick, then click that color on screen)")
+        f.pack(fill="x", **pad)
+        names = {"fill": "Filling bar (optional*)", "green": "Green zone",
+                 "blue": "Blue bar (yours)", "orange": "Orange fish",
+                 "red": "Red mystery box"}
+        for key, name in names.items():
+            row = ttk.Frame(f)
+            row.pack(fill="x", padx=6, pady=3)
+            ttk.Label(row, text=name, width=22).pack(side="left")
+            sw = tk.Label(row, width=6, bg=self.hexcol(self.cfg["colors"][key]), relief="flat", bd=0)
+            sw.pack(side="left", padx=6)
+            self.swatches[key] = sw
+            ttk.Button(row, text="Pick", command=lambda k=key: self.capture("color", k)).pack(side="left")
+        ttk.Label(tabs["setup"], style="Muted.TLabel", justify="left",
+                  text="*Filling bar color is only needed if Fill detection is set to 'color'.\n"
+                       "Tip: use Live preview to check it sees the bars. Get the skill check on screen\n"
+                       "first - the app counts down 3 seconds before taking the screenshot.").pack(anchor="w", padx=14, pady=4)
+
+        # ---- helpers for the other tabs
+        def panel(parent, title):
+            fr = ttk.LabelFrame(parent, text=title)
+            fr.pack(fill="x", **pad)
+            return {"fr": fr, "n": 0}
+
+        def add(p, label, key, kind=str, values=None):
+            rr, cc = divmod(p["n"], 2)
+            p["n"] += 1
+            ttk.Label(p["fr"], text=label).grid(row=rr, column=cc * 2, sticky="w", padx=(8, 4), pady=3)
+            v = tk.StringVar(value=str(self.cfg[key]))
+            if values:
+                w = ttk.Combobox(p["fr"], textvariable=v, values=values, width=11)
+            else:
+                w = ttk.Entry(p["fr"], textvariable=v, width=12)
+            w.grid(row=rr, column=cc * 2 + 1, sticky="w", padx=(0, 12), pady=3)
+            self.vars[key] = (v, kind)
+
+        def check(p, label, key):
+            if p["n"] % 2:
+                p["n"] += 1
+            rr = p["n"] // 2
+            p["n"] += 2
+            v = tk.BooleanVar(value=bool(self.cfg[key]))
+            ttk.Checkbutton(p["fr"], text=label, variable=v).grid(
+                row=rr, column=0, columnspan=4, sticky="w", padx=8, pady=2)
+            self.bools[key] = v
+
+        # ---- Rod & casting tab
+        p = panel(tabs["cast"], "Rod")
+        check(p, "Press the hotbar key to equip the rod", "equip_rod")
+        add(p, "Rod hotbar slot (1-5)", "rod_slot", int, ["1", "2", "3", "4", "5"])
+        add(p, "Cast action", "cast_action", str, ["mouse_left", "e", "f", "space"])
+        check(p, "Equip + cast automatically when the macro starts", "auto_cast_on_start")
+        check(p, "Cast again automatically after each catch", "auto_recast")
+        check(p, "Re-equip the rod (hotbar key) before every cast", "re_equip_each_cast")
+        check(p, "Press a key before every recast (not the first cast)", "pre_cast_press")
+        add(p, "Key to press before recasting", "pre_cast_key")
+        add(p, "Wait after that key (s)", "pre_cast_delay", float)
+        p = panel(tabs["cast"], "Timing")
+        add(p, "Start delay (s)", "start_delay", float)
+        add(p, "Delay before recast (s)", "recast_delay", float)
+        add(p, "Recast if no skill check 1 (s)", "check1_timeout", float)
+        add(p, "Recast if no bite (s)", "bite_timeout", float)
+        ttk.Label(tabs["cast"], style="Muted.TLabel", justify="left",
+                  text="Start delay gives you time to click into the game after pressing Start.\n"
+                       "Set a timeout to 0 to turn that auto-retry off.").pack(anchor="w", padx=14)
+
+        # ---- Skill checks tab
+        p = panel(tabs["skill"], "Skill check 1 - cast (hold, release in the green)")
+        add(p, "Key to hold", "cast_key")
+        add(p, "Release point in green (0-1)", "release_at", float)
+        add(p, "Latency compensation (s)", "release_latency", float)
+        add(p, "Green detection", "green_detect", str, ["auto", "color"])
+        add(p, "Fill detection", "fill_detect", str, ["auto", "color"])
+        add(p, "Fill change threshold", "diff_threshold", int)
+        check(p, "Auto-tune release timing (only if bar stays visible)", "auto_tune")
+        check(p, "Save cast debug trace (cast_trace.txt)", "debug_trace")
+        p = panel(tabs["skill"], "Skill check 2 - reel (keep blue bar on target)")
+        add(p, "Reel mode", "reel_mode", str, ["two_key", "hold"])
+        add(p, "Left key", "left_key")
+        add(p, "Right key", "right_key")
+        add(p, "Hold-mode input", "reel_input", str, ["mouse_left", "space", "e", "f"])
+        add(p, "Hold-mode: holding moves", "hold_moves", str, ["right", "left"])
+        add(p, "Deadzone min (px)", "deadzone", float)
+        add(p, "Deadzone (x box width)", "deadzone_frac", float)
+        add(p, "Prediction lead (s)", "lead", float)
+        add(p, "Fish lost timeout (s)", "lost_timeout", float)
+        check(p, "Also track the RED mystery box", "red_enabled")
+        p = panel(tabs["skill"], "Detection")
+        add(p, "Color tolerance (0-255)", "tolerance", int)
+        add(p, "Min pixels per column", "min_pixels", int)
+
+        # ---- App tab
+        p = panel(tabs["app"], "Window")
+        check(p, "Keep this window on top of other windows", "always_on_top")
+        check(p, "Minimize this window when the macro starts", "minimize_on_start")
+        ttk.Label(tabs["app"], style="Muted.TLabel", justify="left",
+                  text="Hotkeys work even while the game has focus:\n"
+                       "    F6  start / stop the macro\n"
+                       "    F8  bring this window back to the front").pack(anchor="w", padx=14, pady=6)
+        self.bools["always_on_top"].trace_add("write", lambda *a: self.root.attributes(
+            "-topmost", bool(self.bools["always_on_top"].get())))
+
+        # ---- big start button + tools
+        self.btn = ttk.Button(r, text="START  (F6)", style="Start.TButton", command=self.toggle)
+        self.btn.pack(fill="x", padx=12, pady=(8, 4))
+        tools = ttk.Frame(r)
+        tools.pack(fill="x", padx=12, pady=2)
+        for text, cmd in (("Test detection", self.test_detect), ("Live preview", self.live_preview),
+                          ("Export config", self.export_config), ("Import config", self.import_config),
+                          ("Config folder", self.open_config_folder), ("Reset", self.reset_config)):
+            ttk.Button(tools, text=text, command=cmd).pack(side="left", padx=(0, 4))
+
+        # ---- log
+        lf = ttk.Frame(r)
+        lf.pack(fill="both", expand=True, padx=12, pady=(6, 2))
+        sb = ttk.Scrollbar(lf, orient="vertical")
+        self.logbox = tk.Text(lf, height=6, state="disabled", bg=T["log"], fg="#9be39b", relief="flat",
+                              wrap="word", font=("Consolas", 9), padx=8, pady=6, yscrollcommand=sb.set,
+                              highlightthickness=1, highlightbackground=T["border"])
+        sb.config(command=self.logbox.yview)
+        sb.pack(side="right", fill="y")
+        self.logbox.pack(side="left", fill="both", expand=True)
+        ttk.Label(r, text="F6 start/stop   \u2022   F8 show this window", style="Muted.TLabel").pack(
+            anchor="w", padx=14, pady=(0, 8))
+
+        self.log("Ready. Config file: " + CONFIG_FILE)
+        if self.first_run:
+            self.log("First launch: a config file was created automatically.")
+        if not self.cfg["region1"] or not self.cfg["region2"]:
+            self.log("Set both regions + colors on the Setup tab, then press F6.")
+            if self.first_run:
+                self.root.after(400, lambda: messagebox.showinfo(
+                    "Welcome to Fishing Macro",
+                    "First-time setup:\n\n"
+                    "1. Setup tab -> 'Set region' for both skill checks\n"
+                    "2. 'Pick' each color (or use the defaults)\n"
+                    "3. Rod & casting tab -> choose your rod's hotbar slot\n"
+                    "4. Press F6 to start / stop\n\n"
+                    "Your settings save automatically.", parent=self.root))
+
+    # ------------------------------------------------------------------ config actions
+    def refresh_ui(self):
+        for key, (v, _) in self.vars.items():
+            v.set(str(self.cfg[key]))
+        for key, v in self.bools.items():
+            v.set(bool(self.cfg[key]))
+        for key, sw in self.swatches.items():
+            sw.config(bg=self.hexcol(self.cfg["colors"][key]))
+        for key, lbl in self.reg_lbl.items():
+            lbl.config(text=self.fmt_region(self.cfg[key]))
+
+    def export_config(self):
+        self.read_settings()
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".json", initialfile=CONFIG_NAME,
+                                            filetypes=[("Config", "*.json")])
+        if path and save_config(self.cfg, path):
+            self.log(f"Config exported to {path}")
+
+    def import_config(self):
+        path = filedialog.askopenfilename(parent=self.root, filetypes=[("Config", "*.json")])
+        if not path:
+            return
+        try:
+            new = json.loads(json.dumps(DEFAULTS))
+            read_config_file(path, new)
+            self.cfg = new
+            self.refresh_ui()
+            save_config(self.cfg)
+            self.log(f"Config imported from {path}")
+        except Exception as e:
+            self.log(f"Could not import config: {e}")
+
+    def reset_config(self):
+        if messagebox.askyesno("Reset", "Reset everything to defaults?", parent=self.root):
+            self.cfg = json.loads(json.dumps(DEFAULTS))
+            self.refresh_ui()
+            save_config(self.cfg)
+            self.log("Settings reset to defaults.")
+
+    def open_config_folder(self):
+        try:
+            os.startfile(os.path.dirname(CONFIG_FILE))
+        except Exception as e:
+            self.log(f"Config folder: {os.path.dirname(CONFIG_FILE)} ({e})")
+
+    @staticmethod
+    def hexcol(c):
+        return "#%02x%02x%02x" % tuple(c)
+
+    @staticmethod
+    def fmt_region(reg):
+        if not reg:
+            return "not set"
+        return f"{reg['width']}x{reg['height']} @ {reg['left']},{reg['top']}"
+
+    def read_settings(self):
+        for key, (v, kind) in self.vars.items():
+            try:
+                self.cfg[key] = kind(v.get().strip())
+            except Exception:
+                self.log(f"Invalid value for {key}, using previous.")
+        for key, v in self.bools.items():
+            self.cfg[key] = bool(v.get())
+        self.cfg["cast_key"] = self.cfg["cast_key"].lower()
+        self.cfg["cast_action"] = self.cfg["cast_action"].lower()
+        self.cfg["pre_cast_key"] = self.cfg["pre_cast_key"].lower()
+        for k in ("green_detect", "fill_detect"):
+            if self.cfg[k] not in ("auto", "color"):
+                self.cfg[k] = "auto"
+        self.cfg["left_key"] = self.cfg["left_key"].lower()
+        self.cfg["right_key"] = self.cfg["right_key"].lower()
+        save_config(self.cfg)
+
+    # ------------------------------------------------------------------ logging + main-thread pump
+    def log(self, msg):            # safe to call from any thread
+        self.logq.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+    def tick(self):
+        """Runs every 60 ms on the main thread: logs, hotkey commands, status."""
+        try:
+            while True:
+                cmd = self.cmdq.get_nowait()
+                if cmd == "toggle":
+                    self.toggle()
+                elif cmd == "show":
+                    self.show_window()
+                elif isinstance(cmd, tuple) and cmd[0] == "tune":
+                    self.cfg["release_latency"] = cmd[1]
+                    self.vars["release_latency"][0].set(str(cmd[1]))
+                    save_config(self.cfg)
+                elif isinstance(cmd, tuple) and cmd[0] == "revoked":
+                    if self.bot and self.bot.is_alive():
+                        self.bot.stop()
+                    try:
+                        messagebox.showwarning(
+                            APP_TITLE,
+                            "You've been logged out.\n\n%s\n\nOpen a ticket in %s if you think this is a mistake."
+                            % (cmd[1], DISCORD_INVITE), parent=self.root)
+                    except Exception:
+                        pass
+                    self.on_close()
+                    return
+        except queue.Empty:
+            pass
+
+        lines = []
+        try:
+            while len(lines) < 60:
+                lines.append(self.logq.get_nowait())
+        except queue.Empty:
+            pass
+        if lines:
+            self.logbox.config(state="normal")
+            self.logbox.insert("end", "\n".join(lines) + "\n")
+            total = int(self.logbox.index("end-1c").split(".")[0])
+            if total > self.LOG_LINES:                       # keep the log small so the window stays fast
+                self.logbox.delete("1.0", f"{total - self.LOG_LINES}.0")
+            self.logbox.see("end")
+            self.logbox.config(state="disabled")
+
+        running = bool(self.bot and self.bot.is_alive())
+        detail = (self.bot.status if running else "Press F6 to start")
+        if (running, detail) != self._shown:
+            if running != self._shown[0]:
+                self.btn.config(text="STOP  (F6)" if running else "START  (F6)",
+                                style="Stop.TButton" if running else "Start.TButton")
+                self.status_lbl.config(text="\u25cf RUNNING" if running else "\u25cf STOPPED",
+                                       fg=THEME["green"] if running else THEME["muted"])
+                self.root.title(f"{APP_TITLE} - {'RUNNING' if running else 'stopped'}")
+            self.detail_lbl.config(text=detail, fg=THEME["fg"] if running else THEME["muted"])
+            self._shown = (running, detail)
+        self.root.after(60, self.tick)
+
+    # ------------------------------------------------------------------ start / stop / hotkeys
+    def toggle(self):
+        if self.bot and self.bot.is_alive():
+            self.bot.stop()
+            self.log("Stopping...")
+            return
+        self.read_settings()
+        if not self.cfg["region1"] or not self.cfg["region2"]:
+            self.log("Set both regions first (Setup tab).")
+            self.show_window()
+            return
+        self.bot = Bot(dict(self.cfg), self.log, lambda v: self.cmdq.put(("tune", v)))
+        self.bot.start()
+        if self.cfg["minimize_on_start"]:
+            self.root.iconify()                              # get out of the way of the game
+
+    def setup_hotkeys(self):
+        try:
+            from pynput import keyboard
+            self.hk = keyboard.GlobalHotKeys({"<f6>": lambda: self.cmdq.put("toggle"),
+                                              "<f8>": lambda: self.cmdq.put("show")})
+            self.hk.daemon = True
+            self.hk.start()
+        except Exception as e:
+            self.log(f"Hotkeys unavailable: {e}")
+
+    # ------------------------------------------------------------------ test + preview
+    def test_detect(self):
+        self.read_settings()
+        c, col = self.cfg, self.cfg["colors"]
+        tol, mp = c["tolerance"], c["min_pixels"]
+        try:
+            with mss.mss() as sct:
+                if c["region1"]:
+                    img = grab(sct, c["region1"])
+                    z = find_green_zone(img, col, tol, mp, c["green_detect"])
+                    self.log("Check 1 -> green zone: " + (f"x={z[0]}..{z[1]}, rows {z[2]}..{z[3]}" if z else "NOT FOUND"))
+                if c["region2"]:
+                    img = grab(sct, c["region2"])
+                    bar, fx, rows, kind, ext = find_bar_and_fish(img, col, tol, mp, c["red_enabled"])
+                    self.log(f"Check 2 -> blue box: {bar}  target: {None if fx is None else round(fx)} "
+                             f"({kind}{' box' if kind == 'red' else ' fish'})")
+            self.log("(None / NOT FOUND = not visible in that region right now)")
+        except Exception as e:
+            self.log(f"Test failed: {e}")
+
+    def live_preview(self):
+        """What the macro sees: yellow = green zone, white = blue bar, magenta = target."""
+        if self.preview_win is not None:
+            try:
+                self.preview_win.lift()
+                return
+            except Exception:
+                self.preview_win = None
+        self.read_settings()
+        from PIL import ImageDraw
+        c, col = self.cfg, self.cfg["colors"]
+        win = tk.Toplevel(self.root)
+        win.title("Live preview")
+        win.configure(bg=THEME["bg"])
+        win.attributes("-topmost", True)
+        win.bind("<Escape>", lambda e: close())
+        lbl = tk.Label(win, bg=THEME["bg"])
+        lbl.pack(padx=6, pady=6)
+        tk.Label(win, text="yellow = green zone   white = blue bar   magenta = target   (Esc closes)",
+                 bg=THEME["bg"], fg=THEME["muted"], font=("Segoe UI", 8)).pack(pady=(0, 6))
+        sct = mss.mss()
+        state = {"alive": True}
+        self.preview_win = win
+        win.focus_force()
+
+        def close():
+            state["alive"] = False
+            self.preview_win = None
+            try:
+                sct.close()
+            except Exception:
+                pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+
+        def tick():
+            if not state["alive"]:
+                return
+            panels = []
+            tol, mp = c["tolerance"], c["min_pixels"]
+            try:
+                if c["region1"]:
+                    img = grab(sct, c["region1"])
+                    pil = Image.fromarray(np.ascontiguousarray(img))
+                    d = ImageDraw.Draw(pil)
+                    z = find_green_zone(img, col, tol, mp, c["green_detect"])
+                    if z:
+                        d.rectangle((z[0], z[2], z[1], z[3]), outline=(255, 255, 0), width=2)
+                    panels.append(pil)
+                if c["region2"]:
+                    img = grab(sct, c["region2"])
+                    pil = Image.fromarray(np.ascontiguousarray(img))
+                    d = ImageDraw.Draw(pil)
+                    bar, fx, rows, kind, ext = find_bar_and_fish(img, col, tol, mp, c["red_enabled"])
+                    if bar and rows:
+                        d.rectangle((bar[0], rows[0], bar[1], rows[1]), outline=(255, 255, 255), width=2)
+                    if fx is not None:
+                        if ext and rows:
+                            d.rectangle((ext[0], rows[0], ext[1], rows[1]), outline=(255, 0, 255), width=2)
+                        d.line((fx, 0, fx, pil.height), fill=(255, 0, 0), width=2)
+                    panels.append(pil)
+                if panels:
+                    w = max(p.width for p in panels)
+                    h = sum(p.height for p in panels)
+                    out = Image.new("RGB", (w, h))
+                    y = 0
+                    for p in panels:
+                        out.paste(p, (0, y))
+                        y += p.height
+                    if out.width > 900:                       # keep the preview light
+                        out = out.resize((900, int(out.height * 900 / out.width)))
+                    ph = ImageTk.PhotoImage(out)
+                    lbl.config(image=ph)
+                    lbl.image = ph
+            except Exception as e:
+                self.log(f"Preview error: {e}")
+            busy = bool(self.bot and self.bot.is_alive())
+            win.after(300 if busy else 100, tick)             # go easy on the CPU while the macro runs
+
+        tick()
+
+    # ------------------------------------------------------------------ screen capture (regions / colors)
+    def capture(self, mode, key):
+        if self.overlay is not None:
+            return
+        self.root.attributes("-alpha", 0.0)                  # invisible, but still a normal window
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg="#111827")
+        sw = self.root.winfo_screenwidth()
+        toast.geometry(f"+{sw // 2 - 190}+20")
+        msg = tk.Label(toast, bg="#111827", fg="#fde047", font=("Segoe UI Semibold", 13), padx=18, pady=10)
+        msg.pack()
+
+        def finish_toast_then_shoot():
+            try:
+                toast.destroy()
+            except Exception:
+                pass
+            self.root.after(180, lambda: self.show_overlay(mode, key))
+
+        def countdown(n):
+            try:
+                if n <= 0:
+                    finish_toast_then_shoot()
+                    return
+                msg.config(text=f"Get the skill check on screen...  capturing in {n}")
+                self.root.after(1000, lambda: countdown(n - 1))
+            except Exception:
+                self.root.attributes("-alpha", 1.0)
+
+        countdown(3)
+
+    def show_overlay(self, mode, key):
+        top = None
+        try:
+            with mss.mss() as sct:
+                mon = dict(sct.monitors[1])
+                shot = sct.grab(mon)
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+            arr = np.array(img)
+
+            top = tk.Toplevel(self.root)
+            self.overlay = top
+            top.geometry(f"{mon['width']}x{mon['height']}+{mon['left']}+{mon['top']}")
+            top.attributes("-fullscreen", True)
+            top.attributes("-topmost", True)
+            cv = tk.Canvas(top, width=mon["width"], height=mon["height"], highlightthickness=0,
+                           cursor="crosshair", bg="black")
+            cv.pack(fill="both", expand=True)
+            photo = ImageTk.PhotoImage(img)
+            cv.create_image(0, 0, image=photo, anchor="nw")
+            cv.image = photo
+            msg = "Drag a box around the skill check" if mode == "region" else "Click the color to pick"
+            cv.create_rectangle(10, 10, 760, 56, fill="#000000", outline="")
+            cv.create_text(20, 20, anchor="nw", fill="#fde047", font=("Segoe UI Semibold", 16),
+                           text=f"{msg}     (Esc or right-click = cancel)")
+            start, rect = {}, {"id": None}
+
+            def done(*_):
+                if self.overlay is None:
+                    return
+                self.overlay = None
+                try:
+                    top.destroy()
+                finally:
+                    self.root.attributes("-alpha", 1.0)      # ALWAYS bring the main window back
+                    self.root.deiconify()
+
+            def press(e):
+                if mode == "color":
+                    x, y = min(e.x, arr.shape[1] - 1), min(e.y, arr.shape[0] - 1)
+                    rgb = [int(v) for v in arr[y, x][:3]]
+                    self.cfg["colors"][key] = rgb
+                    self.swatches[key].config(bg=self.hexcol(rgb))
+                    self.log(f"Color '{key}' = {rgb}")
+                    save_config(self.cfg)
+                    done()
+                else:
+                    start["x"], start["y"] = e.x, e.y
+
+            def drag(e):
+                if mode == "region" and "x" in start:
+                    if rect["id"]:
+                        cv.delete(rect["id"])
+                    rect["id"] = cv.create_rectangle(start["x"], start["y"], e.x, e.y, outline="#ef4444", width=2)
+
+            def release(e):
+                if mode == "region" and "x" in start:
+                    x1, x2 = sorted((start["x"], e.x))
+                    y1, y2 = sorted((start["y"], e.y))
+                    if x2 - x1 > 5 and y2 - y1 > 2:
+                        reg = {"left": mon["left"] + x1, "top": mon["top"] + y1,
+                               "width": x2 - x1, "height": y2 - y1}
+                        self.cfg[key] = reg
+                        self.reg_lbl[key].config(text=self.fmt_region(reg))
+                        self.log(f"{key} set: {self.fmt_region(reg)}")
+                        save_config(self.cfg)
+                        done()
+                    else:
+                        start.clear()
+                        if rect["id"]:
+                            cv.delete(rect["id"])
+
+            cv.bind("<ButtonPress-1>", press)
+            cv.bind("<B1-Motion>", drag)
+            cv.bind("<ButtonRelease-1>", release)
+            cv.bind("<Button-3>", done)
+            top.bind("<Escape>", done)
+            top.protocol("WM_DELETE_WINDOW", done)
+            top.after(90000, done)                            # failsafe: never stay stuck on screen
+            top.focus_force()
+        except Exception as e:
+            self.overlay = None
+            self.log(f"Capture failed: {e}")
+            try:
+                if top is not None:
+                    top.destroy()
+            finally:
+                self.root.attributes("-alpha", 1.0)
+                self.root.deiconify()
+
+    # ------------------------------------------------------------------ shutdown
+    def on_close(self):
+        try:
+            self.read_settings()
+            if self.root.state() == "normal":
+                self.cfg["window_geometry"] = [self.root.winfo_x(), self.root.winfo_y(),
+                                               self.root.winfo_width(), self.root.winfo_height()]
+            save_config(self.cfg)
+        except Exception:
+            pass
+        try:
+            if self.bot and self.bot.is_alive():
+                self.bot.stop()
+                self.bot.join(1.5)                           # lets it release any held keys
+            if self.hk:
+                self.hk.stop()
+            for w in (self.preview_win, self.overlay):
+                if w is not None:
+                    w.destroy()
+        finally:
+            self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+def main():
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FishingMacro.App")   # own taskbar icon
+    except Exception:
+        pass
+    sys.setswitchinterval(0.001)       # let the window stay responsive while the macro thread is busy
+    instance = acquire_single_instance()
+    if instance is None:
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showinfo(APP_TITLE, "XZX Fishing is already running.\nCheck your taskbar (or press F8).")
+        return
+    license = run_login()          # Discord link + access key; refuses (doesn't delete) on a locked key
+    if not license:
+        return
+    App(license).run()
 
 
 if __name__ == "__main__":
-    startup_guard()
-    _cfg = load_cfg()
-    _lic = run_login(_cfg)
-    if _lic:
-        App(_lic).run()
+    main()
