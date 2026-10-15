@@ -43,7 +43,7 @@ except ImportError:  # cogs/licenses.py isn't uploaded yet: the shop still works
     def length_label(days):
         return "Lifetime" if not days else f"{days} Days"
 
-    async def issue_for_order(guild_id, order, product):
+    async def issue_for_order(guild_id, order, product, days_override=...):
         return None
 
     async def receipt_line(order):
@@ -828,8 +828,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         note="A private note for staff (the buyer doesn't see it)",
         send="DM the buyer their receipt and file now (default: yes)",
         option="Which payment option they bought (e.g. 1 Week), if the product has options",
+        key_length="The macro key length to give them (overrides the product's default)",
     )
     @app_commands.autocomplete(product=product_autocomplete, option=option_autocomplete)
+    @app_commands.choices(key_length=KEY_CHOICES)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def createorder(
         self,
@@ -840,6 +842,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         note: Optional[app_commands.Range[str, 1, 200]] = None,
         send: bool = True,
         option: Optional[str] = None,
+        key_length: Optional[app_commands.Choice[str]] = None,
     ):
         if member.bot:
             raise UserError("Pick a real member, not a bot.")
@@ -853,7 +856,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             source="manual", note=note, processed_by=interaction.user.id, option=opt,
         )
         order = await db.fetch_one("SELECT * FROM orders WHERE guild_id = ? AND code = ?", (interaction.guild_id, code))
-        if await issue_for_order(interaction.guild_id, order, p):
+        override = ...  # unset = use the product/option length
+        if key_length is not None:
+            override = None if key_length.value == "none" else LENGTHS.get(key_length.value)
+        if await issue_for_order(interaction.guild_id, order, p, days_override=override):
             order = await db.fetch_one("SELECT * FROM orders WHERE id = ?", (order["id"],))
         shop = await db.get_shop(interaction.guild_id)
         delivered, file_status = False, ("failed" if order["file_id"] else None)

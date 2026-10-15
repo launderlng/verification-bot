@@ -135,8 +135,10 @@ async def create_license(guild_id: Optional[int], days: Optional[int], *, user_i
     raise RuntimeError("Couldn't generate a unique license key")
 
 
-async def issue_for_order(guild_id: int, order, product) -> Optional[str]:
-    """Give an order its key if the product hands one out. Safe to call more than once (returns the existing key)."""
+async def issue_for_order(guild_id: int, order, product, days_override=...) -> Optional[str]:
+    """Give an order its key if the product hands one out. Safe to call more than once (returns the existing key).
+    days_override: leave unset to use the product/option length; pass a number of days (0 = lifetime) to force a
+    specific key length, or None to hand out no key at all."""
     if order is None:
         return None
     if order["license_code"]:
@@ -148,6 +150,8 @@ async def issue_for_order(guild_id: int, order, product) -> Optional[str]:
         option = await db.fetch_one("SELECT * FROM product_options WHERE id = ? AND product_id = ?", (order["option_id"], product["id"]))
         if option is not None:
             days = option["license_days"]
+    if days_override is not ...:  # staff picked a length on /shop createorder
+        days = days_override
     if days is None:
         return None
     macro = product["license_macro"] if "license_macro" in product.keys() else None
@@ -627,16 +631,36 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         paths = (form.get("paths") or "").strip()
         where = "\n".join(f"`{p}`" for p in paths.splitlines() if p.strip())[:950] or "Unknown"
         await log_event(row["id"], "copies_found", f"{count} copies, {bin_count} in bin ({asked}) hwid={hwid[:60]}")
+
+        # Copying the macro breaks the ToS: if real copies exist on disk, auto-disable the key (so every copy on that
+        # PC self-destructs on its next check, within a minute) and DM the owner that they broke the Terms of Service.
+        auto_disabled = False
+        if count >= 1 and row["active"]:
+            await db.execute("UPDATE licenses SET active = 0 WHERE id = ?", (row["id"],))
+            await log_event(row["id"], "deactivated", "auto: copies found (ToS)")
+            auto_disabled = True
+            dm = ui.card(
+                "⛔ Your macro key was disabled — copying detected",
+                f"We found **{count:,}** extra cop{'y' if count == 1 else 'ies'} of the {macro_name(asked)} macro on a device using "
+                f"your key `{row['code']}`.\n\n"
+                "Copying, sharing or redistributing the macro breaks our **Terms of Service**. Your key has been **disabled**, and "
+                "those copies are now being removed from that PC automatically.\n\n"
+                "If you believe this is a mistake, open a ticket in the server.",
+                color=DANGER, section="Keys")
+            await self.dm_owner(who, dm)
+
         await self.key_log(
-            row, "📑 Extra copies of the file found on a PC", who,
+            row, "🚨 Copying detected — key auto-disabled" if auto_disabled else "📑 Extra copies of the file found on a PC", who,
             (("🎮 Macro", macro_label(asked)),
              ("🖥️ Device (HWID)", f"`{hwid}`"),
              ("🔢 Copies on disk", f"{count:,} beyond the running one"),
              ("🗑️ In the Recycle Bin", f"{bin_count:,}" if bin_count else None),
              ("📂 Every copy", where),
-             ("ℹ️ Note", "The macro found more than one copy of its file. Possible key sharing — "
+             ("ℹ️ Note", "🚨 Key **auto-disabled** for breaking the ToS (copying). The owner was DM'd, and every copy on that PC "
+              "self-destructs on its next check." if auto_disabled else
+              "The macro found more than one copy of its file. Possible key sharing — "
               "`/key disable` removes every copy on that PC the next time it checks.")),
-            WARN)
+            DANGER if auto_disabled else WARN)
         return web.Response(text="OK")
 
     # ---------------------------------------------------------- commands ----
