@@ -111,7 +111,7 @@ global Casts := 0, Catches := 0, Phase := "idle", PhaseAt := 0
 global CastHeld := false, WasTracking := false, LostAt := 0
 global LastTapAt := 0, LastStartAt := 0
 global Debug := false
-global PrevEdge := -1, PrevEdgeT := 0, CachedGreen := -1
+global PrevEdge := -1, PrevEdgeT := 0, CachedGreen := -1, GreenRow := -1
 
 ; License server = your Discord bot on Railway (same as the XZX Metal Detector)
 global LICENSE_API_URL := "https://verification-bot-production-2ea4.up.railway.app"
@@ -144,7 +144,7 @@ SetTimer(StreamGuard, 4000)         ; keeps the window hidden from capture even 
 ;  THE MACRO
 ; ---------------------------------------------------------------------------
 LoopTick() {
-    global Phase, PhaseAt, CastHeld, WasTracking, LostAt, LastTapAt, LastStartAt, Casts, Catches, CachedGreen, PrevEdge
+    global Phase, PhaseAt, CastHeld, WasTracking, LostAt, LastTapAt, LastStartAt, Casts, Catches, CachedGreen, PrevEdge, GreenRow
     if !Looping
         return
     t := A_TickCount
@@ -185,7 +185,7 @@ LoopTick() {
             if (t - PhaseAt >= Cfg.castDelayMs) {
                 Send "{Blind}{" Cfg.castKey " down}"
                 CastHeld := true
-                CachedGreen := -1, PrevEdge := -1       ; find the new green fresh for this cast
+                CachedGreen := -1, PrevEdge := -1, GreenRow := -1   ; find the new green fresh for this cast
                 Phase := "charging", PhaseAt := t
                 SetHero("CASTING", "Charging - releasing on the green")
             }
@@ -195,8 +195,11 @@ LoopTick() {
             ; an instant release or hang holding the key.
             held := t - PhaseAt
             greenHit := false
-            if (held >= 200)
+            if (held >= 150)
                 try greenHit := DetectGreenHit()
+            if Debug
+                UI["detail"].Text := "charging: green=" (CachedGreen < 0 ? "NOT FOUND" : CachedGreen)
+                    . "  blue edge=" (PrevEdge < 0 ? "-" : PrevEdge)
             if (greenHit || held >= Cfg.castHoldMs) {
                 Send "{Blind}{" Cfg.castKey " up}"
                 CastHeld := false
@@ -333,7 +336,7 @@ FindColor(x1, y1, x2, y2, color, &ox, &oy) {
 ; works without fiddly colour calibration.
 ColorIsGreen(c) {
     r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
-    return (g > 90 && g > r + 35 && g > b + 25)
+    return (g > 80 && g > r + 28 && g > b + 18)
 }
 ColorIsFill(c) {
     r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
@@ -346,20 +349,23 @@ ColorIsFill(c) {
 ; the macro window (top-right), the minimap and the hotbar.
 CastBounds(&L, &T, &R, &B) {
     W := A_ScreenWidth, H := A_ScreenHeight
-    L := Round(W * 0.372), R := Round(W * 0.628)   ; inside the cast panel (avoids scene water on the sides)
-    T := Round(H * 0.835), B := Round(H * 0.868)
+    L := Round(W * 0.355), R := Round(W * 0.645)   ; inside the cast panel (avoids scene water on the sides)
+    T := Round(H * 0.820), B := Round(H * 0.900)   ; tall band below the HOLD button, so the bar is found wherever it sits
 }
 
 ; Returns the green target's left edge x on the cast bar, or -1 if not seen.
 GreenLeft() {
+    global GreenRow
     CastBounds(&L, &T, &R, &B)
-    ystep := Max(2, (B - T) // 3)
+    ystep := Max(2, (B - T) // 12)       ; scan many rows so a thin green bar isn't skipped
     y := T
     while (y <= B) {
         x := L
         while (x <= R) {
-            if ColorIsGreen(PixelGetColor(x, y))
+            if ColorIsGreen(PixelGetColor(x, y)) {
+                GreenRow := y                ; remember the exact bar row for the fast fill scan
                 return x
+            }
             x += 2
         }
         y += ystep
@@ -370,8 +376,9 @@ GreenLeft() {
 ; Returns the right edge x of the growing blue charge (rightmost blue from the left,
 ; tolerating small gaps), or -1 if no charge is seen.
 FillEdge(stopX) {
+    global GreenRow
     CastBounds(&L, &T, &R, &B)
-    yc := (T + B) // 2
+    yc := (GreenRow >= 0) ? GreenRow : (T + B) // 2    ; scan the exact bar row
     edge := -1, gap := 0
     x := L
     while (x < stopX) {
