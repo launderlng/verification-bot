@@ -343,7 +343,7 @@ ColorIsFill(c) {
 ; the macro window (top-right), the minimap and the hotbar.
 CastBounds(&L, &T, &R, &B) {
     W := A_ScreenWidth, H := A_ScreenHeight
-    L := Round(W * 0.30), R := Round(W * 0.65)
+    L := Round(W * 0.372), R := Round(W * 0.628)   ; inside the cast panel (avoids scene water on the sides)
     T := Round(H * 0.835), B := Round(H * 0.868)
 }
 
@@ -417,8 +417,8 @@ DebugTick() {
     CastBounds(&L, &T, &R, &B)
     ToolTip "XZX detect  (F9 to hide)`n"
         . "cursor colour: " Format("0x{:06X}", cur) "  (" kind ")  @ " mx "," my "`n"
-        . "green left x = " gtxt "    blue charge edge x = " ftxt "`n"
-        . "scan band = " L "," T " .. " R "," B "`n"
+        . "green left x = " gtxt "    blue charge edge x = " ftxt "   (bar only shows while casting)`n"
+        . "screen " A_ScreenWidth "x" A_ScreenHeight "   scan band = " L "," T " .. " R "," B "`n"
         . "releases when blue edge >= green - " Cfg.releaseTol
 }
 
