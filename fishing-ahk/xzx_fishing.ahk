@@ -103,7 +103,7 @@ global ACCENT_HEX := "B57BFF", GREEN_HEX := "6EE7B7", DANGER_HEX := "F0587E"
 global FONT := "Segoe UI", FONT_SEMI := "Segoe UI Semibold"
 global LOGO := A_Temp "\xzx_fishing_logo.png"   ; built into this file, written out at startup
 
-global WIN_W := 600, WIN_H := 756
+global WIN_W := 600, WIN_H := 890
 global UI := Map(), NoDrag := Map(), Clickable := Map()
 global Running := false, Looping := false, NextAt := 0, CycleMs := 1
 global Runs := 0, LastRun := 0, T0 := A_TickCount, CurKeys := []
@@ -472,8 +472,6 @@ Calibrate(*) {
     StopLoop()
     try UI["gui"].Hide()
     steps := [
-        ["Hover the LEFT end of the CAST POWER bar", "castLpt"],
-        ["Hover the RIGHT end of the CAST POWER bar", "castRpt"],
         ["Hover the LEFT end of the FISHING bar", "trackLpt"],
         ["Hover the RIGHT end of the FISHING bar", "trackRpt"],
         ["Hover the FISH", "fish"],
@@ -490,9 +488,6 @@ Calibrate(*) {
         got[s[2]] := r
     }
     ToolTip
-    cl := got["castLpt"], cr := got["castRpt"]
-    Cfg.castL := Min(cl.x, cr.x) - 4, Cfg.castR := Max(cl.x, cr.x) + 4
-    Cfg.castT := Min(cl.y, cr.y) - 12, Cfg.castB := Max(cl.y, cr.y) + 12
     tl := got["trackLpt"], tr := got["trackRpt"]
     Cfg.trackL := Min(tl.x, tr.x) - 4, Cfg.trackR := Max(tl.x, tr.x) + 4
     Cfg.trackT := Min(tl.y, tr.y) - 16, Cfg.trackB := Max(tl.y, tr.y) + 16
@@ -651,18 +646,18 @@ BuildGui() {
     }
 
     ; ---- keybinds
-    Lbl(g, "x46 y652 w400 h14", "KEYBINDS   ·   click a purple one to change it", "s7 bold", TXT_DIM)
+    Lbl(g, "x46 y758 w400 h14", "KEYBINDS   ·   click a purple one to change it", "s7 bold", TXT_DIM)
     for i, k in KeybindSlots() {
         x := 46 + (i - 1) * 130
         if (k.key != "") {
-            chip := Btn(g, "x" (x + 2) " y678 w54 h26", Cfg.%k.key%, CaptureHandler(k.key), "s9 bold", TXT_MAIN, FONT_SEMI, INPUT_HEX)
+            chip := Btn(g, "x" (x + 2) " y796 w54 h26", Cfg.%k.key%, CaptureHandler(k.key), "s9 bold", TXT_MAIN, FONT_SEMI, INPUT_HEX)
             UI["chip_" k.key] := chip
         } else {
-            Lbl(g, "x" (x + 2) " y678 w54 h26 0x200 Center", k.fixed, "s9 bold", TXT_SUB, FONT_SEMI, INPUT_HEX)
+            Lbl(g, "x" (x + 2) " y796 w54 h26 0x200 Center", k.fixed, "s9 bold", TXT_SUB, FONT_SEMI, INPUT_HEX)
         }
-        Lbl(g, "x" (x + 66) " y676 w64 h30 0x200", k.label, "s8", TXT_SUB)
+        Lbl(g, "x" (x + 66) " y794 w64 h30 0x200", k.label, "s8", TXT_SUB)
     }
-    Lbl(g, "x24 y734 w552 h14 Center", "XZX Macro  ·  by Coop", "s7", TXT_DIM)
+    Lbl(g, "x24 y862 w552 h14 Center", "XZX Macro  ·  by Coop", "s7", TXT_DIM)
 
     g.Show("w" WIN_W " h" WIN_H)
     try {
@@ -678,14 +673,20 @@ BuildGui() {
 }
 
 Cells() => [
-    {x: 40,  y: 452, label: "Hold cast (ms)",        kind: "num", key: "castHoldMs"},
-    {x: 304, y: 452, label: "Wait before hold (ms)", kind: "num", key: "castDelayMs"},
-    {x: 40,  y: 494, label: "Fish dead-zone (px)",   kind: "num", key: "deadzone"},
-    {x: 304, y: 494, label: "Tap speed (ms)",        kind: "num", key: "tapMs"},
-    {x: 40,  y: 536, label: "Cast lead (px, higher=earlier)", kind: "num", key: "releaseTol"},
-    {x: 304, y: 536, label: "Flip fish direction",   kind: "switch", key: "drag"},
-    {x: 40,  y: 578, label: "Stream proof",          kind: "switch", key: "stream"},
-    {x: 304, y: 578, label: "Set up (calibrate)",    kind: "test", key: ""}
+    {x: 40,  y: 452, label: "Hold cast (ms)",         kind: "num", key: "castHoldMs"},
+    {x: 304, y: 452, label: "Wait before cast (ms)",  kind: "num", key: "castDelayMs"},
+    {x: 40,  y: 494, label: "Cast lead (px)",         kind: "num", key: "releaseTol"},
+    {x: 304, y: 494, label: "Cast lead lag (ms)",     kind: "num", key: "leadMs"},
+    {x: 40,  y: 536, label: "Delay between casts (ms)", kind: "num", key: "recastMs"},
+    {x: 304, y: 536, label: "Collect delay (ms)",     kind: "num", key: "endHoldMs"},
+    {x: 40,  y: 578, label: "Wait for fish (ms)",     kind: "num", key: "waitFishMs"},
+    {x: 304, y: 578, label: "Reel tap gap (ms)",      kind: "num", key: "tapMs"},
+    {x: 40,  y: 620, label: "Fish dead-zone (px)",    kind: "num", key: "deadzone"},
+    {x: 304, y: 620, label: "Reel strength (ms)",     kind: "num", key: "trackMaxMs"},
+    {x: 40,  y: 662, label: "Colour tolerance",       kind: "num", key: "colVar"},
+    {x: 304, y: 662, label: "Flip fish direction",    kind: "switch", key: "drag"},
+    {x: 40,  y: 704, label: "Stream proof",           kind: "switch", key: "stream"},
+    {x: 304, y: 704, label: "Set up (calibrate)",     kind: "test", key: ""}
 ]
 
 KeybindSlots() => [
@@ -748,7 +749,7 @@ PaintState() {
 }
 
 SaveFields() {
-    for k in ["castHoldMs", "castDelayMs", "deadzone", "tapMs", "releaseTol"] {
+    for k in ["castHoldMs", "castDelayMs", "releaseTol", "leadMs", "recastMs", "endHoldMs", "waitFishMs", "tapMs", "deadzone", "trackMaxMs", "colVar"] {
         v := Trim(UI["f_" k].Value)
         if !IsNumber(v)
             continue
@@ -914,8 +915,8 @@ Render() {
     }
 
     ; switches
-    DrawSwitch(pG, 304 + 196, 536 + 7, Cfg.drag)
-    DrawSwitch(pG, 40 + 196, 578 + 7, Cfg.stream)
+    DrawSwitch(pG, 304 + 196, 662 + 7, Cfg.drag)
+    DrawSwitch(pG, 40 + 196, 704 + 7, Cfg.stream)
 
     DllCall("Gdiplus\GdipCreateHBITMAPFromBitmap", "Ptr", pBmp, "Ptr*", &hbm, "UInt", 0xFF000000)
     DllCall("Gdiplus\GdipDeleteGraphics", "Ptr", pG)
@@ -949,8 +950,8 @@ RenderStatic() {
         Card(pG, x, 262, 176, 72, 16)                     ; stats
         RoundFill(pG, x + 20, 322, 22, 3, 1, 0xFF000000 | C_ACCL)
     }
-    Card(pG, 24, 414, 552, 214, 20)                       ; settings
-    Card(pG, 24, 640, 552, 84, 18)                        ; keybinds
+    Card(pG, 24, 414, 552, 334, 20)                       ; settings
+    Card(pG, 24, 770, 552, 84, 18)                        ; keybinds
 
     ; setting rows
     for c in Cells() {
@@ -966,8 +967,8 @@ RenderStatic() {
     ; keybind chips (purple outline = click to change)
     for i, k in KeybindSlots() {
         x := 46 + (i - 1) * 130
-        RoundFill(pG, x, 676, 58, 30, 9, 0xFF000000 | C_INPUT)
-        RoundStroke(pG, x + 0.5, 676.5, 57, 29, 9, 0xFF000000 | (k.key != "" ? C_ACC : C_BORDER), k.key != "" ? 1.4 : 1)
+        RoundFill(pG, x, 794, 58, 30, 9, 0xFF000000 | C_INPUT)
+        RoundStroke(pG, x + 0.5, 794.5, 57, 29, 9, 0xFF000000 | (k.key != "" ? C_ACC : C_BORDER), k.key != "" ? 1.4 : 1)
     }
 
     DllCall("Gdiplus\GdipDeleteGraphics", "Ptr", pG)
