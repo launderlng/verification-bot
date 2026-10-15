@@ -337,13 +337,24 @@ ColorIsFill(c) {
     return (b > 90 && b > r + 45 && b > g + 20)   ; the blue charge
 }
 
+; The Cast Power bar is a fixed UI element at the bottom-centre of the screen.
+; We scan just its row-band (by screen fraction) so detection never depends on
+; calibrating the cast region, and it dodges the blue HOLD button above the bar,
+; the macro window (top-right), the minimap and the hotbar.
+CastBounds(&L, &T, &R, &B) {
+    W := A_ScreenWidth, H := A_ScreenHeight
+    L := Round(W * 0.30), R := Round(W * 0.65)
+    T := Round(H * 0.835), B := Round(H * 0.868)
+}
+
 ; Returns the green target's left edge x on the cast bar, or -1 if not seen.
 GreenLeft() {
-    ystep := Max(2, (Cfg.castB - Cfg.castT) // 3)
-    y := Cfg.castT
-    while (y <= Cfg.castB) {
-        x := Cfg.castL
-        while (x <= Cfg.castR) {
+    CastBounds(&L, &T, &R, &B)
+    ystep := Max(2, (B - T) // 3)
+    y := T
+    while (y <= B) {
+        x := L
+        while (x <= R) {
             if ColorIsGreen(PixelGetColor(x, y))
                 return x
             x += 2
@@ -356,9 +367,10 @@ GreenLeft() {
 ; Returns the right edge x of the growing blue charge (rightmost blue from the left,
 ; tolerating small gaps), or -1 if no charge is seen.
 FillEdge(stopX) {
-    yc := (Cfg.castT + Cfg.castB) // 2
+    CastBounds(&L, &T, &R, &B)
+    yc := (T + B) // 2
     edge := -1, gap := 0
-    x := Cfg.castL
+    x := L
     while (x < stopX) {
         if ColorIsFill(PixelGetColor(x, yc))
             edge := x, gap := 0
@@ -375,8 +387,6 @@ FillEdge(stopX) {
 ; The green target is at a random spot each cast. Release once the gold fill's
 ; leading edge reaches it (releaseTol = px of lead to beat key latency).
 DetectGreenHit() {
-    if (Cfg.castR <= Cfg.castL)
-        return false
     gL := GreenLeft()
     if (gL < 0)
         return false
@@ -404,10 +414,11 @@ DebugTick() {
     ftxt := (edge >= 0) ? edge : "none"
     cc := PixelGetColor(mx, my)
     kind := ColorIsFill(cc) ? "BLUE charge" : ColorIsGreen(cc) ? "GREEN target" : "-"
+    CastBounds(&L, &T, &R, &B)
     ToolTip "XZX detect  (F9 to hide)`n"
         . "cursor colour: " Format("0x{:06X}", cur) "  (" kind ")  @ " mx "," my "`n"
         . "green left x = " gtxt "    blue charge edge x = " ftxt "`n"
-        . "cast region = " Cfg.castL "," Cfg.castT " .. " Cfg.castR "," Cfg.castB "`n"
+        . "scan band = " L "," T " .. " R "," B "`n"
         . "releases when blue edge >= green - " Cfg.releaseTol
 }
 
