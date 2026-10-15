@@ -149,29 +149,31 @@ LoopTick() {
         return
     t := A_TickCount
 
-    ; FISHING wins: while the fish is visible, chase it with the two keys
-    if (Cfg.trackR > Cfg.trackL && TrackFish()) {
-        EnsureCastUp()
-        WasTracking := true
-        Phase := "fishing", PhaseAt := t
-        SetHero("FISHING", "Tracking the fish - keeping it centred")
-        return
-    }
-
-    ; the fishing bar vanished after tracking -> fish caught: collect, then recast
-    if WasTracking {
-        EnsureCastUp()
-        if (LostAt = 0)
-            LostAt := t
-        if (t - LostAt >= Cfg.endHoldMs) {
-            Tap(Cfg.collectKey)
-            Catches++
-            UI["catches"].Text := Catches
-            WasTracking := false
-            LostAt := 0
-            Phase := "idle", PhaseAt := t
+    ; Only watch for the fish AFTER a cast (waitfish/fishing). This stops a false
+    ; fish-colour hit in the scene from hijacking the loop and blocking the cast.
+    if (Phase = "waitfish" || Phase = "fishing") {
+        if (Cfg.trackR > Cfg.trackL && TrackFish()) {
+            EnsureCastUp()
+            WasTracking := true
+            Phase := "fishing", PhaseAt := t
+            SetHero("FISHING", "Tracking the fish - keeping it centred")
+            return
         }
-        return
+        ; the fishing bar vanished after tracking -> fish caught: collect, then recast
+        if WasTracking {
+            EnsureCastUp()
+            if (LostAt = 0)
+                LostAt := t
+            if (t - LostAt >= Cfg.endHoldMs) {
+                Tap(Cfg.collectKey)
+                Catches++
+                UI["catches"].Text := Catches
+                WasTracking := false
+                LostAt := 0
+                Phase := "idle", PhaseAt := t
+            }
+            return
+        }
     }
 
     switch Phase {
