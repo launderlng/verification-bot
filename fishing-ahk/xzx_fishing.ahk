@@ -111,7 +111,7 @@ global Casts := 0, Catches := 0, Phase := "idle", PhaseAt := 0
 global CastHeld := false, WasTracking := false, LostAt := 0
 global LastTapAt := 0, LastStartAt := 0
 global Debug := false
-global PrevEdge := -1, PrevEdgeT := 0
+global PrevEdge := -1, PrevEdgeT := 0, CachedGreen := -1
 
 ; License server = your Discord bot on Railway (same as the XZX Metal Detector)
 global LICENSE_API_URL := "https://verification-bot-production-2ea4.up.railway.app"
@@ -131,7 +131,7 @@ StartupGuard()              ; a shared copy self-destructs here, before any logi
 ShowLogin()                 ; Discord link + access key, same as the XZX Metal Detector
 BuildGui()
 RegisterKeys()
-SetTimer(LoopTick, 25)
+SetTimer(LoopTick, 15)
 SetTimer(SecondTick, 1000)
 Hotkey "$F2", (*) => ToggleMenu()
 Hotkey "$F9", (*) => ToggleDebug()
@@ -144,7 +144,7 @@ SetTimer(StreamGuard, 4000)         ; keeps the window hidden from capture even 
 ;  THE MACRO
 ; ---------------------------------------------------------------------------
 LoopTick() {
-    global Phase, PhaseAt, CastHeld, WasTracking, LostAt, LastTapAt, LastStartAt, Casts, Catches
+    global Phase, PhaseAt, CastHeld, WasTracking, LostAt, LastTapAt, LastStartAt, Casts, Catches, CachedGreen, PrevEdge
     if !Looping
         return
     t := A_TickCount
@@ -185,6 +185,7 @@ LoopTick() {
             if (t - PhaseAt >= Cfg.castDelayMs) {
                 Send "{Blind}{" Cfg.castKey " down}"
                 CastHeld := true
+                CachedGreen := -1, PrevEdge := -1       ; find the new green fresh for this cast
                 Phase := "charging", PhaseAt := t
                 SetHero("CASTING", "Charging - releasing on the green")
             }
@@ -389,8 +390,13 @@ FillEdge(stopX) {
 ; The green target is at a random spot each cast. Release once the gold fill's
 ; leading edge reaches it (releaseTol = px of lead to beat key latency).
 DetectGreenHit() {
-    global PrevEdge, PrevEdgeT
-    gL := GreenLeft()
+    global PrevEdge, PrevEdgeT, CachedGreen
+    ; The green doesn't move during a cast, so find it ONCE (full scan) then cache it.
+    ; Every tick after that only scans the single fill-edge row -> fast, so the loop
+    ; reacts in time instead of charging past the green.
+    if (CachedGreen < 0)
+        CachedGreen := GreenLeft()
+    gL := CachedGreen
     if (gL < 0) {
         PrevEdge := -1
         return false
