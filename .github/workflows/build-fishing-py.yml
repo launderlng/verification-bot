@@ -1,0 +1,42 @@
+name: Build Fishing EXE (Python)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "fishing-macro/fishing_macro.py"
+      - ".github/workflows/build-fishing-py.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller mss numpy pillow pydirectinput pynput
+      - name: Build
+        shell: pwsh
+        run: |
+          $icon = if (Test-Path "fishing-macro/icon.ico") { "fishing-macro/icon.ico" } else { "fishing-macro/xzx_fishing.ico" }
+          pyinstaller --onefile --noconsole --name "XZX Fishing" --icon $icon `
+            --add-data "$icon;." fishing-macro/fishing_macro.py
+          if (-not (Test-Path "dist/XZX Fishing.exe")) { throw "no exe" }
+          Get-Item "dist/XZX Fishing.exe" | Format-List Name,Length
+
+      - name: Publish exe to a branch I can fetch
+        shell: bash
+        run: |
+          mkdir out && cp "dist/XZX Fishing.exe" "out/XZX Fishing.exe"
+          cd out
+          git init -q
+          git checkout -q -b exe-dist-py
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "exe-bot"
+          git add -A
+          git commit -q -m "fishing python exe ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" exe-dist-py
