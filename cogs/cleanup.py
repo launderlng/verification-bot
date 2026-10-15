@@ -97,8 +97,24 @@ class ConfirmCleanup(discord.ui.View):
         await interaction.response.edit_message(embed=ui.card("Cancelled", "Nothing was removed."), view=None)
 
 
+# Bot DMs worth keeping by default: purchase receipts and anything with a macro key in it.
+KEEP_TITLES = ("payment received", "order confirmed", "macro key", "your keys", "your purchases")
+
+
+def is_receipt(message: discord.Message) -> bool:
+    for e in message.embeds:
+        text = " ".join(filter(None, [e.title or "", *(f.name or "" for f in e.fields)])).lower()
+        if any(k in text for k in KEEP_TITLES):
+            return True
+    return False
+
+
 @app_commands.guild_only()
-class Cleanup(commands.Cog):
+class Tools(commands.GroupCog, group_name="tools",
+            group_description="Admin tools: tidy up leftovers and clear the bot's DMs"):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
     @app_commands.command(description="Find and remove test orders, unused files and other leftovers (asks first)")
     @app_commands.describe(include_test_files="Also delete stored files whose name starts with 'test' or 'demo'")
     @app_commands.default_permissions(manage_guild=True)
@@ -123,23 +139,6 @@ class Cleanup(commands.Cog):
             embed=ui.card("🧹 Cleanup preview", body, color=WARN, guild=interaction.guild, section="Staff"), view=ConfirmCleanup(interaction.user.id, plan) if total else None, ephemeral=True,
         )
 
-
-# Bot DMs worth keeping by default: purchase receipts and anything with a macro key in it.
-KEEP_TITLES = ("payment received", "order confirmed", "macro key", "your keys", "your purchases")
-
-
-def is_receipt(message: discord.Message) -> bool:
-    for e in message.embeds:
-        text = " ".join(filter(None, [e.title or "", *(f.name or "" for f in e.fields)])).lower()
-        if any(k in text for k in KEEP_TITLES):
-            return True
-    return False
-
-
-@app_commands.guild_only()
-class ClearDMs(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
 
     @app_commands.command(description="Delete the messages I've sent you by DM (admins can clear a member's)")
     @app_commands.describe(
@@ -186,5 +185,4 @@ class ClearDMs(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(ClearDMs(bot))
-    await bot.add_cog(Cleanup())
+    await bot.add_cog(Tools(bot))

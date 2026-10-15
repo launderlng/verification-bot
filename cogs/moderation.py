@@ -32,7 +32,8 @@ def done(title: str, text: str, color=SUCCESS) -> discord.Embed:
 
 
 @app_commands.guild_only()
-class Moderation(commands.Cog):
+class Moderation(commands.GroupCog, group_name="mod",
+                 group_description="Moderation: kick, ban, timeout, warn, purge and channel control"):
     @app_commands.command(description="Kick a member")
     @app_commands.describe(member="Who to kick", reason="Why")
     @app_commands.checks.has_permissions(kick_members=True)
