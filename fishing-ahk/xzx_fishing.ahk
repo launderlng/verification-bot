@@ -61,8 +61,9 @@ global Cfg := {
     ; tuning in fishing.ini only
     releaseTol:  ReadNum("releaseTol", 12),   ; extra px to release early (raise if it over-charges)
     leadMs:      ReadNum("leadMs", 45),        ; how far ahead to predict the charge (input latency)
-    trackMinMs:  ReadNum("trackMinMs", 12),   ; shortest reel press (fish nearly centred)
-    trackMaxMs:  ReadNum("trackMaxMs", 60),   ; longest reel press (fish far from the box)
+    trackMinMs:  ReadNum("trackMinMs", 10),   ; shortest reel press (fish nearly centred)
+    trackMaxMs:  ReadNum("trackMaxMs", 55),   ; longest reel press (fish far from the box)
+    trackLeadMs: ReadNum("trackLeadMs", 45),  ; aim this far ahead of the moving fish
     waitFishMs:  ReadNum("waitFishMs", 4500),
     endHoldMs:   ReadNum("endHoldMs", 180),
     drag:        ReadNum("drag", 0),          ; reused as "flip fish direction"
@@ -86,7 +87,7 @@ Cfg.stream := 1
 InitRegions()
 
 SaveCfg() {
-    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","leadMs","trackMinMs","trackMaxMs","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
+    for k in ["castL","castT","castR","castB","greenCol","markerCol","trackL","trackT","trackR","trackB","fishCol","boxCol","castHoldMs","castDelayMs","deadzone","tapMs","colVar","recastMs","releaseTol","leadMs","trackMinMs","trackMaxMs","trackLeadMs","waitFishMs","endHoldMs","drag","stream","castKey","leftKey","rightKey","collectKey","startKey","runKey","toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", k)
 }
 
@@ -112,6 +113,7 @@ global CastHeld := false, WasTracking := false, LostAt := 0
 global LastTapAt := 0, LastStartAt := 0
 global Debug := false
 global PrevEdge := -1, PrevEdgeT := 0, CachedGreen := -1, GreenRow := -1
+global FishPrev := -1, FishPrevT := 0
 
 ; License server = your Discord bot on Railway (same as the XZX Metal Detector)
 global LICENSE_API_URL := "https://verification-bot-production-2ea4.up.railway.app"
@@ -149,29 +151,31 @@ LoopTick() {
         return
     t := A_TickCount
 
-    ; FISHING wins: while the fish is visible, chase it with the two keys
-    if (Cfg.trackR > Cfg.trackL && TrackFish()) {
-        EnsureCastUp()
-        WasTracking := true
-        Phase := "fishing", PhaseAt := t
-        SetHero("FISHING", "Tracking the fish - keeping it centred")
-        return
-    }
-
-    ; the fishing bar vanished after tracking -> fish caught: collect, then recast
-    if WasTracking {
-        EnsureCastUp()
-        if (LostAt = 0)
-            LostAt := t
-        if (t - LostAt >= Cfg.endHoldMs) {
-            Tap(Cfg.collectKey)
-            Catches++
-            UI["catches"].Text := Catches
-            WasTracking := false
-            LostAt := 0
-            Phase := "idle", PhaseAt := t
+    ; Only watch for the fish AFTER a cast (waitfish/fishing). This stops a false
+    ; fish-colour hit in the scene from hijacking the loop and blocking the cast.
+    if (Phase = "waitfish" || Phase = "fishing") {
+        if (Cfg.trackR > Cfg.trackL && TrackFish()) {
+            EnsureCastUp()
+            WasTracking := true
+            Phase := "fishing", PhaseAt := t
+            SetHero("FISHING", "Tracking the fish - keeping it centred")
+            return
         }
-        return
+        ; the fishing bar vanished after tracking -> fish caught: collect, then recast
+        if WasTracking {
+            EnsureCastUp()
+            if (LostAt = 0)
+                LostAt := t
+            if (t - LostAt >= Cfg.endHoldMs) {
+                Tap(Cfg.collectKey)
+                Catches++
+                UI["catches"].Text := Catches
+                WasTracking := false
+                LostAt := 0
+                Phase := "idle", PhaseAt := t
+            }
+            return
+        }
     }
 
     switch Phase {
@@ -277,10 +281,10 @@ EnsureCastUp() {
 
 ; Scan the fishing row for the fish + the box, then tap to centre the fish.
 TrackFish() {
-    global LastTapAt
-    ; sample a few rows across the bar (not just one) so the fish is found reliably
+    global LastTapAt, FishPrev, FishPrevT
+    ; sample several rows for the fish (orange) and the box (blue) centres
     fsum := 0, fn := 0, bsum := 0, bn := 0
-    ystep := Max(3, (Cfg.trackB - Cfg.trackT) // 3)
+    ystep := Max(2, (Cfg.trackB - Cfg.trackT) // 4)
     y := Cfg.trackT
     while (y <= Cfg.trackB) {
         x := Cfg.trackL
@@ -290,21 +294,33 @@ TrackFish() {
                 fsum += x, fn += 1
             else if ColorNear(c, Cfg.boxCol, Cfg.colVar)
                 bsum += x, bn += 1
-            x += 3
+            x += 2
         }
         y += ystep
     }
-    if (fn < 2)                         ; need a couple of pixels so a stray dot isn't "the fish"
+    if (fn < 2) {                        ; no fish on screen -> stop tracking, clear velocity
+        FishPrev := -1
         return false
+    }
     fishC := fsum / fn
-    target := (bn > 2) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
-    width := Max(1, Cfg.trackR - Cfg.trackL)
-    diff := fishC - target
-    ; proportional correction: far = longer press, close = tiny nudge (less overshoot)
-    if (A_TickCount - LastTapAt >= Cfg.tapMs && Abs(diff) > Cfg.deadzone) {
-        frac := Min(1.0, Abs(diff) / width)
+    boxC := (bn > 2) ? (bsum / bn) : ((Cfg.trackL + Cfg.trackR) / 2)
+
+    ; Predict where the fish is heading and aim the box's CENTRE there, so the fish
+    ; stays in the middle of the box instead of the box chasing from behind.
+    t := A_TickCount
+    fishAim := fishC
+    if (FishPrev >= 0 && t > FishPrevT) {
+        vel := (fishC - FishPrev) / (t - FishPrevT)        ; px per ms
+        fishAim := fishC + vel * Cfg.trackLeadMs
+    }
+    FishPrev := fishC, FishPrevT := t
+
+    error := fishAim - boxC                                 ; how far the box centre is from the fish
+    half := Max(1, (Cfg.trackR - Cfg.trackL) / 2)
+    if (A_TickCount - LastTapAt >= Cfg.tapMs && Abs(error) > Cfg.deadzone) {
+        frac := Min(1.0, Abs(error) / half)
         hold := Round(Cfg.trackMinMs + frac * (Cfg.trackMaxMs - Cfg.trackMinMs))
-        goRight := (diff > 0)
+        goRight := (error > 0)
         if Cfg.drag
             goRight := !goRight
         key := goRight ? Cfg.rightKey : Cfg.leftKey
