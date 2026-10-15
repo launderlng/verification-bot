@@ -325,14 +325,26 @@ FindColor(x1, y1, x2, y2, color, &ox, &oy) {
 ; The green target sits at a random spot on the cast bar each time. Find its left
 ; edge, then say "release now" the moment the gold charge fill arrives just before
 ; it (releaseTol = px of lead so the release lands on the green despite key latency).
-; Returns the green's left edge x on the cast bar, or -1 if the green isn't seen.
+; The cast bar uses a strong BLUE charge that grows left->right and a strong GREEN
+; target. We detect them by colour character (not an exact calibrated colour), so it
+; works without fiddly colour calibration.
+ColorIsGreen(c) {
+    r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
+    return (g > 90 && g > r + 35 && g > b + 25)
+}
+ColorIsFill(c) {
+    r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
+    return (b > 90 && b > r + 45 && b > g + 20)   ; the blue charge
+}
+
+; Returns the green target's left edge x on the cast bar, or -1 if not seen.
 GreenLeft() {
     ystep := Max(2, (Cfg.castB - Cfg.castT) // 3)
     y := Cfg.castT
     while (y <= Cfg.castB) {
         x := Cfg.castL
         while (x <= Cfg.castR) {
-            if ColorNear(PixelGetColor(x, y), Cfg.greenCol, Cfg.colVar)
+            if ColorIsGreen(PixelGetColor(x, y))
                 return x
             x += 2
         }
@@ -341,18 +353,18 @@ GreenLeft() {
     return -1
 }
 
-; Returns the right edge x of the growing gold fill (rightmost gold, from the left,
-; tolerating small gaps), or -1 if no fill is seen.
+; Returns the right edge x of the growing blue charge (rightmost blue from the left,
+; tolerating small gaps), or -1 if no charge is seen.
 FillEdge(stopX) {
     yc := (Cfg.castT + Cfg.castB) // 2
     edge := -1, gap := 0
     x := Cfg.castL
     while (x < stopX) {
-        if ColorNear(PixelGetColor(x, yc), Cfg.markerCol, Cfg.colVar)
+        if ColorIsFill(PixelGetColor(x, yc))
             edge := x, gap := 0
         else {
             gap += 2
-            if (edge >= 0 && gap > 14)      ; after the fill, a real dark run = the leading edge
+            if (edge >= 0 && gap > 16)      ; after the charge, a real gap = the leading edge
                 break
         }
         x += 2
@@ -390,12 +402,13 @@ DebugTick() {
     edge := (gL >= 0) ? FillEdge(gL) : -1
     gtxt := (gL >= 0) ? gL : "none"
     ftxt := (edge >= 0) ? edge : "none"
+    cc := PixelGetColor(mx, my)
+    kind := ColorIsFill(cc) ? "BLUE charge" : ColorIsGreen(cc) ? "GREEN target" : "-"
     ToolTip "XZX detect  (F9 to hide)`n"
-        . "cursor colour: " Format("0x{:06X}", cur) "  @ " mx "," my "`n"
-        . "greenCol=" Format("0x{:06X}", Cfg.greenCol) "   goldCol=" Format("0x{:06X}", Cfg.markerCol) "   tol=" Cfg.colVar "`n"
-        . "green left x = " gtxt "    fill edge x = " ftxt "`n"
+        . "cursor colour: " Format("0x{:06X}", cur) "  (" kind ")  @ " mx "," my "`n"
+        . "green left x = " gtxt "    blue charge edge x = " ftxt "`n"
         . "cast region = " Cfg.castL "," Cfg.castT " .. " Cfg.castR "," Cfg.castB "`n"
-        . "release fires when fill edge >= green - " Cfg.releaseTol
+        . "releases when blue edge >= green - " Cfg.releaseTol
 }
 
 ; If never calibrated, drop the detection boxes where the game usually draws the bars.
@@ -418,8 +431,6 @@ Calibrate(*) {
     steps := [
         ["Hover the LEFT end of the CAST POWER bar", "castLpt"],
         ["Hover the RIGHT end of the CAST POWER bar", "castRpt"],
-        ["Hover the GREEN target block on the cast bar", "green"],
-        ["Hover the GOLD filled part of the cast bar (the charge colour)", "marker"],
         ["Hover the LEFT end of the FISHING bar", "trackLpt"],
         ["Hover the RIGHT end of the FISHING bar", "trackRpt"],
         ["Hover the FISH", "fish"],
@@ -439,7 +450,6 @@ Calibrate(*) {
     cl := got["castLpt"], cr := got["castRpt"]
     Cfg.castL := Min(cl.x, cr.x) - 4, Cfg.castR := Max(cl.x, cr.x) + 4
     Cfg.castT := Min(cl.y, cr.y) - 12, Cfg.castB := Max(cl.y, cr.y) + 12
-    Cfg.greenCol := got["green"].c, Cfg.markerCol := got["marker"].c
     tl := got["trackLpt"], tr := got["trackRpt"]
     Cfg.trackL := Min(tl.x, tr.x) - 4, Cfg.trackR := Max(tl.x, tr.x) + 4
     Cfg.trackT := Min(tl.y, tr.y) - 16, Cfg.trackB := Max(tl.y, tr.y) + 16
