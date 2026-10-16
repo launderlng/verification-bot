@@ -246,10 +246,29 @@ def _tos_dm(code: str, macro) -> discord.Embed:
     return ui.card(
         "⛔ Your macro key was disabled — copying detected",
         f"Extra copies of the {macro_name(macro)} macro were found on a device using your key `{code}`.\n\n"
-        "Copying, sharing or redistributing the macro breaks our **Terms of Service**. Your key has been **disabled**, and "
-        "those copies are now being removed from that PC automatically.\n\n"
+        "Copying, sharing or redistributing the macro breaks our **Terms of Service**, so your key has been **disabled** "
+        "and the macro will stop working.\n\n"
         "If you believe this is a mistake, open a ticket in the server.",
         color=DANGER, section="Keys")
+
+
+def _shared_dm(code: str, macro) -> discord.Embed:
+    return ui.card(
+        "⛔ Your macro key was disabled — used on another device",
+        f"Your {macro_name(macro)} key `{code}` was used on a second computer. Keys lock to one device, and sharing or "
+        "using a key on more than one machine breaks our **Terms of Service**, so the key has been **disabled** and the "
+        "macro will stop working.\n\n"
+        "If this was you (for example a new PC) or you think it's a mistake, open a ticket in the server and staff can turn it back on.",
+        color=DANGER, section="Keys")
+
+
+def _reenabled_dm(code: str, macro) -> discord.Embed:
+    return ui.card(
+        "✅ Your macro key is active again",
+        f"Your {macro_name(macro)} key `{code}` has been re-enabled and its device lock was cleared, so you can log in "
+        "again on your computer — it will lock to the first device that logs in.\n\n"
+        "Please don't share it: using it on another device will disable it again.",
+        color=SUCCESS, section="Keys")
 
 
 async def _dm_user(bot, user_id: Optional[int], embed: discord.Embed) -> bool:
@@ -322,6 +341,39 @@ def copy_review_view(license_id: int) -> discord.ui.View:
     return view
 
 
+class ReenableKeyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sharelock:on:(?P<lid>[0-9]+)"):
+    """Staff: re-enable a key that was auto-disabled for second-device use, clear its device
+    lock so the owner can log in fresh, and DM them that it's active again."""
+    def __init__(self, license_id: int):
+        super().__init__(discord.ui.Button(label="Re-enable key", emoji="✅",
+                                           style=discord.ButtonStyle.success, custom_id=f"sharelock:on:{license_id}"))
+        self.license_id = license_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["lid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("Only staff can action this.", ephemeral=True)
+        row = await db.fetch_one("SELECT * FROM licenses WHERE id = ?", (self.license_id,))
+        if not row:
+            return await interaction.response.send_message("That key no longer exists.", ephemeral=True)
+        await db.execute("UPDATE licenses SET active = 1, hwid = NULL WHERE id = ?", (row["id"],))
+        await log_event(row["id"], "activated", f"shared-key re-enable by {interaction.user.id}; device lock cleared")
+        dmed = await _dm_user(interaction.client, row["user_id"], _reenabled_dm(row["code"], row["macro"]))
+        embed = interaction.message.embeds[0] if interaction.message.embeds else ui.card("Shared key", "", color=DANGER)
+        embed.set_footer(text=f"✅ Re-enabled by {interaction.user} · device lock cleared · "
+                              + ("owner DM'd" if dmed else "owner not DM'd (DMs closed / no account)"))
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+def shared_lock_view(license_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(ReenableKeyButton(license_id))
+    return view
+
+
 class Keys(commands.GroupCog, group_name="key", group_description="Macro license keys"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -341,9 +393,34 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             app.router.add_get("/auth/callback", self.handle_auth_callback)
             log.info("License check route is ready at /api/activate (Discord linking %s)",
                      "ON" if self.linking_enabled() else "off: set DISCORD_CLIENT_SECRET to turn it on")
-        self.bot.add_dynamic_items(CopyDisableButton, CopyIgnoreButton)
+        self.bot.add_dynamic_items(CopyDisableButton, CopyIgnoreButton, ReenableKeyButton)
         if not self.expiry_sweep.is_running():
             self.expiry_sweep.start()
+
+    async def auto_disable_shared(self, row, tried_hwid) -> None:
+        """A key used on a second device: disable it, DM the owner the ToS notice, and post to the
+        dedicated 🚨 shared-key log with a staff 'Re-enable key' button. Access control only."""
+        if row["active"]:
+            await db.execute("UPDATE licenses SET active = 0 WHERE id = ?", (row["id"],))
+        await log_event(row["id"], "deactivated", f"auto: used on a second device {str(tried_hwid)[:60]}")
+        dmed = await _dm_user(self.bot, row["user_id"], _shared_dm(row["code"], row["macro"]))
+        try:
+            guild = self.log_guild(row)
+            if guild is None:
+                return
+            who = (f"<@{row['user_id']}> · `{row['user_id']}`" if row["user_id"]
+                   else (row["owner_name"] or "unassigned"))
+            embed = ui.card(
+                "🚨 Key auto-disabled — used on a second device",
+                ui.kv(("👤 Owner", who), ("🔑 Key", f"`{row['code']}`"), ("🎮 Macro", macro_label(row["macro"])),
+                      ("🔒 Locked to", f"`{row['hwid']}`" if row["hwid"] else "—"),
+                      ("🕵️ Tried from", f"`{str(tried_hwid)[:60]}`"),
+                      ("📬 Owner", "DM sent" if dmed else "couldn't DM (DMs closed / no account)"),
+                      ("↩️ Undo", "Re-enable below turns it back on, clears the device lock and DMs them")),
+                color=DANGER, guild=guild, section="Keys")
+            await send_log(guild, "sharing", embed, view=shared_lock_view(row["id"]))
+        except Exception:
+            log.exception("Couldn't post a shared-key log")
 
     async def cog_unload(self):
         self.expiry_sweep.cancel()
@@ -596,10 +673,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                 row = await db.fetch_one("SELECT * FROM licenses WHERE id = ?", (row["id"],))
             elif row["hwid"] != dev:
                 await log_event(row["id"], "activation_denied", f"wrong device {dev[:60]}")
-                await self.key_log(row, "🖥️ Key used on a different device", who,
-                                   (("🔒 Locked to", f"`{row['hwid']}`"), ("🕵️ Tried from", f"`{dev}`"),
-                                    ("❌ Refused", "Different device — the copy there will self-destruct"),
-                                    ("🔎 Reset", "`/key resethwid` if this member got a new PC")), DANGER)
+                await self.auto_disable_shared(row, dev)   # second device -> auto-disable + DM + shared-key log
                 return web.Response(text="DENIED|KEY LOCKED TO ANOTHER DEVICE")
         owner = row["user_id"]
         first_link = False
@@ -667,7 +741,8 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             if row["macro"] and row["macro"] != asked:
                 reason = f"THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO"
             elif row["hwid"] and dev and row["hwid"] != dev:
-                reason = "KEY LOCKED TO ANOTHER DEVICE"
+                await self.auto_disable_shared(row, dev)   # second device -> auto-disable + DM + shared-key log
+                reason = "KEY DISABLED"
             elif self.linking_enabled() and row["user_id"]:
                 link = await self.linked_user(clean_session(form.get("session")))
                 if link is not None and link["user_id"] != row["user_id"]:
