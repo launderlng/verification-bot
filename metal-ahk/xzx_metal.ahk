@@ -7309,9 +7309,12 @@ WaitForArc(timeoutMs) {
             return arc
         ; Not where we expected it: the Skill Check panel is not centred, and
         ; its position can differ per server / resolution. Look for it on the
-        ; whole screen (every 400ms, after giving it 120ms to draw).
-        if (C.AUTO_LOCATE_DIAL && A_TickCount - t0 > 120
-                && A_TickCount - lastLocate > 400) {
+        ; whole screen - aggressively, because a round is short. Try almost
+        ; immediately (40ms, just enough for the dial to have drawn) and keep
+        ; retrying every 150ms until it is found, so an off-centre panel is
+        ; caught within the same round instead of after it has moved on.
+        if (C.AUTO_LOCATE_DIAL && A_TickCount - t0 > 40
+                && A_TickCount - lastLocate > 150) {
             lastLocate := A_TickCount
             if (AutoLocateDial() && (arc := FindArc()))
                 return arc
