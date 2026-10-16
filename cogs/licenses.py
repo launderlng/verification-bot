@@ -825,6 +825,64 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                           footer=f"{total['c']:,} keys in total · {total['a']:,} enabled" + (f"\n{per_macro}" if per_macro else "")),
             ephemeral=True)
 
+    @app_commands.command(name="all", description="Every key with its linked info (owner, device, status, expiry, last seen)")
+    @app_commands.describe(macro="Only keys for this macro", status="Filter by status")
+    @app_commands.choices(status=[app_commands.Choice(name=n, value=n) for n in ("all", "active", "disabled", "expired")],
+                          macro=FILTER_MACRO_CHOICES)
+    async def list_all(self, interaction: discord.Interaction, macro: Optional[str] = None, status: str = "all"):
+        sql, where, params = "SELECT * FROM licenses", [], []
+        if macro == "all":
+            where.append("macro IS NULL")
+        elif clean_macro(macro):
+            where.append("macro = ?")
+            params.append(clean_macro(macro))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        rows = await db.fetch_all(sql + " ORDER BY id DESC", tuple(params))
+        wanted = {"active": "✅", "disabled": "⛔", "expired": "⌛"}.get(status)
+        if wanted:
+            rows = [r for r in rows if status_text(r).startswith(wanted)]
+        if not rows:
+            raise UserError("No keys match that.")
+
+        def fmt(r) -> str:
+            who = f"<@{r['user_id']}>" if r["user_id"] else (r["owner_name"] or "unassigned")
+            dev = f"`{r['hwid'][:16]}…`" if r["hwid"] else "not bound"
+            last = parse_time(r["last_seen"])
+            seen = discord.utils.format_dt(last, "R") if last else "never"
+            return (f"{status_text(r)[:1]} `{r['code']}` · **{macro_label(r['macro'])}**\n"
+                    f" {who} · 🖥️ {dev} · ⏳ {expiry_text(r)} · 👁️ {seen}")
+
+        # page the lines so each embed stays under Discord's description limit
+        pages, buf, size = [], [], 0
+        for ln in (fmt(r) for r in rows):
+            if buf and (size + len(ln) + 1 > 3900 or len(buf) >= 12):
+                pages.append("\n".join(buf))
+                buf, size = [], 0
+            buf.append(ln)
+            size += len(ln) + 1
+        if buf:
+            pages.append("\n".join(buf))
+
+        total = await db.fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(active), 0) AS a FROM licenses")
+        counts = await db.fetch_all("SELECT macro, COUNT(*) AS c FROM licenses GROUP BY macro")
+        per_macro = " · ".join(f"{macro_name(c['macro'])}: {c['c']:,}" for c in counts)
+        foot = f"{len(rows):,} shown · {total['c']:,} keys total · {total['a']:,} enabled" + (f"\n{per_macro}" if per_macro else "")
+
+        shown = pages[:12]
+        for i, pg in enumerate(shown):
+            emb = ui.card(f"🔑 All keys ({i + 1}/{len(shown)})", pg, guild=interaction.guild, footer=foot)
+            if i == 0:
+                await interaction.response.send_message(embed=emb, ephemeral=True)
+            else:
+                await interaction.followup.send(embed=emb, ephemeral=True)
+        if len(pages) > 12:
+            await interaction.followup.send(
+                embed=ui.card("…more keys", f"{len(rows):,} keys matched - showing the first {12 * 12}. "
+                              "Narrow it with the `macro` or `status` options, or use `/key info` for one key.",
+                              guild=interaction.guild),
+                ephemeral=True)
+
     async def set_active(self, interaction: discord.Interaction, code: str, active: bool):
         row = await find_license(code)
         await db.execute("UPDATE licenses SET active = ? WHERE id = ?", (int(active), row["id"]))
