@@ -48,6 +48,12 @@ global Cfg := {
     radius:  ReadNum("Radius", 52),    ; radius of the track the red marker moves on
     margin:  ReadNum("Margin", 9),     ; purple must be this far either side of the marker before pressing E
     checks:  ReadNum("Checks", 4),     ; skill checks per dig
+    detectSlot: ReadNum("DetectSlot", 1),  ; hotbar slot with the metal detector
+    foodSlot:   ReadNum("FoodSlot", 2),    ; hotbar slot with the food
+    waterSlot:  ReadNum("WaterSlot", 5),   ; hotbar slot with the water
+    eatEvery:   ReadNum("EatEvery", 20),   ; eat + drink every this many digs (0 = never)
+    foodWait:   ReadNum("FoodWait", 3),    ; seconds to wait after eating
+    waterWait:  ReadNum("WaterWait", 3),   ; seconds to wait after drinking
     stream:  ReadNum("Stream", 1),     ; 1 = hide the menu from OBS/Discord
     toggleKey: IniRead(INI, "Macro", "ToggleKey", "F6")
 }
@@ -60,7 +66,8 @@ ReadNum(key, def, isFloat := false) {
 Cfg.stream := 1
 
 SaveCfg() {
-    for k in ["cx", "cy", "radius", "margin", "checks", "stream", "toggleKey"]
+    for k in ["cx", "cy", "radius", "margin", "checks", "detectSlot", "foodSlot", "waterSlot",
+              "eatEvery", "foodWait", "waterWait", "stream", "toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", StrTitle(k))
 }
 
@@ -69,13 +76,19 @@ SaveCfg() {
 ; ---------------------------------------------------------------------------
 global BAND := 4                   ; px inside/outside the radius to check
 global STEP_DEG := 3               ; angle resolution in degrees
-global DETECT_KEY := "sc002"       ; the "1" key (hotbar slot with the detector)
 global HIT_KEY := "sc012"          ; the "E" key
 global KEY_HOLD_MS := 35           ; how long each key is held down
 global HIT_COOLDOWN_MS := 400      ; wait after a hit so the next check can load
 global WAIT_FOR_CHECK_MS := 40000  ; max wait for the search bar to finish
 global ROUND_PAUSE_MS := 2500      ; pause after a full dig before pressing 1 again
 global GAME_WIN := "ahk_class grcWindow"   ; FiveM window. Set to "" to disable this check.
+
+; A hotbar slot number (1-9, 0) -> its keyboard scan code, so it works on any layout.
+SlotSc(n) {
+    static m := Map(1, "sc002", 2, "sc003", 3, "sc004", 4, "sc005", 5, "sc006",
+                    6, "sc007", 7, "sc008", 8, "sc009", 9, "sc00A", 0, "sc00B")
+    return m.Has(n) ? m[n] : "sc002"
+}
 
 ; colour rules
 IsRed(r, g, b)    => (r >= 140 && g <= 90 && b <= 110 && r - b >= 60)
@@ -85,6 +98,7 @@ IsPanel(r, g, b)  => (r < 80 && g < 80 && b < 95)
 ; detector state (GRAB + SAMPLES rebuilt whenever cx/cy/radius change)
 global PAD := 0, GRAB := 0, NBINS := 0, SAMPLES := []
 global Passed := 0, RoundState := "idle"
+global DigCount := 0, SinceEat := 0    ; digs done, and digs since the last food/water break
 
 ; ---------------------------------------------------------------------------
 ;  THEME  (matches the XZX macro)
@@ -99,7 +113,7 @@ global ACCENT_HEX := "B57BFF", GREEN_HEX := "6EE7B7", DANGER_HEX := "F0587E"
 global FONT := "Segoe UI", FONT_SEMI := "Segoe UI Semibold"
 global LOGO := A_Temp "\xzx_metal_logo.png"   ; built into this file, written out at startup
 
-global WIN_W := 600, WIN_H := 756
+global WIN_W := 600, WIN_H := 876
 global UI := Map(), NoDrag := Map(), Clickable := Map()
 global Running := false, Looping := false
 global Runs := 0, LastRun := 0, T0 := A_TickCount, CurKeys := []
@@ -130,11 +144,12 @@ SetTimer(StreamGuard, 4000)         ; keeps the window hidden from capture even 
 ;  THE MACRO  -  watch the circular skill check, press E inside the zone
 ; ---------------------------------------------------------------------------
 StartLoop(*) {
-    global Looping, Passed
+    global Looping, Passed, SinceEat
     if Looping
         return
     Looping := true
     Passed := 0
+    SinceEat := 0                   ; fresh session - count digs to the next food/water break from 0
     PaintState()
     SetTimer(MainLoop, -10)
 }
@@ -164,16 +179,26 @@ TestRun(*) {
         : "No skill check on screen right now")
 }
 
-; The dig loop: press 1, wait for a check, then solve each check in the round.
+; The dig loop: press the detector slot, wait for a check, then solve the round.
+; Every Cfg.eatEvery digs it eats and drinks before carrying on.
 MainLoop() {
-    global Looping, Runs, LastRun, Passed
+    global Looping, Runs, LastRun, Passed, DigCount, SinceEat
     while Looping {
         if (GAME_WIN != "" && !WinActive(GAME_WIN)) {
             SetState("WAITING", "Click into FiveM to start")
             Sleep 400
             continue
         }
-        Tap(DETECT_KEY)
+        ; food + water break every N digs, then re-check the window and carry on
+        if (Cfg.eatEvery > 0 && SinceEat >= Cfg.eatEvery) {
+            SinceEat := 0
+            EatDrink()
+            if !Looping
+                break
+            continue
+        }
+        Tap(SlotSc(Cfg.detectSlot))
+        DigCount++, SinceEat++
         SetState("DETECTING", "Waiting for the skill check…")
         if !WaitForCheck(WAIT_FOR_CHECK_MS) {
             if Looping
@@ -237,6 +262,25 @@ Tap(key) {
     SendEvent "{" key " down}"
     DllCall("Sleep", "uint", KEY_HOLD_MS)
     SendEvent "{" key " up}"
+}
+
+; Press the food slot, wait, press the water slot, wait - then the dig loop resumes.
+EatDrink() {
+    SetState("EATING", "Using food (slot " Cfg.foodSlot ")…")
+    Tap(SlotSc(Cfg.foodSlot))
+    CountdownSleep(Cfg.foodWait)
+    if !Looping
+        return
+    SetState("DRINKING", "Using water (slot " Cfg.waterSlot ")…")
+    Tap(SlotSc(Cfg.waterSlot))
+    CountdownSleep(Cfg.waterWait)
+}
+
+; Sleep in short steps so STOP still responds during a food/water wait.
+CountdownSleep(seconds) {
+    deadline := A_TickCount + seconds * 1000
+    while (Looping && A_TickCount < deadline)
+        Sleep 50
 }
 
 SetState(state, detail) {
@@ -486,18 +530,18 @@ BuildGui() {
     }
 
     ; ---- keybinds
-    Lbl(g, "x46 y652 w400 h14", "KEYBINDS   ·   click a purple one to change it", "s7 bold", TXT_DIM)
+    Lbl(g, "x46 y772 w400 h14", "KEYBINDS   ·   click a purple one to change it", "s7 bold", TXT_DIM)
     for i, k in KeybindSlots() {
         x := 46 + (i - 1) * 130
         if (k.key != "") {
-            chip := Btn(g, "x" (x + 2) " y678 w54 h26", Cfg.%k.key%, CaptureHandler(k.key), "s9 bold", TXT_MAIN, FONT_SEMI, INPUT_HEX)
+            chip := Btn(g, "x" (x + 2) " y798 w54 h26", Cfg.%k.key%, CaptureHandler(k.key), "s9 bold", TXT_MAIN, FONT_SEMI, INPUT_HEX)
             UI["chip_" k.key] := chip
         } else {
-            Lbl(g, "x" (x + 2) " y678 w54 h26 0x200 Center", k.fixed, "s9 bold", TXT_SUB, FONT_SEMI, INPUT_HEX)
+            Lbl(g, "x" (x + 2) " y798 w54 h26 0x200 Center", k.fixed, "s9 bold", TXT_SUB, FONT_SEMI, INPUT_HEX)
         }
-        Lbl(g, "x" (x + 66) " y676 w64 h30 0x200", k.label, "s8", TXT_SUB)
+        Lbl(g, "x" (x + 66) " y796 w64 h30 0x200", k.label, "s8", TXT_SUB)
     }
-    Lbl(g, "x24 y734 w552 h14 Center", "XZX Macro  ·  by Coop", "s7", TXT_DIM)
+    Lbl(g, "x24 y854 w552 h14 Center", "XZX Macro  ·  by Coop", "s7", TXT_DIM)
 
     g.Show("w" WIN_W " h" WIN_H)
     try {
@@ -513,13 +557,19 @@ BuildGui() {
 }
 
 Cells() => [
-    {x: 40,  y: 452, label: "Ring centre X",         kind: "num", key: "cx"},
-    {x: 304, y: 452, label: "Ring centre Y",         kind: "num", key: "cy"},
-    {x: 40,  y: 494, label: "Ring radius (px)",      kind: "num", key: "radius"},
-    {x: 304, y: 494, label: "Zone margin (deg)",     kind: "num", key: "margin"},
-    {x: 40,  y: 536, label: "Skill checks per dig",  kind: "num", key: "checks"},
-    {x: 304, y: 536, label: "Stream proof",          kind: "switch", key: "stream"},
-    {x: 40,  y: 578, label: "Test detection",        kind: "test", key: ""}
+    {x: 40,  y: 450, label: "Detector slot",         kind: "num", key: "detectSlot"},
+    {x: 304, y: 450, label: "Skill checks per dig",  kind: "num", key: "checks"},
+    {x: 40,  y: 490, label: "Food slot",             kind: "num", key: "foodSlot"},
+    {x: 304, y: 490, label: "Water slot",            kind: "num", key: "waterSlot"},
+    {x: 40,  y: 530, label: "Eat/drink every digs",  kind: "num", key: "eatEvery"},
+    {x: 304, y: 530, label: "Food wait (s)",         kind: "num", key: "foodWait"},
+    {x: 40,  y: 570, label: "Water wait (s)",        kind: "num", key: "waterWait"},
+    {x: 304, y: 570, label: "Zone margin (deg)",     kind: "num", key: "margin"},
+    {x: 40,  y: 610, label: "Ring centre X",         kind: "num", key: "cx"},
+    {x: 304, y: 610, label: "Ring centre Y",         kind: "num", key: "cy"},
+    {x: 40,  y: 650, label: "Ring radius (px)",      kind: "num", key: "radius"},
+    {x: 304, y: 650, label: "Stream proof",          kind: "switch", key: "stream"},
+    {x: 40,  y: 690, label: "Test detection",        kind: "test", key: ""}
 ]
 
 KeybindSlots() => [
@@ -579,7 +629,7 @@ PaintState() {
 }
 
 SaveFields() {
-    for k in ["cx", "cy", "radius", "margin", "checks"] {
+    for k in ["cx", "cy", "radius", "margin", "checks", "detectSlot", "foodSlot", "waterSlot", "eatEvery", "foodWait", "waterWait"] {
         v := Trim(UI["f_" k].Value)
         if !IsNumber(v)
             continue
@@ -587,6 +637,8 @@ SaveFields() {
     }
     Cfg.radius := Max(10, Cfg.radius)
     Cfg.checks := Max(1, Cfg.checks)
+    for k in ["detectSlot", "foodSlot", "waterSlot"]   ; hotbar slots are 0-9
+        Cfg.%k% := Min(9, Cfg.%k%)
     SaveCfg()
     RebuildGrab()                              ; coords/radius changed -> recapture
     UI["every"].Text := Cfg.checks " checks per dig"
@@ -747,7 +799,7 @@ Render() {
     }
 
     ; switches
-    DrawSwitch(pG, 304 + 196, 536 + 7, Cfg.stream)
+    DrawSwitch(pG, 304 + 196, 650 + 7, Cfg.stream)
 
     DllCall("Gdiplus\GdipCreateHBITMAPFromBitmap", "Ptr", pBmp, "Ptr*", &hbm, "UInt", 0xFF000000)
     DllCall("Gdiplus\GdipDeleteGraphics", "Ptr", pG)
@@ -781,8 +833,8 @@ RenderStatic() {
         Card(pG, x, 262, 176, 72, 16)                     ; stats
         RoundFill(pG, x + 20, 322, 22, 3, 1, 0xFF000000 | C_ACCL)
     }
-    Card(pG, 24, 414, 552, 214, 20)                       ; settings
-    Card(pG, 24, 640, 552, 84, 18)                        ; keybinds
+    Card(pG, 24, 414, 552, 320, 20)                       ; settings
+    Card(pG, 24, 760, 552, 84, 18)                        ; keybinds
 
     ; setting rows
     for c in Cells() {
@@ -798,8 +850,8 @@ RenderStatic() {
     ; keybind chips (purple outline = click to change)
     for i, k in KeybindSlots() {
         x := 46 + (i - 1) * 130
-        RoundFill(pG, x, 676, 58, 30, 9, 0xFF000000 | C_INPUT)
-        RoundStroke(pG, x + 0.5, 676.5, 57, 29, 9, 0xFF000000 | (k.key != "" ? C_ACC : C_BORDER), k.key != "" ? 1.4 : 1)
+        RoundFill(pG, x, 796, 58, 30, 9, 0xFF000000 | C_INPUT)
+        RoundStroke(pG, x + 0.5, 796.5, 57, 29, 9, 0xFF000000 | (k.key != "" ? C_ACC : C_BORDER), k.key != "" ? 1.4 : 1)
     }
 
     DllCall("Gdiplus\GdipDeleteGraphics", "Ptr", pG)
