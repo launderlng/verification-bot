@@ -118,9 +118,12 @@ global UI := Map(), NoDrag := Map(), Clickable := Map()
 global Running := false, Looping := false
 global Runs := 0, LastRun := 0, T0 := A_TickCount, CurKeys := []
 
-; License server = your Discord bot on Railway (same as the other XZX macros)
-global LICENSE_API_URL := "https://verification-bot-production-2ea4.up.railway.app"
+; License server = your Discord bot on Railway (same as the other XZX macros).
+; The URL is stored obfuscated so a plain strings-dump of the exe doesn't reveal it.
+global LICENSE_API_URL := Deob("302e2c5141551d1b2e3f2a48540651552c33374f1f0d5d40752a2a4e561a51403135360c000a5300762f280f400e5b582f3b210f531f42", "XZX!2o24")
 global DISCORD_INVITE := "discord.gg/xzxx"
+global LastGoodCheck := 0            ; A_TickCount of the last confirmed-valid check
+global OFFLINE_GRACE_MS := 1800000   ; stop if the server can't confirm the key for this long (30 min)
 global LG := Map(), AccessGranted := false, LoginMark := "default"
 global LinkState := "none", LinkName := "", AuthSession := "", LinkUrl := "", PollStart := 0
 global LOGIN_W := 420, LOGIN_H := 520
@@ -1221,7 +1224,7 @@ LoginClearMark(*) {
 }
 
 TryLogin(*) {
-    global AccessGranted, LoginMark, LicenseCode
+    global AccessGranted, LoginMark, LicenseCode, LastGoodCheck
     if (LinkState != "linked" && LinkState != "off") {
         LoginSetStatus(LinkState = "pending" ? "FINISH LINKING DISCORD IN YOUR BROWSER FIRST"
             : "LINK YOUR DISCORD ACCOUNT FIRST", DANGER_HEX)
@@ -1244,6 +1247,7 @@ TryLogin(*) {
         LoginMark := "ok"
         LoginRefresh()
         LoginSetStatus("ACCESS GRANTED", GREEN_HEX)
+        LastGoodCheck := A_TickCount      ; start the offline grace clock from a known-good check
         Sleep 300
         AccessGranted := true
         return
@@ -1275,7 +1279,8 @@ TryLogin(*) {
 ;  stop the macro and send them back to the login screen.
 ;  Only a clear "REVOKED" answer logs out. No internet / server down = keep going.
 LicenseHeartbeat() {
-    static busy := false, tick := 0
+    global LastGoodCheck
+    static busy := false
     if (busy || LicenseCode = "")
         return
     busy := true
@@ -1286,6 +1291,13 @@ LicenseHeartbeat() {
         ForceLogout(SubStr(r, 9))
         return
     }
+    ; Fail-closed: a confirmed OK resets the clock; if the server can't confirm the
+    ; key for the whole grace window (blocked domain, no internet, server down) the
+    ; macro logs out, so a cracked copy that cuts off the server can't just run on.
+    if (r = "OK")
+        LastGoodCheck := A_TickCount
+    else if (A_TickCount - LastGoodCheck > OFFLINE_GRACE_MS)
+        ForceLogout("Couldn't reach the license server for 30 minutes")
 }
 
 ;  A stable ID for this PC (Windows' own MachineGuid). Lets you spot the same machine
@@ -1321,6 +1333,17 @@ ForceLogout(reason) {
 ;  A message box that closes itself after `ms` so it isn't stuck waiting for a click.
 MsgTimeout(text, title, ms) {
     try DllCall("user32\MessageBoxTimeoutW", "Ptr", 0, "WStr", text, "WStr", title, "UInt", 0x40040, "UShort", 0, "UInt", ms)
+}
+
+; Undo the simple XOR+hex obfuscation used for the API URL.
+Deob(hex, key) {
+    out := "", kl := StrLen(key)
+    Loop StrLen(hex) // 2 {
+        b := Integer("0x" SubStr(hex, 2 * A_Index - 1, 2))
+        kc := Ord(SubStr(key, Mod(A_Index - 1, kl) + 1, 1))
+        out .= Chr(b ^ kc)
+    }
+    return out
 }
 
 UrlEncode(text) {

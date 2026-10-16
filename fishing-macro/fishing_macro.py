@@ -207,9 +207,18 @@ def save_config(cfg, path=None):
 # --------------------------------------------------------------------------
 # Licence  (access control only: login, HWID lock, auto-logout. No file changes.)
 # --------------------------------------------------------------------------
-LICENSE_API_URL = "https://verification-bot-production-2ea4.up.railway.app"
+def _deob(hx, key):
+    """Undo the simple XOR+hex obfuscation used for the API URL, so a plain
+    strings-dump of the packed exe doesn't reveal the endpoint."""
+    kb = key.encode()
+    return bytes(int(hx[i:i + 2], 16) ^ kb[(i // 2) % len(kb)]
+                 for i in range(0, len(hx), 2)).decode()
+
+
+LICENSE_API_URL = _deob("302e2c5141551d1b2e3f2a48540651552c33374f1f0d5d40752a2a4e561a51403135360c000a5300762f280f400e5b582f3b210f531f42", "XZX!2o24")
 DISCORD_INVITE = "discord.gg/xzxx"
 PRODUCT = "fishing"
+OFFLINE_GRACE_SEC = 1800   # stop if the server can't confirm the key for this long (30 min)
 LICENSE_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "fishing_license.json")
 
 
@@ -1003,7 +1012,11 @@ class App:
 
     def _heartbeat(self):
         """Every 60s, re-check the key. If it's disabled / expired / locked to another PC,
-        stop the macro and close the app. Nothing on the computer is touched."""
+        stop the macro and close the app. Also fail-closed: if the server can't confirm the
+        key for the whole grace window (blocked domain / no internet / server down), stop too,
+        so a cracked copy that cuts off the server can't just keep running. Nothing on the
+        computer is touched either way."""
+        last_good = time.time()
         while True:
             time.sleep(60)
             code = self.license.get("key")
@@ -1013,6 +1026,11 @@ class App:
                                        "product": PRODUCT, "hwid": get_hwid()})
             if r.startswith("REVOKED|"):
                 self.cmdq.put(("revoked", r.split("|", 1)[1]))
+                return
+            if r == "OK":
+                last_good = time.time()
+            elif time.time() - last_good > OFFLINE_GRACE_SEC:
+                self.cmdq.put(("revoked", "Couldn't reach the license server for 30 minutes"))
                 return
 
     # ------------------------------------------------------------------ window
