@@ -98,7 +98,7 @@ IsPanel(r, g, b)  => (r < 80 && g < 80 && b < 95)
 ; detector state (GRAB + SAMPLES rebuilt whenever cx/cy/radius change)
 global PAD := 0, GRAB := 0, NBINS := 0, SAMPLES := []
 global Passed := 0, RoundState := "idle"
-global DigCount := 0, SinceEat := 0    ; digs done, and digs since the last food/water break
+global DigCount := 0, SinceEat := 0    ; digs done, and skill-check hits since the last food/water break
 
 ; ---------------------------------------------------------------------------
 ;  THEME  (matches the XZX macro)
@@ -149,7 +149,7 @@ StartLoop(*) {
         return
     Looping := true
     Passed := 0
-    SinceEat := 0                   ; fresh session - count digs to the next food/water break from 0
+    SinceEat := 0                   ; fresh session - count hits to the next food/water break from 0
     PaintState()
     SetTimer(MainLoop, -10)
 }
@@ -180,7 +180,8 @@ TestRun(*) {
 }
 
 ; The dig loop: press the detector slot, wait for a check, then solve the round.
-; Every Cfg.eatEvery digs it eats and drinks before carrying on.
+; Every Cfg.eatEvery skill checks hit, it eats and drinks (at the next safe gap
+; between digs) before carrying on.
 MainLoop() {
     global Looping, Runs, LastRun, Passed, DigCount, SinceEat
     while Looping {
@@ -189,7 +190,7 @@ MainLoop() {
             Sleep 400
             continue
         }
-        ; food + water break every N digs, then re-check the window and carry on
+        ; food + water break once enough checks have been hit, then carry on
         if (Cfg.eatEvery > 0 && SinceEat >= Cfg.eatEvery) {
             SinceEat := 0
             EatDrink()
@@ -198,7 +199,7 @@ MainLoop() {
             continue
         }
         Tap(SlotSc(Cfg.detectSlot))
-        DigCount++, SinceEat++
+        DigCount++
         SetState("DETECTING", "Waiting for the skill check…")
         if !WaitForCheck(WAIT_FOR_CHECK_MS) {
             if Looping
@@ -212,7 +213,7 @@ MainLoop() {
             SetState("SOLVING", "Watching the ring for the zone…")
             result := SolveOne()
             if (result = "hit") {
-                Passed++, Runs++, LastRun := A_TickCount
+                Passed++, Runs++, SinceEat++, LastRun := A_TickCount
                 if UI.Has("runs")
                     UI["runs"].Text := Runs
                 if UI.Has("last")
@@ -561,7 +562,7 @@ Cells() => [
     {x: 304, y: 450, label: "Skill checks per dig",  kind: "num", key: "checks"},
     {x: 40,  y: 490, label: "Food slot",             kind: "num", key: "foodSlot"},
     {x: 304, y: 490, label: "Water slot",            kind: "num", key: "waterSlot"},
-    {x: 40,  y: 530, label: "Eat/drink every digs",  kind: "num", key: "eatEvery"},
+    {x: 40,  y: 530, label: "Eat/drink every hits",  kind: "num", key: "eatEvery"},
     {x: 304, y: 530, label: "Food wait (s)",         kind: "num", key: "foodWait"},
     {x: 40,  y: 570, label: "Water wait (s)",        kind: "num", key: "waterWait"},
     {x: 304, y: 570, label: "Zone margin (deg)",     kind: "num", key: "margin"},
