@@ -1,0 +1,57 @@
+name: Build Alt Click EXE (AutoHotkey)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "alt-ahk/**"
+      - ".github/workflows/build-altclick-ahk.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch AutoHotkey v2 base + Ahk2Exe (from v1.1), compile
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Invoke-WebRequest -Uri "https://github.com/AutoHotkey/AutoHotkey/releases/download/v2.0.18/AutoHotkey_2.0.18.zip" -OutFile ahk.zip
+          Expand-Archive ahk.zip -DestinationPath ahk -Force
+          $b = Get-ChildItem ahk -Recurse -Filter AutoHotkey64.exe | Select-Object -First 1
+          Invoke-WebRequest -Uri "https://github.com/AutoHotkey/AutoHotkey/releases/download/v1.1.37.02/AutoHotkey_1.1.37.02.zip" -OutFile ahk1.zip
+          Expand-Archive ahk1.zip -DestinationPath ahk1 -Force
+          $c = Get-ChildItem ahk1 -Recurse -Filter Ahk2Exe.exe | Select-Object -First 1
+          "compiler = $($c.FullName)" | Tee-Object build.log -Append
+          "base     = $($b.FullName)" | Tee-Object build.log -Append
+          if ($c -and $b) {
+            $inp = (Resolve-Path "alt-ahk\xzx_alt_click.ahk").Path
+            $ico = (Resolve-Path "alt-ahk\xzx_alt_click.ico").Path
+            $out = Join-Path $PWD "XZX Alt Click.exe"
+            & $c.FullName /in $inp /out $out /icon $ico /base $b.FullName *>&1 | Tee-Object build.log -Append
+            "exit code = $LASTEXITCODE" | Tee-Object build.log -Append
+            $found = Get-ChildItem -Recurse -Filter "XZX Alt Click.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { "found = $($found.FullName) ($($found.Length) bytes)" | Tee-Object build.log -Append; if ($found.FullName -ne $out) { Copy-Item $found.FullName $out -Force } }
+          }
+          if (Test-Path "XZX Alt Click.exe") { "EXE OK" | Tee-Object build.log -Append } else { "NO EXE" | Tee-Object build.log -Append }
+
+      - name: Publish log (+ exe) to a branch I can fetch
+        if: always()
+        shell: bash
+        run: |
+          mkdir out
+          cp build.log "out/build.log" 2>/dev/null || echo "no log" > out/build.log
+          if [ -f "XZX Alt Click.exe" ]; then cp "XZX Alt Click.exe" "out/XZX Alt Click.exe"; else echo "compile failed" > out/NO_EXE.txt; fi
+          cd out
+          git init -q
+          git checkout -q -b exe-dist-altclick
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "exe-bot"
+          git add -A
+          git commit -q -m "altclick exe ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" exe-dist-altclick
