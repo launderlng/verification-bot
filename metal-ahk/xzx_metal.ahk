@@ -341,6 +341,7 @@ global C := {
                                      ; only in the middle. Raise if still early.
     STAGE_GAP_MS:         1500,      ; after a hit, how long to look for the next stage
     AUTO_LOCATE_DIAL:     1,         ; find the Skill Check dial anywhere on screen
+    AUTO_LEARN_COLOUR:    1,         ; if presets miss, find dial by ring + learn the zone colour
     DETECT_RANGE_PCT:     20,        ; look for the ring this % inside AND outside its saved size
     DIAL_BOX_PX:          140,       ; size of the detection box (the pink square in Calibrate)
     WAIT_FOR_BAR:         0,         ; 0 = no progress bar after the skill check
@@ -7318,6 +7319,11 @@ WaitForArc(timeoutMs) {
             lastLocate := A_TickCount
             if (AutoLocateDial() && (arc := FindArc()))
                 return arc
+            ; Preset colours did not match on this server. Find the dial by its
+            ; colour-independent grey ring and learn the real zone colour off
+            ; the ring, then try once more.
+            if (C.AUTO_LEARN_COLOUR && AutoLearnDial() && (arc := FindArc()))
+                return arc
         }
         Sleep 15
     }
@@ -7489,6 +7495,107 @@ RingScore(cx, cy, r, n) {
             hits++
     }
     return hits
+}
+
+; ============================================================================
+;  AUTO-LEARN  - find the dial by its RING and read the zone colour off it
+; ============================================================================
+; AutoLocateDial only works if the zone is a shade near one of the presets. On
+; a server whose zone is some other colour, that fails and nothing is ever
+; found. This path does not care what colour the zone is: the dial's grey ring
+; is always the same, so it finds the dial by the ring, then samples whatever
+; coloured arc is sitting on that ring and adopts it as the zone colour. That
+; is the "just watch the box and get the colour for me" behaviour.
+AutoLearnDial() {
+    if (!C.AUTO_LEARN_COLOUR)
+        return false
+    R := C.DIAL_RADIUS
+    W := A_ScreenWidth, H := A_ScreenHeight
+    own := OwnWindowRects()
+    ; The grey ring stroke. One mid-grey with a wide per-channel tolerance
+    ; covers every shade IsRingPixel accepts (0x23..0x48).
+    greyCol := 0x363940, greyTol := 20
+    band := 40, tries := 0
+    by := 0
+    while (by < H) {
+        sx := 0
+        while (sx < W) {
+            found := false
+            try found := PixelSearch(&fx, &fy, sx, by, W - 1, Min(H - 1, by + band - 1), greyCol, greyTol)
+            if (!found)
+                break
+            if (r := RectAt(own, fx, fy)) {
+                sx := r[3] + 1
+                continue
+            }
+            ; Grey is everywhere in a dark UI, so cap the attempts high and
+            ; always skip well past a non-ring hit.
+            if (++tries > 600)
+                return false
+            if (loc := DialCentreFrom(fx, fy, R)) {
+                ; We have a real dial. Move onto it and learn its colour.
+                C.DIAL_CX := loc.x, C.DIAL_CY := loc.y
+                if (Abs(loc.r - C.DIAL_RADIUS) > 2)
+                    C.DIAL_RADIUS := loc.r
+                SaveCfg("DIAL_CX"), SaveCfg("DIAL_CY"), SaveCfg("DIAL_RADIUS")
+                RecalcGeometry()
+                try PositionCalibOverlays()
+                learned := LearnZoneColour(loc.x, loc.y, C.DIAL_RADIUS)
+                if (learned >= 0) {
+                    C.ZONE_STYLE := "custom"
+                    C.ARC_COLOR  := learned
+                    C.ARC_TOL    := 48
+                    SaveCfg("ZONE_STYLE"), SaveCfg("ARC_COLOR"), SaveCfg("ARC_TOL")
+                    LogLine(Format("dial found by ring at {},{} r{} - learned zone colour {}",
+                        loc.x, loc.y, C.DIAL_RADIUS, HexOrFail(learned)))
+                } else {
+                    LogLine(Format("dial found by ring at {},{} r{} - no zone arc visible yet",
+                        loc.x, loc.y, C.DIAL_RADIUS))
+                }
+                return true
+            }
+            sx := fx + 2 * R + 20
+        }
+        by += band
+    }
+    return false
+}
+
+; Sweep the ring at a known dial centre and return the average colour of the
+; coloured arc sitting on it (the zone), ignoring the grey ring, the red marker
+; and the dark background. Returns -1 if no clearly-coloured arc is present.
+LearnZoneColour(cx, cy, radius) {
+    span := radius + 10
+    if (!GrabRegion(cx - span, cy - span, 2 * span + 1, 2 * span + 1))
+        return -1
+    try {
+        sumR := 0, sumG := 0, sumB := 0, cnt := 0
+        ang := 0
+        while (ang < 360) {
+            a := ang * G.RAD
+            dr := -4
+            while (dr <= 4) {
+                col := GrabAt(cx + Round((radius + dr) * Cos(a)),
+                              cy - Round((radius + dr) * Sin(a)))
+                dr += 2
+                if (col < 0)
+                    continue
+                rr := (col >> 16) & 0xFF, gg := (col >> 8) & 0xFF, bb := col & 0xFF
+                hi := Max(rr, gg, bb), lo := Min(rr, gg, bb)
+                if (hi - lo < 50)                 ; grey ring / dark background
+                    continue
+                if (IsTickRed(col))               ; the moving marker, not the zone
+                    continue
+                sumR += rr, sumG += gg, sumB += bb, cnt++
+            }
+            ang += 2
+        }
+        if (cnt < 14)                             ; no real arc on the ring
+            return -1
+        return ((sumR // cnt) << 16) | ((sumG // cnt) << 8) | (sumB // cnt)
+    } finally {
+        GrabEnd()
+    }
 }
 
 ; Did the zone jump to a new spot? That is how the next stage (2/2) shows.
