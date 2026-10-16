@@ -342,7 +342,7 @@ global C := {
     STAGE_GAP_MS:         1500,      ; after a hit, how long to look for the next stage
     AUTO_LOCATE_DIAL:     1,         ; find the Skill Check dial anywhere on screen
     DETECT_RANGE_PCT:     20,        ; look for the ring this % inside AND outside its saved size
-    DIAL_BOX_PX:          220,       ; size of the detection box (the pink square in Calibrate)
+    DIAL_BOX_PX:          140,       ; size of the detection box (the pink square in Calibrate)
     WAIT_FOR_BAR:         0,         ; 0 = no progress bar after the skill check
 
 ; ---- timeouts (ms) ---------------------------------------------------------
@@ -5553,10 +5553,10 @@ LoadConfig() {
     }
     ; One-time migration #6: the detection box back to a roomy size, editable
     ; from now on (Settings -> Regions, or drag its corner in Calibrate).
-    if (IniRead(C.INI_FILE, "Geometry", "DialBox6", "<<UNSET>>") = "<<UNSET>>") {
-        C.DIAL_BOX_PX := 220, C.DETECT_RANGE_PCT := 20
+    if (IniRead(C.INI_FILE, "Geometry", "DialBox7", "<<UNSET>>") = "<<UNSET>>") {
+        C.DIAL_BOX_PX := 140, C.DETECT_RANGE_PCT := 20
         SaveCfg("DIAL_BOX_PX"), SaveCfg("DETECT_RANGE_PCT")
-        IniWrite(1, C.INI_FILE, "Geometry", "DialBox6")
+        IniWrite(1, C.INI_FILE, "Geometry", "DialBox7")
     }
     ; One-time migration #5 (from the 2026-10-11 screenshot + log): the current
     ; Skill Check is a light pink zone (0xFF88F0) with a red line (0xEF4444).
