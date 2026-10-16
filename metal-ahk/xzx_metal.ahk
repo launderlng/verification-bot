@@ -490,7 +490,35 @@ G.RAD := 0.01745329251994
 ; Recomputed whenever the dial centre or radius changes. The measured arc band
 ; was 46.0..53.1 around a 49.7 mid-radius, so -16%/+20% covers the stroke with
 ; margin at any scale.
+; A radius of 0 or an absurd value poisons every geometry calc: the ring
+; collapses to a point, so any single grey pixel scores a fake 100% ring match
+; and the macro "finds" a dial jammed at y=0 forever (seen live - radius 0 was
+; saved to config.ini and reloaded every launch). Clamp it back to the default
+; for this resolution and persist the repair. Returns true if it changed it.
+EnsureSaneRadius() {
+    defR := Max(20, Round(53 * SCL))
+    if (!C.HasOwnProp("DIAL_RADIUS") || C.DIAL_RADIUS < 20 || C.DIAL_RADIUS > 600) {
+        C.DIAL_RADIUS := defR
+        try SaveCfg("DIAL_RADIUS")
+        return true
+    }
+    return false
+}
+
+; A located dial must have a real radius and sit a full radius clear of every
+; screen edge. Rejects the degenerate y=0 / radius-0 hits that a point-sized
+; ring would otherwise accept.
+ValidDial(loc) {
+    W := A_ScreenWidth, H := A_ScreenHeight
+    if (loc.r < 20 || loc.r > 400)
+        return false
+    if (loc.x < loc.r || loc.x > W - loc.r || loc.y < loc.r || loc.y > H - loc.r)
+        return false
+    return true
+}
+
 RecalcGeometry() {
+    EnsureSaneRadius()
     ; How far around the saved ring size to look - Settings -> Regions ->
     ; Detection area. 32% (the default) = 68%..132% of the radius.
     pct := Max(5, Min(60, C.HasOwnProp("DETECT_RANGE_PCT") ? C.DETECT_RANGE_PCT : 20))
@@ -7343,6 +7371,7 @@ WaitForArc(timeoutMs) {
 AutoLocateDial() {
     if (!C.AUTO_LOCATE_DIAL)
         return false
+    EnsureSaneRadius()
     R := C.DIAL_RADIUS
     W := A_ScreenWidth, H := A_ScreenHeight
     ; Presets are a typical shade, so allow more leeway; a sampled custom
@@ -7375,6 +7404,10 @@ AutoLocateDial() {
                 if (++tries > 150)
                     return false
                 if (loc := DialCentreFrom(fx, fy, R)) {
+                    if (!ValidDial(loc)) {               ; degenerate (edge / tiny) - keep looking
+                        sx := fx + 2 * R + 20
+                        continue
+                    }
                     moved := Abs(loc.x - C.DIAL_CX) + Abs(loc.y - C.DIAL_CY)
                     if (moved > 2 || Abs(loc.r - C.DIAL_RADIUS) > 2) {
                         C.DIAL_CX := loc.x, C.DIAL_CY := loc.y
@@ -7434,6 +7467,8 @@ ZoneSearchColours() {
 
 ; Given one zone pixel, return {x, y, r, pct} of the ring it sits on, or false.
 DialCentreFrom(px, py, ringR) {
+    if (ringR < 20)                           ; a point-sized ring matches any grey pixel
+        return false
     span := 2 * ringR + 16
     if (!GrabRegion(px - span, py - span, 2 * span + 1, 2 * span + 1))
         return false                          ; no fast capture - too slow to try
@@ -7509,6 +7544,7 @@ RingScore(cx, cy, r, n) {
 AutoLearnDial() {
     if (!C.AUTO_LEARN_COLOUR)
         return false
+    EnsureSaneRadius()
     R := C.DIAL_RADIUS
     W := A_ScreenWidth, H := A_ScreenHeight
     own := OwnWindowRects()
@@ -7533,6 +7569,10 @@ AutoLearnDial() {
             if (++tries > 600)
                 return false
             if (loc := DialCentreFrom(fx, fy, R)) {
+                if (!ValidDial(loc)) {               ; degenerate (edge / tiny) - keep looking
+                    sx := fx + 2 * R + 20
+                    continue
+                }
                 ; We have a real dial. Move onto it and learn its colour.
                 C.DIAL_CX := loc.x, C.DIAL_CY := loc.y
                 if (Abs(loc.r - C.DIAL_RADIUS) > 2)
