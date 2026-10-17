@@ -48,6 +48,11 @@ global Cfg := {
     hold:      ReadNum("Hold", 1),             ; ms each click is held
     drag:      ReadNum("Drag", 0),             ; 1 = hold the click while sliding
     stream:    ReadNum("Stream", 1),           ; 1 = hide the menu from OBS/Discord
+    foodSlot:  ReadNum("FoodSlot", 2),         ; hotbar slot with the food
+    waterSlot: ReadNum("WaterSlot", 5),        ; hotbar slot with the water
+    eatEvery:  ReadNum("EatEvery", 0),         ; eat + drink every this many clicks (0 = off)
+    foodWait:  ReadNum("FoodWait", 3),         ; seconds to wait after eating
+    waterWait: ReadNum("WaterWait", 3),        ; seconds to wait after drinking
     runKey:    IniRead(INI, "Macro", "RunKey", "F3"),
     toggleKey: IniRead(INI, "Macro", "ToggleKey", "F1")
 }
@@ -55,6 +60,40 @@ ReadNum(key, def, isFloat := false) {
     v := IniRead(INI, "Macro", key, def)
     try return isFloat ? Float(v) : Integer(v)
     return def
+}
+
+; A hotbar slot number (1-9, 0) -> its keyboard scan code, so it works on any layout.
+SlotSc(n) {
+    static m := Map(1, "sc002", 2, "sc003", 3, "sc004", 4, "sc005", 5, "sc006",
+                    6, "sc007", 7, "sc008", 8, "sc009", 9, "sc00A", 0, "sc00B")
+    return m.Has(n) ? m[n] : "sc003"
+}
+
+; Press the food slot, wait, the water slot, wait - used every Cfg.eatEvery clicks.
+EatDrink() {
+    global Running
+    Running := true                       ; reuse the click guard so the loop doesn't overlap the break
+    try {
+        SendEvent "{" SlotSc(Cfg.foodSlot) " down}"
+        Sleep 35
+        SendEvent "{" SlotSc(Cfg.foodSlot) " up}"
+        CountdownSleep(Cfg.foodWait)
+        if !Looping
+            return
+        SendEvent "{" SlotSc(Cfg.waterSlot) " down}"
+        Sleep 35
+        SendEvent "{" SlotSc(Cfg.waterSlot) " up}"
+        CountdownSleep(Cfg.waterWait)
+    } finally {
+        Running := false
+    }
+}
+
+; Sleep in short steps so STOP still responds during a food/water wait.
+CountdownSleep(seconds) {
+    deadline := A_TickCount + seconds * 1000
+    while (Looping && A_TickCount < deadline)
+        Sleep 50
 }
 ; Stream proof is always on when the macro loads (you can still turn it off for the session).
 Cfg.stream := 1
@@ -71,7 +110,8 @@ if (IniRead(INI, "Macro", "Fast3", "") = "") {
 
 SaveCfg() {
     IniWrite(Round(Cfg.interval, 1), INI, "Macro", "Interval")
-    for k in ["slide", "speed", "delay", "hold", "drag", "stream", "runKey", "toggleKey"]
+    for k in ["slide", "speed", "delay", "hold", "drag", "stream", "foodSlot", "waterSlot",
+              "eatEvery", "foodWait", "waterWait", "runKey", "toggleKey"]
         IniWrite(Cfg.%k%, INI, "Macro", StrTitle(k))
 }
 
@@ -88,10 +128,11 @@ global ACCENT_HEX := "B57BFF", GREEN_HEX := "6EE7B7", DANGER_HEX := "F0587E"
 global FONT := "Segoe UI", FONT_SEMI := "Segoe UI Semibold"
 global LOGO := A_Temp "\xzx_altclick_logo.png"   ; built into this file, written out at startup
 
-global WIN_W := 600, WIN_H := 756
+global WIN_W := 600, WIN_H := 876
 global UI := Map(), NoDrag := Map(), Clickable := Map()
 global Running := false, Looping := false, NextAt := 0, CycleMs := 1
 global Runs := 0, LastRun := 0, T0 := A_TickCount, CurKeys := []
+global ClicksSinceEat := 0   ; clicks since the last food/water break
 
 ; License server = your Discord bot on Railway (same as the other XZX macros).
 ; The URL is stored obfuscated so a plain strings-dump of the exe doesn't reveal it.
@@ -151,7 +192,7 @@ DoMacro(*) {
         Send "{Alt up}"
         Running := false
     }
-    Runs++
+    Runs++, ClicksSinceEat++
     LastRun := A_TickCount
     UI["runs"].Text := Runs
     UI["last"].Text := "just now"
@@ -160,10 +201,21 @@ DoMacro(*) {
 
 ; Repeats the click every Cfg.interval seconds while Looping is on.
 LoopTick() {
-    global NextAt, CycleMs
+    global NextAt, CycleMs, ClicksSinceEat
     if !Looping
         return
     if (A_TickCount >= NextAt && !Running) {
+        ; food + water break every N clicks, before the next click
+        if (Cfg.eatEvery > 0 && ClicksSinceEat >= Cfg.eatEvery) {
+            ClicksSinceEat := 0
+            UI["state"].Text := "EATING"
+            EatDrink()
+            if !Looping
+                return
+            NextAt := A_TickCount + CycleMs
+            UI["state"].Text := "RUNNING"
+            return
+        }
         DoMacro()
         if !Looping
             return
@@ -177,10 +229,11 @@ LoopTick() {
 }
 
 StartLoop(*) {
-    global Looping, NextAt, CycleMs
+    global Looping, NextAt, CycleMs, ClicksSinceEat
     if Looping
         return
     Looping := true
+    ClicksSinceEat := 0
     CycleMs := 3000                 ; 3 seconds to get your mouse into place
     NextAt := A_TickCount + CycleMs
     PaintState()
@@ -344,18 +397,18 @@ BuildGui() {
     }
 
     ; ---- keybinds
-    Lbl(g, "x46 y652 w400 h14", "KEYBINDS   ·   click a purple one to change it", "s7 bold", TXT_DIM)
+    Lbl(g, "x46 y772 w400 h14", "KEYBINDS   ·   click a purple one to change it", "s7 bold", TXT_DIM)
     for i, k in KeybindSlots() {
         x := 46 + (i - 1) * 130
         if (k.key != "") {
-            chip := Btn(g, "x" (x + 2) " y678 w54 h26", Cfg.%k.key%, CaptureHandler(k.key), "s9 bold", TXT_MAIN, FONT_SEMI, INPUT_HEX)
+            chip := Btn(g, "x" (x + 2) " y798 w54 h26", Cfg.%k.key%, CaptureHandler(k.key), "s9 bold", TXT_MAIN, FONT_SEMI, INPUT_HEX)
             UI["chip_" k.key] := chip
         } else {
-            Lbl(g, "x" (x + 2) " y678 w54 h26 0x200 Center", k.fixed, "s9 bold", TXT_SUB, FONT_SEMI, INPUT_HEX)
+            Lbl(g, "x" (x + 2) " y798 w54 h26 0x200 Center", k.fixed, "s9 bold", TXT_SUB, FONT_SEMI, INPUT_HEX)
         }
-        Lbl(g, "x" (x + 66) " y676 w64 h30 0x200", k.label, "s8", TXT_SUB)
+        Lbl(g, "x" (x + 66) " y796 w64 h30 0x200", k.label, "s8", TXT_SUB)
     }
-    Lbl(g, "x24 y734 w552 h14 Center", "XZX Macro  ·  by Coop", "s7", TXT_DIM)
+    Lbl(g, "x24 y854 w552 h14 Center", "XZX Macro  ·  by Coop", "s7", TXT_DIM)
 
     g.Show("w" WIN_W " h" WIN_H)
     try {
@@ -371,14 +424,19 @@ BuildGui() {
 }
 
 Cells() => [
-    {x: 40,  y: 452, label: "Repeat every (seconds)",  kind: "num", key: "interval"},
-    {x: 304, y: 452, label: "Slide distance (px)",     kind: "num", key: "slide"},
-    {x: 40,  y: 494, label: "Step delay (ms)",         kind: "num", key: "delay"},
-    {x: 304, y: 494, label: "Click hold (ms)",         kind: "num", key: "hold"},
-    {x: 40,  y: 536, label: "Slide speed (0 = instant)", kind: "num", key: "speed"},
-    {x: 304, y: 536, label: "Hold click while sliding", kind: "switch", key: "drag"},
-    {x: 40,  y: 578, label: "Stream proof",            kind: "switch", key: "stream"},
-    {x: 304, y: 578, label: "Test one click",          kind: "test", key: ""}
+    {x: 40,  y: 450, label: "Repeat every (seconds)",  kind: "num", key: "interval"},
+    {x: 304, y: 450, label: "Slide distance (px)",     kind: "num", key: "slide"},
+    {x: 40,  y: 490, label: "Step delay (ms)",         kind: "num", key: "delay"},
+    {x: 304, y: 490, label: "Click hold (ms)",         kind: "num", key: "hold"},
+    {x: 40,  y: 530, label: "Slide speed (0 = instant)", kind: "num", key: "speed"},
+    {x: 304, y: 530, label: "Hold click while sliding", kind: "switch", key: "drag"},
+    {x: 40,  y: 570, label: "Food slot",               kind: "num", key: "foodSlot"},
+    {x: 304, y: 570, label: "Water slot",              kind: "num", key: "waterSlot"},
+    {x: 40,  y: 610, label: "Eat/drink every clicks",  kind: "num", key: "eatEvery"},
+    {x: 304, y: 610, label: "Food wait (s)",           kind: "num", key: "foodWait"},
+    {x: 40,  y: 650, label: "Water wait (s)",          kind: "num", key: "waterWait"},
+    {x: 304, y: 650, label: "Stream proof",            kind: "switch", key: "stream"},
+    {x: 40,  y: 690, label: "Test one click",          kind: "test", key: ""}
 ]
 
 KeybindSlots() => [
@@ -439,13 +497,15 @@ PaintState() {
 }
 
 SaveFields() {
-    for k in ["interval", "slide", "delay", "hold", "speed"] {
+    for k in ["interval", "slide", "delay", "hold", "speed", "foodSlot", "waterSlot", "eatEvery", "foodWait", "waterWait"] {
         v := Trim(UI["f_" k].Value)
         if !IsNumber(v)
             continue
         Cfg.%k% := (k = "interval") ? Max(0.5, Round(Float(v), 1)) : Max(0, Round(Float(v)))
     }
     Cfg.speed := Min(100, Cfg.speed)
+    for k in ["foodSlot", "waterSlot"]          ; hotbar slots are 0-9
+        Cfg.%k% := Min(9, Cfg.%k%)
     SaveCfg()
     UI["every"].Text := "every " Format("{:.1f}", Cfg.interval) " seconds"
     FlashSaved()
@@ -612,8 +672,8 @@ Render() {
     }
 
     ; switches
-    DrawSwitch(pG, 304 + 196, 536 + 7, Cfg.drag)
-    DrawSwitch(pG, 40 + 196, 578 + 7, Cfg.stream)
+    DrawSwitch(pG, 304 + 196, 530 + 7, Cfg.drag)
+    DrawSwitch(pG, 304 + 196, 650 + 7, Cfg.stream)
 
     DllCall("Gdiplus\GdipCreateHBITMAPFromBitmap", "Ptr", pBmp, "Ptr*", &hbm, "UInt", 0xFF000000)
     DllCall("Gdiplus\GdipDeleteGraphics", "Ptr", pG)
@@ -647,8 +707,8 @@ RenderStatic() {
         Card(pG, x, 262, 176, 72, 16)                     ; stats
         RoundFill(pG, x + 20, 322, 22, 3, 1, 0xFF000000 | C_ACCL)
     }
-    Card(pG, 24, 414, 552, 214, 20)                       ; settings
-    Card(pG, 24, 640, 552, 84, 18)                        ; keybinds
+    Card(pG, 24, 414, 552, 320, 20)                       ; settings
+    Card(pG, 24, 760, 552, 84, 18)                        ; keybinds
 
     ; setting rows
     for c in Cells() {
@@ -664,8 +724,8 @@ RenderStatic() {
     ; keybind chips (purple outline = click to change)
     for i, k in KeybindSlots() {
         x := 46 + (i - 1) * 130
-        RoundFill(pG, x, 676, 58, 30, 9, 0xFF000000 | C_INPUT)
-        RoundStroke(pG, x + 0.5, 676.5, 57, 29, 9, 0xFF000000 | (k.key != "" ? C_ACC : C_BORDER), k.key != "" ? 1.4 : 1)
+        RoundFill(pG, x, 796, 58, 30, 9, 0xFF000000 | C_INPUT)
+        RoundStroke(pG, x + 0.5, 796.5, 57, 29, 9, 0xFF000000 | (k.key != "" ? C_ACC : C_BORDER), k.key != "" ? 1.4 : 1)
     }
 
     DllCall("Gdiplus\GdipDeleteGraphics", "Ptr", pG)
