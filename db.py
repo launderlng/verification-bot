@@ -538,6 +538,9 @@ MIGRATIONS = [
     ("products", "license_macro", "TEXT"),  # which macro a product's keys are for
     ("tickets", "macro", "TEXT"),           # which macro a support ticket is about
     ("review_settings", "staff_channel_id", "INTEGER"),  # where staff/support reviews go (NULL = the reviews channel)
+    ("ticket_types", "kind", "TEXT NOT NULL DEFAULT 'support'"),  # 'support' or 'application'
+    ("ticket_types", "questions", "TEXT"),  # application questions, one per line (max 5)
+    ("ticket_types", "app_open", "INTEGER NOT NULL DEFAULT 1"),   # 0 = applications closed for this type
 ]
 
 

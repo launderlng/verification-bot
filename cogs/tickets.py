@@ -30,6 +30,24 @@ DEFAULT_TYPES = [
     ("Support", "🛠️", "Get help with anything", "Thanks for reaching out! A member of staff will be with you shortly. Please describe your issue in as much detail as you can.", 0),
     ("Purchase help", "🧾", "Questions about an order (have your Invoice ID ready)", "Thanks for your purchase! Staff will check your Invoice ID and sort out your order.", 1),
 ]
+
+# Seeded as `application` ticket types on setup. (name, emoji, description, welcome, questions)
+DEFAULT_APPS = [
+    ("Staff Application", "📋", "Apply to join the staff team",
+     "Thanks for applying to the staff team! Answer honestly — a senior staff member will review your application here.",
+     ["How old are you?",
+      "What timezone are you in and how active can you be?",
+      "Do you have any past staff experience?",
+      "Why do you want to be staff here?",
+      "How would you handle a rule-breaker?"]),
+    ("Leader Application", "⭐", "Apply for a leadership / senior role",
+     "Thanks for applying for a leadership role! These are reviewed by the owners — take your time with your answers.",
+     ["What leadership role are you applying for?",
+      "How long have you been in the server and how active are you?",
+      "What leadership or management experience do you have?",
+      "What would you improve or bring to the team?",
+      "How do you handle conflict between staff members?"]),
+]
 INVOICE_RE = re.compile(r"^[A-Z0-9]{2,10}-[A-Z0-9]{3,12}$")  # any prefix: INV-3F9A1C2E, 14K-0042 …
 
 
@@ -101,6 +119,29 @@ class TicketModal(discord.ui.Modal):
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception("Ticket modal error", exc_info=error)
+
+
+class ApplicationModal(discord.ui.Modal):
+    """For 'application' ticket types: shows the type's questions (up to 5) as fields."""
+    def __init__(self, cog: "Tickets", ttype):
+        super().__init__(title=(ttype["name"] or "Application")[:45])
+        self.cog, self.ttype = cog, ttype
+        qs = [q.strip() for q in (ttype["questions"] or "").splitlines() if q.strip()][:5]
+        if not qs:
+            qs = ["Why are you applying?", "What relevant experience do you have?", "How active can you be?"]
+        self.pairs = []
+        for q in qs:
+            inp = discord.ui.TextInput(label=q[:45], style=discord.TextStyle.paragraph, max_length=400, required=True,
+                                       placeholder=(q[:100] if len(q) > 45 else None))
+            self.pairs.append((q, inp))
+            self.add_item(inp)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        details = "\n\n".join(f"**{q}**\n{inp.value.strip()}" for q, inp in self.pairs)
+        await self.cog.safe(interaction, self.cog.create_ticket(interaction, self.ttype, self.ttype["name"], details, None, None))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Application modal error", exc_info=error)
 
 
 class CloseModal(discord.ui.Modal):
@@ -422,6 +463,11 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
     async def types_for(self, guild_id: int):
         return await db.fetch_all("SELECT * FROM ticket_types WHERE guild_id = ? ORDER BY id", (guild_id,))
 
+    def open_types(self, types):
+        """Types to show in the panel: hide applications that are currently closed."""
+        vis = [t for t in types if not (t["kind"] == "application" and not t["app_open"])]
+        return vis or types
+
     def type_options(self, types) -> list:
         return [
             discord.SelectOption(label=t["name"][:100], value=str(t["id"]), description=(t["description"] or "")[:100] or None, emoji=t["emoji"] or None)
@@ -429,6 +475,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         ]
 
     def build_panel(self, guild: discord.Guild, cfg, types) -> tuple[discord.Embed, discord.ui.View]:
+        types = self.open_types(types)
         color = int(cfg["panel_color"], 16) if cfg["panel_color"] else COLOR.value
         embed = ui.card(cfg["panel_title"] or "🎫 Need help?", cfg["panel_text"] or "Open a private ticket and our team will get back to you as soon as they can.", color=color, section="Tickets")
         if len(types) > 1:
@@ -485,17 +532,24 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         types = await self.types_for(guild.id)
         if not types:
             raise UserError("There are no ticket types yet. Please tell an admin.")
+        vis = self.open_types(types)
         chosen = None
         if value and value.isdigit() and value != "0":
             chosen = next((t for t in types if t["id"] == int(value)), None)
-        elif len(types) == 1:
-            chosen = types[0]
+        elif len(vis) == 1:
+            chosen = vis[0]
         if chosen is None:
-            return await reply(interaction, embed=simple("🎫 Open a ticket", "What do you need help with?", INFO), view=ChooseTypeView(self, self.type_options(types)))
+            return await reply(interaction, embed=simple("🎫 Open a ticket", "What do you need help with?", INFO), view=ChooseTypeView(self, self.type_options(vis)))
 
+        if chosen["kind"] == "application" and not chosen["app_open"]:
+            raise UserError(f"**{chosen['name']}s** are closed right now. Please check back later.")
         problem = await self.can_open(guild, interaction.user, cfg)
         if problem:
             raise UserError(problem)
+        if chosen["kind"] == "application":
+            # applications aren't about a macro - go straight to the question form
+            await interaction.response.send_modal(ApplicationModal(self, chosen))
+            return
         await reply(interaction, embed=simple(f"🎫 {chosen['name']}", "Which macro do you need help with?", INFO),
                     view=MacroPickView(self, chosen))
         # Reset the dropdown so the same option can be picked again (best effort)
@@ -575,6 +629,9 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
 
         if invoice_code:
             await channel.send(embed=await self.invoice_embed(guild, member, invoice_code))
+
+        if ttype["kind"] == "application" and details.strip():   # full answers, untruncated
+            await channel.send(embed=ui.card(f"📋 {ttype['name']}", details[:4000], color=ACCENT, section="Tickets"))
 
         await emit(guild, "tickets", "🎫 Ticket opened", ui.kv(("👤 Opened by", f"{member.mention} (`{member.id}`)"), ("📍 Channel", channel.mention), ("🎫 Ticket", f"{number_label(t)} · {ttype['name']}"), ("🎮 Macro", macro_label(macro) if macro else None), ("📌 Subject", subject.strip()), ("🧾 Invoice", f"`{invoice_code}`" if invoice_code else None)), COLOR, subject=member.id, ids=(("ticket", number_label(t)), ("channel", channel.id)))
         await interaction.followup.send(embed=simple("✅ Ticket created", f"Head over to {channel.mention}. A staff member will be with you soon.", COLOR), ephemeral=True)
@@ -863,11 +920,19 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
             guild.id, category_id=category_id, panel_channel_id=channel.id, staff_roles=",".join(str(r) for r in sorted(roles)),
             transcript_channel_id=transcript_channel.id if transcript_channel else (existing["transcript_channel_id"] if existing else None),
         )
-        if not await self.types_for(guild.id):
+        existing_types = await self.types_for(guild.id)
+        if not existing_types:
             for name, emoji, desc, welcome, needs_invoice in DEFAULT_TYPES:
                 await db.execute(
                     "INSERT OR IGNORE INTO ticket_types (guild_id, name, emoji, description, welcome, needs_invoice) VALUES (?, ?, ?, ?, ?, ?)",
                     (guild.id, name, emoji, desc, welcome, needs_invoice),
+                )
+        if not any(t["kind"] == "application" for t in existing_types):   # seed Staff + Leader apps once
+            for name, emoji, desc, welcome, questions in DEFAULT_APPS:
+                await db.execute(
+                    "INSERT OR IGNORE INTO ticket_types (guild_id, name, emoji, description, welcome, needs_invoice, kind, questions, app_open) "
+                    "VALUES (?, ?, ?, ?, ?, 0, 'application', ?, 1)",
+                    (guild.id, name, emoji, desc, welcome, "\n".join(questions)),
                 )
         cfg = await db.get_ticket_config(guild.id)
         await self.post_panel(guild, cfg, old=old)
@@ -1054,12 +1119,90 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Private
         await self.refresh_panel(interaction.guild)
         await interaction.followup.send(f"🗑️ Removed **{target['name']}** and refreshed the panel. Existing tickets keep working.", ephemeral=True)
 
+    @app_commands.command(description="Add or edit an application type (e.g. Staff / Leader apps)")
+    @app_commands.describe(
+        name="Application name, e.g. Staff Application",
+        questions="The questions applicants answer, separated by | (max 5)",
+        emoji="An emoji for it, e.g. 📋",
+        description="Short description shown in the panel",
+        welcome="Message shown at the top of the application ticket",
+        open="Whether people can apply right now (default: yes)",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def application(
+        self,
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 40],
+        questions: Optional[str] = None,
+        emoji: Optional[str] = None,
+        description: Optional[app_commands.Range[str, 1, 100]] = None,
+        welcome: Optional[app_commands.Range[str, 1, 1000]] = None,
+        open: Optional[bool] = None,
+    ):
+        await self.cfg_or_error(interaction.guild_id)
+        emoji = clean_emoji(emoji)
+        qs = None
+        if questions is not None:
+            parts = [q.strip() for q in re.split(r"[|\n]", questions) if q.strip()][:5]
+            if not parts:
+                raise UserError("Give at least one question, separated by `|`.")
+            qs = "\n".join(parts)
+        existing = await db.fetch_one("SELECT * FROM ticket_types WHERE guild_id = ? AND name = ?", (interaction.guild_id, name.strip()))
+        await interaction.response.defer(ephemeral=True)
+        if existing:
+            await db.execute(
+                "UPDATE ticket_types SET emoji = ?, description = ?, welcome = ?, kind = 'application', questions = ?, app_open = ? WHERE id = ?",
+                (emoji or existing["emoji"], description or existing["description"], welcome or existing["welcome"],
+                 qs if qs is not None else existing["questions"],
+                 existing["app_open"] if open is None else int(open), existing["id"]),
+            )
+            verb = "Updated"
+        else:
+            if len(await self.types_for(interaction.guild_id)) >= MAX_TYPES:
+                raise UserError(f"You can have up to {MAX_TYPES} ticket types. Remove one with `/ticket removetype`.")
+            await db.execute(
+                "INSERT INTO ticket_types (guild_id, name, emoji, description, welcome, needs_invoice, kind, questions, app_open) "
+                "VALUES (?, ?, ?, ?, ?, 0, 'application', ?, ?)",
+                (interaction.guild_id, name.strip(), emoji or "📋", description, welcome, qs or "", 1 if open is None else int(open)),
+            )
+            verb = "Added"
+        await self.refresh_panel(interaction.guild)
+        await interaction.followup.send(f"✅ {verb} the **{name.strip()}** application and refreshed the panel.", ephemeral=True)
+
+    @app_commands.command(description="Open or close applications so people can / can't apply")
+    @app_commands.describe(open="True = people can apply, False = applications closed",
+                           name="Which application (leave blank for all applications)")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def applications(self, interaction: discord.Interaction, open: bool, name: Optional[str] = None):
+        await self.cfg_or_error(interaction.guild_id)
+        types = await self.types_for(interaction.guild_id)
+        apps = [t for t in types if t["kind"] == "application"]
+        if name:
+            apps = [t for t in apps if t["name"].lower() == name.strip().lower()]
+            if not apps:
+                raise UserError("I can't find an application by that name. See `/ticket types`.")
+        if not apps:
+            raise UserError("There are no application types yet. Add one with `/ticket application`.")
+        await interaction.response.defer(ephemeral=True)
+        for t in apps:
+            await db.execute("UPDATE ticket_types SET app_open = ? WHERE id = ?", (int(open), t["id"]))
+        await self.refresh_panel(interaction.guild)
+        which = apps[0]["name"] if name else f"{len(apps)} application" + ("" if len(apps) == 1 else "s")
+        await interaction.followup.send(
+            f"{'🟢 Opened' if open else '🔴 Closed'} **{which}**. " +
+            ("People can apply now." if open else "People can't apply until you open it again.") +
+            " The panel has been updated.", ephemeral=True)
+
     @app_commands.command(description="List your ticket types")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def types(self, interaction: discord.Interaction):
         await self.cfg_or_error(interaction.guild_id)
         types = await self.types_for(interaction.guild_id)
-        lines = [f"{t['emoji'] or '🎫'} **{t['name']}**{' · asks for Invoice ID' if t['needs_invoice'] else ''}\n{t['description'] or ''}" for t in types]
+        def tag(t):
+            if t["kind"] == "application":
+                return " · 📋 application " + ("🟢 open" if t["app_open"] else "🔴 closed")
+            return " · asks for Invoice ID" if t["needs_invoice"] else ""
+        lines = [f"{t['emoji'] or '🎫'} **{t['name']}**{tag(t)}\n{t['description'] or ''}" for t in types]
         await interaction.response.send_message(embed=ui.card("🎫 Ticket types", "\n\n".join(lines), color=INFO, section="Tickets"), ephemeral=True)
 
     @app_commands.command(description="Stop someone from opening tickets")
