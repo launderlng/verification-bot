@@ -131,6 +131,12 @@ DEFAULTS = {
     # --- detection ---
     "tolerance": 40,           # color match tolerance (0-255)
     "min_pixels": 2,           # min pixels in a column to count as a hit
+    # --- food / water break ---
+    "food_slot": 2,            # hotbar slot with the food
+    "water_slot": 5,           # hotbar slot with the water
+    "eat_every": 0,            # eat + drink every this many catches (0 = off)
+    "food_wait": 3.0,          # seconds to wait after eating
+    "water_wait": 3.0,         # seconds to wait after drinking
 }
 
 
@@ -588,9 +594,23 @@ class Bot(threading.Thread):
         self.status = "Starting..."
         self.stop_flag = threading.Event()
         self.inp = Inputs()
+        self.since_eat = 0          # catches since the last food/water break
 
     def stop(self):
         self.stop_flag.set()
+
+    def eat_drink(self):
+        """Press the food slot, wait, the water slot, wait - every Cfg eat_every catches."""
+        c = self.cfg
+        food = str(max(0, min(9, int(c.get("food_slot", 2)))))
+        water = str(max(0, min(9, int(c.get("water_slot", 5)))))
+        self.log(f"Food + water break (slots {food} / {water}).")
+        self.inp.tap(food, 0.06)
+        self.wait(float(c.get("food_wait", 3)))
+        if self.stop_flag.is_set():
+            return
+        self.inp.tap(water, 0.06)
+        self.wait(float(c.get("water_wait", 3)))
 
     def wait(self, sec):
         end = time.perf_counter() + sec
@@ -896,7 +916,12 @@ class Bot(threading.Thread):
                             self.inp.release_all()
                             self.log("Reel finished.")
                             bite_since = None
-                            if c["auto_recast"]:
+                            self.since_eat += 1
+                            if int(c.get("eat_every", 0)) > 0 and self.since_eat >= int(c["eat_every"]) \
+                                    and not self.stop_flag.is_set():
+                                self.since_eat = 0
+                                self.eat_drink()
+                            if c["auto_recast"] and not self.stop_flag.is_set():
                                 self.wait(float(c["recast_delay"]))
                                 if not self.stop_flag.is_set():
                                     self.do_cast(c["re_equip_each_cast"], pre=True)
@@ -1237,6 +1262,12 @@ class App:
         ttk.Label(tabs["cast"], style="Muted.TLabel", justify="left",
                   text="Start delay gives you time to click into the game after pressing Start.\n"
                        "Set a timeout to 0 to turn that auto-retry off.").pack(anchor="w", padx=14)
+        p = panel(tabs["cast"], "Food & water break")
+        add(p, "Food slot (0-9)", "food_slot", int, ["0","1","2","3","4","5","6","7","8","9"])
+        add(p, "Water slot (0-9)", "water_slot", int, ["0","1","2","3","4","5","6","7","8","9"])
+        add(p, "Eat/drink every (catches, 0=off)", "eat_every", int)
+        add(p, "Food wait (s)", "food_wait", float)
+        add(p, "Water wait (s)", "water_wait", float)
 
         # ---- Skill checks tab
         p = panel(tabs["skill"], "Skill check 1 - cast (hold, release in the green)")
