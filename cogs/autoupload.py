@@ -193,8 +193,8 @@ class PresetModal(discord.ui.Modal, title="⚡ Preset: FIVEM/RZ/Boosters"):
 
 
 class BulkAddModal(discord.ui.Modal, title="📥 Bulk add a category"):
-    vault_guild_id = discord.ui.TextInput(label="Other server's ID", placeholder="Right-click the server icon → Copy Server ID")
-    category = discord.ui.TextInput(label="Category to match (optional)", placeholder="e.g. RZ -- leave blank for the whole server", required=False)
+    source_id = discord.ui.TextInput(label="Copy FROM: category ID (or server ID)", placeholder="Right-click the category → Copy Category ID")
+    dest_category_id = discord.ui.TextInput(label="Copy TO: category ID here (optional)", placeholder="Blank = match/create by the source category", required=False)
     exclude = discord.ui.TextInput(label="Skip channels containing (optional)", placeholder="e.g. no-,chat", required=False)
     required_role_id = discord.ui.TextInput(label="Required role to claim (optional)", placeholder="@role or role ID", required=False)
     gif_url = discord.ui.TextInput(label="Branding GIF URL (optional)", placeholder="https://....gif", required=False)
@@ -206,7 +206,7 @@ class BulkAddModal(discord.ui.Modal, title="📥 Bulk add a category"):
     async def on_submit(self, interaction: discord.Interaction):
         required_role = resolve_role(interaction.guild, self.required_role_id.value)
         await self.cog.bulkadd(
-            interaction, self.vault_guild_id.value, category=(self.category.value.strip() or None),
+            interaction, self.source_id.value, dest_category_id=(self.dest_category_id.value.strip() or None),
             exclude=(self.exclude.value.strip() or None), required_role=required_role, once_per_user=False,
             create_missing=True, gif_url=(self.gif_url.value.strip() or None),
         )
@@ -299,7 +299,7 @@ class AutoUpload(commands.Cog):
             "**📤 Staff guide** — post the forwarding how-to for staff to pin\n"
             "**🔗 Invite link** — invite me to another server (e.g. a vault)\n"
             "**⚡ Preset** — one-click setup for a FIVEM/RZ/Boosters vault\n"
-            "**📥 Bulk add category** — pair a whole category by matching channel names\n"
+            "**📥 Bulk add category** — paste a category ID (or server ID) to copy from, and optionally a category ID here to copy into\n"
             "**🌱 Seed empty vault** — build matching empty channels in a brand-new vault server"
         )
         await interaction.response.send_message(
@@ -576,9 +576,10 @@ class AutoUpload(commands.Cog):
                 + (f"\n\n🔒 Needs {required_role.mention} to claim." if required_role else "") + (" 🔁 Once per member." if once_per_user else ""))
         await interaction.response.send_message(embed=ui.card("✅ Drop zone ready", body, color=SUCCESS, guild=interaction.guild, section="Files"), ephemeral=True)
 
-    async def pair_category(self, interaction: discord.Interaction, vault: discord.Guild, category: Optional[str], skip: list,
+    async def pair_category(self, interaction: discord.Interaction, vault: discord.Guild, category, skip: list,
                              required_role: Optional[discord.Role], once_per_user: bool, create_missing: bool = True,
-                             dest_category_name: Optional[str] = None, gif_url: Optional[str] = None) -> tuple[list, list, list]:
+                             dest_category_name: Optional[str] = None, gif_url: Optional[str] = None,
+                             dest_category: Optional[discord.CategoryChannel] = None) -> tuple[list, list, list]:
         """Match one category's (or the whole server's) channels on `vault` to same/similarly-named channels in
         the server the command was run in, and save a drop zone for every match. When `create_missing` is True
         (the default), any vault channel with no existing match gets a brand-new channel created for it here,
@@ -591,14 +592,18 @@ class AutoUpload(commands.Cog):
         Returns (matched, unmatched, created) -- created is the subset of matched that are newly-made channels."""
         vault_cats, all_vault_channels = await fetch_live(vault)
         cat_ids = None
-        if category:
+        if isinstance(category, int):          # an exact category, picked by its ID
+            cat_ids = {category}
+        elif category:
             cat_ids = {c.id for c in vault_cats if category.strip().lower() in c.name.lower()}
         vault_channels = [
             c for c in all_vault_channels
             if (cat_ids is None or c.category_id in cat_ids)
             and not any(s in c.name.lower() for s in skip)
         ]
-        if dest_category_name:
+        if dest_category is not None:          # an exact destination category, picked by its ID
+            main_channels = list(dest_category.text_channels)
+        elif dest_category_name:
             existing_dest_cat = discord.utils.find(lambda c: c.name.lower() == dest_category_name.lower(), interaction.guild.categories)
             main_channels = list(existing_dest_cat.text_channels) if existing_dest_cat else []
         else:
@@ -617,7 +622,7 @@ class AutoUpload(commands.Cog):
             want_name = dest_category_name or (vault_cat.name if vault_cat else None)
             cat_key = (want_name or "").lower()
             try:
-                dest_cat = new_category_cache.get(cat_key)
+                dest_cat = dest_category or new_category_cache.get(cat_key)
                 if dest_cat is None:
                     dest_cat = discord.utils.find(
                         lambda c: want_name and c.name.lower() == want_name.lower(), interaction.guild.categories
@@ -658,20 +663,39 @@ class AutoUpload(commands.Cog):
         return ui.card(title, body or "Nothing matched.", color=SUCCESS if matched else WARN, guild=guild, section="Files")
 
     async def bulkadd(
-        self, interaction: discord.Interaction, vault_guild_id: str, category: Optional[str] = None, exclude: Optional[str] = None,
+        self, interaction: discord.Interaction, source_id: str, dest_category_id: Optional[str] = None, exclude: Optional[str] = None,
         required_role: Optional[discord.Role] = None, once_per_user: bool = False, create_missing: bool = True,
         gif_url: Optional[str] = None,
     ):
-        if not vault_guild_id.strip().isdigit():
-            raise UserError("That doesn't look like a server ID. Right-click the server's icon → **Copy Server ID**.")
-        vault = self.bot.get_guild(int(vault_guild_id.strip()))
-        if vault is None:
-            raise UserError("I'm not in that server. Use the menu's **Invite link** button, add me there, then try again.")
+        """Pair a whole category by ID. `source_id` is a category ID (that category only) or a server ID (every
+        channel on it); `dest_category_id` is an optional category here to pair with / create channels in."""
+        raw = source_id.strip().strip("<#>").strip()
+        if not raw.isdigit():
+            raise UserError("Paste an **ID**: right-click the category → **Copy Category ID** (or the server icon → **Copy Server ID** "
+                            "for the whole server). Turn on Developer Mode in Discord's App Settings → Advanced first.")
+        category = None
+        source = self.bot.get_channel(int(raw))
+        if isinstance(source, discord.CategoryChannel):
+            vault, category = source.guild, source.id
+        elif source is not None:
+            raise UserError(f"<#{raw}> is a channel, not a category. Use **Add drop zone** for one channel, or paste the category's ID here.")
+        else:
+            vault = self.bot.get_guild(int(raw))
+            if vault is None:
+                raise UserError("I can't find a category or server with that ID. Check the ID, and that I'm in that server "
+                                "(the menu's **Invite link** button adds me).")
+        dest_category = None
+        if dest_category_id:
+            d = dest_category_id.strip().strip("<#>").strip()
+            dest_category = interaction.guild.get_channel(int(d)) if d.isdigit() else None
+            if not isinstance(dest_category, discord.CategoryChannel):
+                raise UserError("The **Copy TO** ID has to be a category in this server: right-click it → **Copy Category ID**.")
         skip = [s.strip().lower() for s in (exclude or "").split(",") if s.strip()]
         await interaction.response.defer(ephemeral=True)
-        matched, unmatched, created = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user, create_missing, gif_url=gif_url)
+        matched, unmatched, created = await self.pair_category(interaction, vault, category, skip, required_role, once_per_user, create_missing,
+                                                               gif_url=gif_url, dest_category=dest_category)
         if not matched and not unmatched:
-            raise UserError("No text channels found over there. Check the category name, or leave it blank to scan every channel.")
+            raise UserError("No text channels found there. Check the category ID.")
         await interaction.followup.send(embed=self.pairing_result_embed(interaction.guild, f"📥 {len(matched)} drop zone(s) paired", matched, unmatched, created), ephemeral=True)
 
     async def preset(

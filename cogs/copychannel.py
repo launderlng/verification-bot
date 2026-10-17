@@ -165,11 +165,29 @@ class CopyChannel(commands.Cog):
 
     # ------------------------------------------------------------- command ----
 
+    async def channel_from_id(self, raw: str, what: str) -> discord.TextChannel:
+        """A text channel from its ID (or a #mention), on any server the bot is in."""
+        raw = (raw or "").strip().strip("<#>").strip()
+        if not raw.isdigit():
+            raise UserError(f"For the channel to {what}, paste its **ID**: right-click the channel → **Copy Channel ID** "
+                            "(turn on **Developer Mode** in Discord's App Settings → Advanced first).")
+        channel = self.bot.get_channel(int(raw))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(raw))
+            except discord.HTTPException:
+                channel = None
+        if channel is None:
+            raise UserError(f"I can't find a channel with ID `{raw}`. Make sure the ID is right and I'm in that server.")
+        if not isinstance(channel, discord.TextChannel):
+            raise UserError(f"<#{raw}> isn't a text channel.")
+        return channel
+
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.command(name="copychannel", description="Copy a channel's messages, files and videos into another channel")
     @app_commands.describe(
-        source="The channel to copy from",
-        destination="The channel to post the copy in",
+        source="Channel ID to copy from (right-click the channel → Copy Channel ID). Can be on another server I'm in",
+        destination="Channel ID to post the copy in (or #mention it)",
         limit="How many of the most recent messages to look through (default 100, copied oldest first)",
         only_files="Only copy messages that have files, images or videos",
         show_author="Show who posted each message and when (default: yes)",
@@ -179,14 +197,16 @@ class CopyChannel(commands.Cog):
     async def copychannel(
         self,
         interaction: discord.Interaction,
-        source: discord.TextChannel,
-        destination: discord.TextChannel,
+        source: str,
+        destination: str,
         limit: app_commands.Range[int, 1, 1000] = 100,
         only_files: bool = False,
         show_author: bool = True,
         skip_bots: bool = True,
     ):
         guild = interaction.guild
+        source = await self.channel_from_id(source, "copy from")
+        destination = await self.channel_from_id(destination, "post the copy in")
         if not self.bot.intents.message_content:
             raise UserError(
                 "To read other people's messages and files I need the **Message Content Intent**. Turn it on in the Discord Developer Portal "
@@ -194,10 +214,10 @@ class CopyChannel(commands.Cog):
             )
         if source.id == destination.id:
             raise UserError("Pick two different channels.")
-        perms = source.permissions_for(guild.me)
+        perms = source.permissions_for(source.guild.me)
         if not (perms.view_channel and perms.read_message_history):
             raise UserError(f"I need **View Channel** and **Read Message History** in {source.mention}.")
-        check_can_send(destination, guild.me, files=True)
+        check_can_send(destination, destination.guild.me, files=True)
         if guild.id in self.running:
             raise UserError("A copy is already running in this server. Wait for it to finish, or press **Stop** on it.")
 
