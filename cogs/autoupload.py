@@ -235,6 +235,26 @@ class SeedVaultModal(discord.ui.Modal, title="🌱 Seed an empty vault"):
         await send_component_error(interaction, error)
 
 
+class SetMainServerModal(discord.ui.Modal, title="🔗 Link main server"):
+    server_id = discord.ui.TextInput(label="Main server ID", placeholder="Right-click the server icon → Copy Server ID")
+    exclude = discord.ui.TextInput(
+        label="Skip channels containing (optional)",
+        placeholder="e.g. log,staff,ticket,vc — comma-separated",
+        required=False,
+        default="log,ticket,staff,mod,admin,vc,voice,report",
+    )
+
+    def __init__(self, cog: "AutoUpload"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.set_main_server(interaction, self.server_id.value, self.exclude.value)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await send_component_error(interaction, error)
+
+
 class AutoUploadMenuView(discord.ui.View):
     """The buttons behind the one `/autoupload` command. The menu message is ephemeral (only the staff member who
     ran it can even see it), so there's no need to re-check who's clicking -- Discord already scoped that."""
@@ -278,6 +298,14 @@ class AutoUploadMenuView(discord.ui.View):
     async def seedvault_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SeedVaultModal(self.cog))
 
+    @discord.ui.button(label="Link main server", emoji="🌐", style=discord.ButtonStyle.primary, row=3)
+    async def link_main_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetMainServerModal(self.cog))
+
+    @discord.ui.button(label="Refresh channels", emoji="🔄", style=discord.ButtonStyle.success, row=3)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.refresh_main_channels(interaction)
+
 
 class AutoUpload(commands.Cog):
     """Everything here is reached through the single `/autoupload` menu command below -- its buttons and modals
@@ -299,8 +327,10 @@ class AutoUpload(commands.Cog):
             "**📤 Staff guide** — post the forwarding how-to for staff to pin\n"
             "**🔗 Invite link** — invite me to another server (e.g. a vault)\n"
             "**⚡ Preset** — one-click setup for a FIVEM/RZ/Boosters vault\n"
-            "**📥 Bulk add category** — paste a category ID (or server ID) to copy from, and optionally a category ID here to copy into\n"
-            "**🌱 Seed empty vault** — build matching empty channels in a brand-new vault server"
+            "**📥 Bulk add category** — pair a whole category by matching channel names\n"
+            "**🌱 Seed empty vault** — build matching empty channels in a brand-new vault server\n"
+            "**🌐 Link main server** — save your main server so you can use Refresh Channels\n"
+            "**🔄 Refresh channels** — scan the linked main server and auto-link any new text channels (skips logs, voice, tickets)"
         )
         await interaction.response.send_message(
             embed=ui.card("📂 Auto-Upload Menu", body, guild=interaction.guild, section="Files"),
@@ -797,6 +827,147 @@ class AutoUpload(commands.Cog):
             ),
             ephemeral=True,
         )
+
+    # -------------------------------------------------- main server link ----
+
+    # Default skip terms for the refresh command — channels whose names contain any of these (case-insensitive)
+    # are ignored automatically. Voice and Stage channels are always skipped regardless.
+    DEFAULT_SKIP = {"log", "ticket", "staff", "mod", "admin", "vc", "voice", "report", "audit", "general", "rules", "announcements"}
+
+    async def set_main_server(self, interaction: discord.Interaction, server_id: str, exclude_raw: str):
+        server_id = server_id.strip()
+        if not server_id.isdigit():
+            raise UserError("That doesn't look like a server ID. Right-click the server icon → **Copy Server ID**.")
+        guild = self.bot.get_guild(int(server_id))
+        if guild is None:
+            raise UserError("I'm not in that server. Use the menu's **Invite link** button, add me there, then try again.")
+        # Parse exclusion terms and persist them alongside the main_server_id
+        skip_terms = ",".join(s.strip().lower() for s in exclude_raw.split(",") if s.strip())
+        await db.execute(
+            "INSERT INTO autoupload_settings (guild_id, main_server_id, skip_terms) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET main_server_id = excluded.main_server_id, skip_terms = excluded.skip_terms",
+            (interaction.guild_id, guild.id, skip_terms or None),
+        )
+
+        body = (
+            f"Main server set to **{guild.name}** (`{guild.id}`).\n\n"
+            f"Press **🔄 Refresh channels** any time to scan that server and auto-link any new text channels "
+            f"to matching channels here. Channels with these words in their name are skipped: "
+            f"`{skip_terms or '(none)'}`.\n\n"
+            f"Voice, stage, log, and ticket channels are always skipped."
+        )
+        await interaction.response.send_message(embed=ui.card("🌐 Main server linked", body, color=SUCCESS, guild=interaction.guild, section="Files"), ephemeral=True)
+
+    async def refresh_main_channels(self, interaction: discord.Interaction):
+        """Scan the linked main server for text channels and auto-link any that aren't already drop zones here.
+        Skips voice/stage channels, and any channel whose name contains a term from the skip list.
+        Creates matching channels locally when none exist (same as bulkadd with create_missing=True)."""
+        row = await db.fetch_one("SELECT * FROM autoupload_settings WHERE guild_id = ?", (interaction.guild_id,))
+        if not row or not row["main_server_id"]:
+            raise UserError("No main server linked yet. Press **🌐 Link main server** first.")
+        vault = self.bot.get_guild(row["main_server_id"])
+        if vault is None:
+            raise UserError("I'm no longer in the linked main server. Re-invite me there and try again.")
+
+        skip_terms_raw = (row["skip_terms"] if "skip_terms" in row.keys() else None) or ""
+        skip = [s.strip().lower() for s in skip_terms_raw.split(",") if s.strip()] or list(self.DEFAULT_SKIP)
+
+        await interaction.response.defer(ephemeral=True)
+
+        # IDs already wired as drop zones on the vault side — skip these entirely
+        existing = {r["channel_id"] for r in await db.fetch_all(
+            "SELECT channel_id FROM upload_channels WHERE guild_id = ?", (vault.id,)
+        )}
+
+        # Fetch vault channels fresh from the API (not the gateway cache)
+        vault_cats, vault_texts = await fetch_live(vault)
+
+        # Only genuinely new text channels that pass the skip filter
+        to_add = [
+            c for c in vault_texts
+            if c.id not in existing
+            and not any(s in c.name.lower() for s in skip)
+        ]
+
+        await db.execute(
+            "UPDATE autoupload_settings SET last_refresh_at = ? WHERE guild_id = ?",
+            (discord.utils.utcnow().isoformat(), interaction.guild_id),
+        )
+
+        if not to_add:
+            await interaction.followup.send(
+                embed=ui.card(
+                    "🔄 Already up to date",
+                    f"All text channels on **{vault.name}** are already wired up as drop zones.\n"
+                    f"Skipping: `{', '.join(skip)}`",
+                    color=SUCCESS, guild=interaction.guild, section="Files",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # For each new vault channel, find or create a matching local channel and wire it up
+        main_cats, main_texts = await fetch_live(interaction.guild)
+        matched, unmatched, created = [], [], []
+        new_category_cache: dict = {}
+
+        for vc in to_add:
+            target = find_match(vc.name, main_texts)
+            if target and target.id != vc.id:
+                matched.append((vc, target))
+            else:
+                # Create a matching channel locally under the same category name
+                vault_cat = next((c for c in vault_cats if c.id == vc.category_id), None)
+                cat_name = vault_cat.name if vault_cat else None
+                cat_key = (cat_name or "").lower()
+                try:
+                    dest_cat = new_category_cache.get(cat_key)
+                    if dest_cat is None:
+                        dest_cat = discord.utils.find(
+                            lambda c: cat_name and c.name.lower() == cat_name.lower(),
+                            interaction.guild.categories,
+                        ) if cat_name else None
+                        if dest_cat is None and cat_name:
+                            dest_cat = await interaction.guild.create_category(
+                                cat_name, reason="Auto-created by /autoupload refresh"
+                            )
+                        new_category_cache[cat_key] = dest_cat
+                    new_ch = await interaction.guild.create_text_channel(
+                        vc.name, category=dest_cat,
+                        reason=f"Auto-created by /autoupload refresh to mirror #{vc.name}",
+                    )
+                except discord.Forbidden:
+                    unmatched.append(vc)
+                    continue
+                main_texts.append(new_ch)
+                matched.append((vc, new_ch))
+                created.append((vc, new_ch))
+
+        # Save all the new drop zones in one go
+        for vc, target in matched:
+            try:
+                check_can_send(target, interaction.guild.me, files=False)
+            except Exception:
+                unmatched.append(vc)
+                continue
+            await db.execute(
+                "INSERT INTO upload_channels "
+                "(guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, "
+                "pack_name = excluded.pack_name, required_role_id = excluded.required_role_id, "
+                "once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
+                (vc.guild.id, vc.id, target.id,
+                 vc.name.replace("-", " ").title(),
+                 None, 0, interaction.user.id, discord.utils.utcnow().isoformat(), None),
+            )
+
+        embed = self.pairing_result_embed(
+            interaction.guild,
+            f"🔄 Refresh complete — {len(matched)} new channel(s) linked",
+            matched, unmatched, created,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def remove(self, interaction: discord.Interaction, upload_channel_id: str):
         cid = resolve_channel_id(upload_channel_id)

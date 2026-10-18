@@ -393,6 +393,12 @@ CREATE TABLE IF NOT EXISTS giveaway_entries (
     joined_at   TEXT NOT NULL,
     PRIMARY KEY (giveaway_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS autoupload_settings (
+    guild_id         INTEGER PRIMARY KEY,
+    main_server_id   INTEGER,           -- the "main" server channels are mirrored from
+    last_refresh_at  TEXT               -- ISO timestamp of last /autoupload refresh
+);
+
 CREATE TABLE IF NOT EXISTS upload_channels (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id         INTEGER NOT NULL,
@@ -541,6 +547,8 @@ MIGRATIONS = [
     ("ticket_types", "kind", "TEXT NOT NULL DEFAULT 'support'"),  # 'support' or 'application'
     ("ticket_types", "questions", "TEXT"),  # application questions, one per line (max 5)
     ("ticket_types", "app_open", "INTEGER NOT NULL DEFAULT 1"),   # 0 = applications closed for this type
+    ("licenses", "shared_disabled_at", "TEXT"),         # ISO timestamp when key was auto-disabled for sharing
+    ("autoupload_settings", "skip_terms", "TEXT"),      # comma-separated channel name terms to skip on refresh
 ]
 
 
