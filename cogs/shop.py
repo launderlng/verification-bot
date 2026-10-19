@@ -570,14 +570,29 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             line = f"`{stored['filename']}`\n{human_size(stored['size'])} · " + (
                 f"press **Download** below (private, valid {LINK_SECONDS // 60} min)" if linked else "attached below")
             payload = await file_payload(user, guild, stored, embed=self.receipt_embed(guild, order, shop, support_channel, line, role_line=role_line, key_line=key_line), support_channel_id=support_channel)
+        # ── build receipt view (Launch + Support buttons) ────────────────────────
+        receipt_view = discord.ui.View()
+        receipt_view.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.primary,
+            label="Launch XZX Suite",
+            emoji="🚀",
+            custom_id=f"launch_xzx:{user.id}",
+        ))
+        if support_channel:
+            receipt_view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="Support",
+                emoji="🎫",
+                url=f"https://discord.com/channels/{guild.id}/{support_channel}",
+            ))
+
         if payload is not None:
-            kwargs = payload
+            kwargs = {**payload, "view": receipt_view}
         else:  # no file for this product, or it couldn't be attached: send the receipt on its own
-            kwargs = {"embed": self.receipt_embed(guild, order, shop, support_channel, file_problem=stored is not None, role_line=role_line, key_line=key_line)}
-            if support_channel:
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{support_channel}"))
-                kwargs["view"] = view
+            kwargs = {
+                "embed": self.receipt_embed(guild, order, shop, support_channel, file_problem=stored is not None, role_line=role_line, key_line=key_line),
+                "view": receipt_view,
+            }
         delivered = False
         try:
             await user.send(**kwargs)
@@ -829,9 +844,10 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         send="DM the buyer their receipt and file now (default: yes)",
         option="Which payment option they bought (e.g. 1 Week), if the product has options",
         key_length="The macro key length to give them (overrides the product's default)",
+        key_macro="Which macro this key works in (overrides the product's default)",
     )
     @app_commands.autocomplete(product=product_autocomplete, option=option_autocomplete)
-    @app_commands.choices(key_length=KEY_CHOICES)
+    @app_commands.choices(key_length=KEY_CHOICES, key_macro=KEY_MACRO_CHOICES)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def createorder(
         self,
@@ -843,6 +859,7 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         send: bool = True,
         option: Optional[str] = None,
         key_length: Optional[app_commands.Choice[str]] = None,
+        key_macro: Optional[app_commands.Choice[str]] = None,
     ):
         if member.bot:
             raise UserError("Pick a real member, not a bot.")
@@ -859,7 +876,11 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
         override = ...  # unset = use the product/option length
         if key_length is not None:
             override = None if key_length.value == "none" else LENGTHS.get(key_length.value)
-        if await issue_for_order(interaction.guild_id, order, p, days_override=override):
+        # apply macro override: patch a copy of the product dict so issue_for_order picks it up
+        p_issue = dict(p)
+        if key_macro is not None:
+            p_issue["license_macro"] = clean_macro(key_macro.value)
+        if await issue_for_order(interaction.guild_id, order, p_issue, days_override=override):
             order = await db.fetch_one("SELECT * FROM orders WHERE id = ?", (order["id"],))
         shop = await db.get_shop(interaction.guild_id)
         delivered, file_status = False, ("failed" if order["file_id"] else None)

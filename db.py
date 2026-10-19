@@ -468,6 +468,26 @@ CREATE TABLE IF NOT EXISTS processed_uploads (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (message_id, attachment_id)
 );
+
+CREATE TABLE IF NOT EXISTS tray_agents (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id  TEXT NOT NULL,
+    hwid        TEXT NOT NULL,
+    version     TEXT,
+    last_seen   TEXT NOT NULL,
+    UNIQUE(discord_id, hwid)
+);
+CREATE INDEX IF NOT EXISTS idx_tray_discord ON tray_agents (discord_id, last_seen);
+
+CREATE TABLE IF NOT EXISTS tray_signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    hwid        TEXT NOT NULL,
+    discord_id  TEXT NOT NULL,
+    nonce       TEXT NOT NULL UNIQUE,
+    token       TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    acked       INTEGER NOT NULL DEFAULT 0
+);
 """
 
 CONFIG_COLUMNS = {
