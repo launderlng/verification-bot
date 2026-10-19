@@ -27,18 +27,20 @@ SECRET_SALT = b"xzx_suite_2025_salt_noclone"
 # ── helpers ──────────────────────────────────────────────────────────────────────
 
 async def _get_hwid_for_user(discord_id: str) -> str | None:
-    """Look up the HWID registered by this user's tray agent."""
-    db_path = os.getenv("DB_PATH", "verification.db")
-    try:
-        async with aiosqlite.connect(db_path) as db:
-            async with db.execute(
-                "SELECT hwid FROM tray_agents WHERE discord_id = ? ORDER BY last_seen DESC LIMIT 1",
-                (str(discord_id),)
-            ) as cur:
-                row = await cur.fetchone()
-                return row[0] if row else None
-    except Exception:
-        return None
+    """Look up the HWID registered by this user's tray agent via the API."""
+    import asyncio
+    def _do_get():
+        try:
+            params = urllib.parse.urlencode({"discord_id": discord_id})
+            req = urllib.request.Request(f"{API_BASE}/tray/hwid?{params}")
+            req.add_header("X-XZX-Bot", "1")
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read())
+            return data.get("hwid") or None
+        except Exception:
+            return None
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _do_get)
 
 def _make_launch_token(hwid: str, nonce: str) -> str:
     """HMAC(HWID:nonce:ts_window, SECRET_SALT)[:32] — same logic verified by the tray agent."""
