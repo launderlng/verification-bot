@@ -87,12 +87,12 @@ async def _user_has_valid_license(discord_id: str) -> bool:
             async with db.execute(
                 """
                 SELECT 1 FROM licenses
-                WHERE discord_id = ?
+                WHERE user_id = ?
                   AND active = 1
                   AND (expires_at IS NULL OR expires_at > datetime('now'))
                 LIMIT 1
                 """,
-                (str(discord_id),)
+                (int(discord_id),)
             ) as cur:
                 return await cur.fetchone() is not None
     except Exception:
