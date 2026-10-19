@@ -147,7 +147,7 @@ class Launch(commands.Cog):
             view.add_item(discord.ui.Button(
                 label="Download XZX Tray",
                 style=discord.ButtonStyle.link,
-                url=f"{API_BASE}/tray/download?discord_id={discord_id}",
+                url=f"{API_BASE}/tray/install?discord_id={discord_id}",
                 emoji="⬇️",
             ))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -219,7 +219,7 @@ class Launch(commands.Cog):
             view.add_item(discord.ui.Button(
                 label="Download XZX Tray",
                 style=discord.ButtonStyle.link,
-                url=f"{API_BASE}/tray/download?discord_id={discord_id}",
+                url=f"{API_BASE}/tray/install?discord_id={discord_id}",
                 emoji="⬇️",
             ))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
