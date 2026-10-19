@@ -570,14 +570,29 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             line = f"`{stored['filename']}`\n{human_size(stored['size'])} · " + (
                 f"press **Download** below (private, valid {LINK_SECONDS // 60} min)" if linked else "attached below")
             payload = await file_payload(user, guild, stored, embed=self.receipt_embed(guild, order, shop, support_channel, line, role_line=role_line, key_line=key_line), support_channel_id=support_channel)
+        # ── build receipt view (Launch + Support buttons) ────────────────────────
+        receipt_view = discord.ui.View()
+        receipt_view.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.primary,
+            label="Launch XZX Suite",
+            emoji="🚀",
+            custom_id=f"launch_xzx:{user.id}",
+        ))
+        if support_channel:
+            receipt_view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="Support",
+                emoji="🎫",
+                url=f"https://discord.com/channels/{guild.id}/{support_channel}",
+            ))
+
         if payload is not None:
-            kwargs = payload
+            kwargs = {**payload, "view": receipt_view}
         else:  # no file for this product, or it couldn't be attached: send the receipt on its own
-            kwargs = {"embed": self.receipt_embed(guild, order, shop, support_channel, file_problem=stored is not None, role_line=role_line, key_line=key_line)}
-            if support_channel:
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Support", emoji="🎫", url=f"https://discord.com/channels/{guild.id}/{support_channel}"))
-                kwargs["view"] = view
+            kwargs = {
+                "embed": self.receipt_embed(guild, order, shop, support_channel, file_problem=stored is not None, role_line=role_line, key_line=key_line),
+                "view": receipt_view,
+            }
         delivered = False
         try:
             await user.send(**kwargs)

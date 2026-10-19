@@ -183,5 +183,58 @@ class Launch(commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Handle the Launch button on receipt DMs."""
+        if interaction.type != discord.InteractionType.component:
+            return
+        custom_id = interaction.data.get("custom_id", "")
+        if not custom_id.startswith("launch_xzx:"):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        discord_id = str(interaction.user.id)
+
+        # must have valid license
+        if not await _user_has_valid_license(discord_id):
+            await interaction.followup.send(
+                "❌ No active license found. Get access in the shop.", ephemeral=True)
+            return
+
+        # look up HWID
+        hwid = await _get_hwid_for_user(discord_id)
+        if not hwid:
+            embed = discord.Embed(
+                title="🖥️ Tray agent not installed",
+                description=(
+                    "You need to install **XZX Tray** once first.\n\n"
+                    "**Setup (one time only):**\n"
+                    "1. Download and run **XZX Tray** below\n"
+                    "2. Come back and click **Launch** again\n\n"
+                    "After that, one click opens XZX Suite instantly."
+                ),
+                color=0x5865F2,
+            )
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(
+                label="Download XZX Tray",
+                style=discord.ButtonStyle.link,
+                url=f"{API_BASE}/tray/download?discord_id={discord_id}",
+                emoji="⬇️",
+            ))
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            return
+
+        # send launch signal
+        ok = await _post_launch_signal(hwid, discord_id)
+        if ok:
+            await interaction.followup.send(
+                "🚀 Launching… check your desktop in a few seconds.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "⚠️ Couldn't reach your PC. Make sure XZX Tray is running, then try again.",
+                ephemeral=True)
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(Launch(bot))
