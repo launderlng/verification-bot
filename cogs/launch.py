@@ -51,8 +51,11 @@ async def _log_launch(bot: commands.Bot, title: str, description: str, color,
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
 
-async def _get_hwid_for_user(discord_id: str) -> str | None:
-    """Look up the HWID registered by this user's tray agent via the API."""
+async def _get_tray_status(discord_id: str) -> tuple[str | None, bool]:
+    """Look up the HWID registered by this user's tray agent, and whether it
+    has polled recently enough to actually be running right now — so /launch
+    can tell "will open instantly" apart from "installed but not running",
+    instead of always claiming success once a signal is merely accepted."""
     import asyncio
     def _do_get():
         try:
@@ -61,9 +64,9 @@ async def _get_hwid_for_user(discord_id: str) -> str | None:
             req.add_header("X-XZX-Bot", "1")
             with urllib.request.urlopen(req, timeout=8) as r:
                 data = json.loads(r.read())
-            return data.get("hwid") or None
+            return data.get("hwid") or None, bool(data.get("online"))
         except Exception:
-            return None
+            return None, False
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _do_get)
 
@@ -133,7 +136,7 @@ class Launch(commands.Cog):
 
     @app_commands.command(
         name="launch",
-        description="Launch the XZX Suite on your PC instantly — no files needed."
+        description="Launch XZX Loader on your PC instantly — no files needed."
     )
     async def launch(self, interaction: discord.Interaction):
         # /launch only works in a DM with the bot — never in a server channel
@@ -164,18 +167,25 @@ class Launch(commands.Cog):
                               f"**👤 User** · {name}", DANGER, discord_id)
             return
 
-        # 2. Must have the tray agent installed and registered
-        hwid = await _get_hwid_for_user(discord_id)
-        if not hwid:
+        # 2. Must have the tray agent installed AND actually running right now
+        hwid, online = await _get_tray_status(discord_id)
+        if not hwid or not online:
+            first_time = not hwid
             embed = discord.Embed(
-                title="🖥️ Tray agent not found",
+                title="🖥️ Tray agent not found" if first_time else "🖥️ Tray agent isn't running",
                 description=(
                     "Your PC isn't connected yet.\n\n"
                     "**One-time setup:**\n"
                     "1. Download **XZX Tray** below\n"
                     "2. Run it once — it installs itself to startup\n"
                     "3. Come back and run `/launch` again\n\n"
-                    "After setup, `/launch` will open XZX Suite on your PC instantly."
+                    "After setup, `/launch` will open XZX Loader on your PC instantly."
+                ) if first_time else (
+                    "XZX Tray is installed on your PC, but it isn't checking in right now "
+                    "— your PC may be off, asleep, or the tray got closed.\n\n"
+                    "Turn your PC on / wake it up and make sure XZX Tray is running "
+                    "(check your system tray), then run `/launch` again.\n\n"
+                    "If it still won't come back, download it again below."
                 ),
                 color=0x5865F2,
             )
@@ -190,7 +200,8 @@ class Launch(commands.Cog):
                 emoji="⬇️",
             ))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-            await _log_launch(self.bot, "🖥️ /launch — tray agent not registered",
+            await _log_launch(self.bot, "🖥️ /launch — tray agent not registered" if first_time
+                              else "🖥️ /launch — tray agent registered but offline",
                               f"**👤 User** · {name}", WARN, discord_id)
             return
 
@@ -199,15 +210,14 @@ class Launch(commands.Cog):
 
         if ok:
             embed = discord.Embed(
-                title="🚀 Launching XZX Suite",
+                title="🚀 Launching XZX Loader",
                 description=(
                     "Signal sent to your PC!\n"
-                    "The launcher should open in a few seconds.\n\n"
-                    "*Make sure your PC is on and the tray agent is running.*"
+                    "The launcher should open in a few seconds."
                 ),
                 color=0x00E676,
             )
-            embed.set_footer(text="XZX Suite • Validated server-side every launch")
+            embed.set_footer(text="XZX Loader • Validated server-side every launch")
             await _log_launch(self.bot, "🚀 /launch — signal sent",
                               f"**👤 User** · {name}", SUCCESS, discord_id, hwid)
         else:
@@ -255,17 +265,24 @@ class Launch(commands.Cog):
                               f"**👤 User** · {name}", DANGER, discord_id)
             return
 
-        # look up HWID
-        hwid = await _get_hwid_for_user(discord_id)
-        if not hwid:
+        # look up the tray — and whether it's actually running right now
+        hwid, online = await _get_tray_status(discord_id)
+        if not hwid or not online:
+            first_time = not hwid
             embed = discord.Embed(
-                title="🖥️ Tray agent not installed",
+                title="🖥️ Tray agent not installed" if first_time else "🖥️ Tray agent isn't running",
                 description=(
                     "You need to install **XZX Tray** once first.\n\n"
                     "**Setup (one time only):**\n"
                     "1. Download and run **XZX Tray** below\n"
                     "2. Come back and click **Launch** again\n\n"
-                    "After that, one click opens XZX Suite instantly."
+                    "After that, one click opens XZX Loader instantly."
+                ) if first_time else (
+                    "XZX Tray is installed, but it isn't checking in right now — your PC "
+                    "may be off, asleep, or the tray got closed.\n\n"
+                    "Turn your PC on / wake it up and make sure XZX Tray is running, "
+                    "then click **Launch** again. If it still won't come back, "
+                    "download it again below."
                 ),
                 color=0x5865F2,
             )
@@ -277,7 +294,8 @@ class Launch(commands.Cog):
                 emoji="⬇️",
             ))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-            await _log_launch(self.bot, "🖥️ Launch button — tray agent not registered",
+            await _log_launch(self.bot, "🖥️ Launch button — tray agent not registered" if first_time
+                              else "🖥️ Launch button — tray agent registered but offline",
                               f"**👤 User** · {name}", WARN, discord_id)
             return
 

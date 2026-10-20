@@ -20,6 +20,7 @@ from common import ACCENT, COLOR, INFO, LINK_RE, SUCCESS, WARN, UserError, check
 from fileutil import ATTACH_LIMIT, LINK_SECONDS, human_size
 from logutil import emit
 
+XZX_API_BASE = os.getenv("XZX_API_BASE", "https://api.xzxsuite.com")
 
 
 def money(text) -> Optional[str]:
@@ -570,11 +571,21 @@ class Shop(commands.GroupCog, group_name="shop", group_description="Sell product
             line = f"`{stored['filename']}`\n{human_size(stored['size'])} · " + (
                 f"press **Download** below (private, valid {LINK_SECONDS // 60} min)" if linked else "attached below")
             payload = await file_payload(user, guild, stored, embed=self.receipt_embed(guild, order, shop, support_channel, line, role_line=role_line, key_line=key_line), support_channel_id=support_channel)
-        # ── build receipt view (Launch + Support buttons) ────────────────────────
+        # ── build receipt view (Download + Launch + Support buttons) ─────────────
+        # Launch only works once XZX Tray is installed and running, so the
+        # download link is always offered here too, rather than only
+        # appearing after someone clicks Launch and it quietly fails for
+        # them with no tray installed yet.
         receipt_view = discord.ui.View()
         receipt_view.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label="First time? Download XZX Loader",
+            emoji="⬇️",
+            url=f"{XZX_API_BASE}/tray/install?discord_id={user.id}",
+        ))
+        receipt_view.add_item(discord.ui.Button(
             style=discord.ButtonStyle.primary,
-            label="Launch XZX Suite",
+            label="Launch XZX Loader",
             emoji="🚀",
             custom_id=f"launch_xzx:{user.id}",
         ))
