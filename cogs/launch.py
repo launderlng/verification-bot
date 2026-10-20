@@ -19,10 +19,35 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from common import SUCCESS, WARN, DANGER, INFO
+from logutil import emit
+
 log = logging.getLogger("verification-bot")
 
 API_BASE    = os.getenv("XZX_API_BASE", "https://api.xzxsuite.com")
 SECRET_SALT = b"xzx_suite_2025_salt_noclone"
+
+
+def _log_guild(bot: commands.Bot):
+    """/launch always runs in DMs, so there's no interaction.guild to log into —
+    fall back to the bot's main server, same pattern licenses.py uses."""
+    guilds = getattr(bot, "guilds", None) or []
+    return guilds[0] if guilds else None
+
+
+async def _log_launch(bot: commands.Bot, title: str, description: str, color,
+                       discord_id: str, hwid: str | None = None):
+    guild = _log_guild(bot)
+    if guild is None:
+        return
+    ids = [("Discord ID", discord_id)]
+    if hwid:
+        ids.append(("HWID", hwid))
+    try:
+        await emit(guild, "keys", title, description, color=color,
+                   subject=int(discord_id), ids=tuple(ids))
+    except Exception:
+        log.exception("Couldn't post a /launch log")
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
 
@@ -111,8 +136,18 @@ class Launch(commands.Cog):
         description="Launch the XZX Suite on your PC instantly — no files needed."
     )
     async def launch(self, interaction: discord.Interaction):
+        # /launch only works in a DM with the bot — never in a server channel
+        if interaction.guild is not None:
+            await interaction.response.send_message(
+                "🔒 `/launch` only works in a **DM** with me — not in a server. "
+                "Send me a direct message and run it there.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
         discord_id = str(interaction.user.id)
+        name = str(interaction.user)
 
         # 1. Must have a valid license
         if not await _user_has_valid_license(discord_id):
@@ -125,6 +160,8 @@ class Launch(commands.Cog):
                 color=0xFF1744,
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
+            await _log_launch(self.bot, "🚫 /launch refused — no active license",
+                              f"**👤 User** · {name}", DANGER, discord_id)
             return
 
         # 2. Must have the tray agent installed and registered
@@ -153,6 +190,8 @@ class Launch(commands.Cog):
                 emoji="⬇️",
             ))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await _log_launch(self.bot, "🖥️ /launch — tray agent not registered",
+                              f"**👤 User** · {name}", WARN, discord_id)
             return
 
         # 3. Send launch signal
@@ -169,6 +208,8 @@ class Launch(commands.Cog):
                 color=0x00E676,
             )
             embed.set_footer(text="XZX Suite • Validated server-side every launch")
+            await _log_launch(self.bot, "🚀 /launch — signal sent",
+                              f"**👤 User** · {name}", SUCCESS, discord_id, hwid)
         else:
             embed = discord.Embed(
                 title="⚠️ Signal failed",
@@ -182,6 +223,8 @@ class Launch(commands.Cog):
                 ),
                 color=0xFF9100,
             )
+            await _log_launch(self.bot, "⚠️ /launch — signal failed to send",
+                              f"**👤 User** · {name}", WARN, discord_id, hwid)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -194,13 +237,22 @@ class Launch(commands.Cog):
         if not custom_id.startswith("launch_xzx:"):
             return
 
+        # the Launch button only works in a DM — never in a server channel
+        if interaction.guild is not None:
+            await interaction.response.send_message(
+                "🔒 This only works in a **DM** with me — not in a server.", ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True)
         discord_id = str(interaction.user.id)
+        name = str(interaction.user)
 
         # must have valid license
         if not await _user_has_valid_license(discord_id):
             await interaction.followup.send(
                 "❌ No active license found. Get access in the shop.", ephemeral=True)
+            await _log_launch(self.bot, "🚫 Launch button refused — no active license",
+                              f"**👤 User** · {name}", DANGER, discord_id)
             return
 
         # look up HWID
@@ -225,6 +277,8 @@ class Launch(commands.Cog):
                 emoji="⬇️",
             ))
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await _log_launch(self.bot, "🖥️ Launch button — tray agent not registered",
+                              f"**👤 User** · {name}", WARN, discord_id)
             return
 
         # send launch signal
@@ -232,10 +286,14 @@ class Launch(commands.Cog):
         if ok:
             await interaction.followup.send(
                 "🚀 Launching… check your desktop in a few seconds.", ephemeral=True)
+            await _log_launch(self.bot, "🚀 Launch button — signal sent",
+                              f"**👤 User** · {name}", SUCCESS, discord_id, hwid)
         else:
             await interaction.followup.send(
                 "⚠️ Couldn't reach your PC. Make sure XZX Tray is running, then try again.",
                 ephemeral=True)
+            await _log_launch(self.bot, "⚠️ Launch button — signal failed to send",
+                              f"**👤 User** · {name}", WARN, discord_id, hwid)
 
 
 async def setup(bot: commands.Bot):
