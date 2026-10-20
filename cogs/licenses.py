@@ -188,6 +188,15 @@ async def find_license(code: str):
     return row
 
 
+async def _delete_licenses(rows) -> None:
+    """Hard-deletes license rows for good — same cleanup /key delete does for
+    one key, just looped. Used by the bulk delete-all / delete-selected flows."""
+    for row in rows:
+        await db.execute("DELETE FROM license_events WHERE license_id = ?", (row["id"],))
+        await db.execute("DELETE FROM licenses WHERE id = ?", (row["id"],))
+        await db.execute("UPDATE orders SET license_code = NULL WHERE license_code = ?", (row["code"],))
+
+
 def license_embed(row, guild: Optional[discord.Guild] = None) -> discord.Embed:
     embed = ui.card(f"🔑 {row['code']}", color=SUCCESS if status_text(row).startswith("✅") else WARN, guild=guild, section="Keys")
     last = parse_time(row["last_seen"])
@@ -372,6 +381,137 @@ def shared_lock_view(license_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(ReenableKeyButton(license_id))
     return view
+
+
+class ConfirmDeleteAllView(discord.ui.View):
+    """Staff clicked /key deleteall — one more click before every one of a
+    member's keys is gone for good. Only the staff member who ran the
+    command can press the buttons."""
+    def __init__(self, invoker_id: int, member: discord.Member, rows: list, bot: commands.Bot):
+        super().__init__(timeout=60)
+        self.invoker_id = invoker_id
+        self.member = member
+        self.rows = rows
+        self.bot = bot
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the staff member who ran this command can confirm it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Delete all", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _delete_licenses(self.rows)
+        codes = ", ".join(f"`{r['code']}`" for r in self.rows)
+        try:
+            guild = self.bot.get_guild(interaction.guild_id) if interaction.guild_id else None
+            if guild is not None:
+                await emit(guild, "keys", "🗑️ All of a member's keys deleted",
+                           ui.kv(("Member", self.member.mention), ("Count", str(len(self.rows))),
+                                 ("Keys", codes[:950]), ("By", interaction.user.mention)),
+                           WARN, subject=self.member.id)
+        except Exception:
+            pass
+        self.stop()
+        await interaction.response.edit_message(
+            embed=ui.card("🗑️ Keys deleted",
+                          f"Deleted all {len(self.rows)} key(s) for {self.member.mention}.", color=SUCCESS),
+            view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=ui.card("Cancelled", "No keys were deleted.", color=WARN), view=None)
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
+
+
+class DeleteSelectView(discord.ui.View):
+    """Staff clicked /key deleteselect — a dropdown of that member's keys so
+    staff can pick exactly which ones to delete, instead of all-or-nothing."""
+    def __init__(self, invoker_id: int, member: discord.Member, rows: list, bot: commands.Bot):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.member = member
+        self.bot = bot
+        self.message: Optional[discord.Message] = None
+        shown = rows[:25]   # Discord caps a select at 25 options
+        self.rows_by_id = {str(r["id"]): r for r in shown}
+
+        options = [
+            discord.SelectOption(
+                label=r["code"],
+                description=f"{macro_name(r['macro'])} · {status_text(r)} · {expiry_text(r)}"[:100],
+                value=str(r["id"]),
+            ) for r in shown
+        ]
+        select = discord.ui.Select(placeholder="Choose which key(s) to delete…",
+                                   min_values=1, max_values=len(options), options=options)
+        select.callback = self._on_select
+        self.select = select
+        self.add_item(select)
+
+        delete_btn = discord.ui.Button(label="Delete selected", style=discord.ButtonStyle.danger,
+                                       emoji="🗑️", disabled=True)
+        delete_btn.callback = self._on_delete
+        self.delete_btn = delete_btn
+        self.add_item(delete_btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the staff member who ran this command can use this.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        self.delete_btn.disabled = False
+        self.delete_btn.label = f"Delete {len(self.select.values)} selected"
+        await interaction.response.edit_message(view=self)
+
+    async def _on_delete(self, interaction: discord.Interaction):
+        rows = [self.rows_by_id[v] for v in self.select.values if v in self.rows_by_id]
+        await _delete_licenses(rows)
+        codes = ", ".join(f"`{r['code']}`" for r in rows)
+        try:
+            guild = self.bot.get_guild(interaction.guild_id) if interaction.guild_id else None
+            if guild is not None:
+                await emit(guild, "keys", "🗑️ Selected keys deleted",
+                           ui.kv(("Member", self.member.mention), ("Count", str(len(rows))),
+                                 ("Keys", codes[:950]), ("By", interaction.user.mention)),
+                           WARN, subject=self.member.id)
+        except Exception:
+            pass
+        self.stop()
+        await interaction.response.edit_message(
+            embed=ui.card("🗑️ Keys deleted",
+                          f"Deleted {len(rows)} key(s) for {self.member.mention}:\n{codes}", color=SUCCESS),
+            view=None)
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=ui.card("Cancelled", "No keys were deleted.", color=WARN), view=None)
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
 
 
 class Keys(commands.GroupCog, group_name="key", group_description="Macro license keys"):
@@ -1120,10 +1260,39 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
     @app_commands.autocomplete(code=key_autocomplete)
     async def delete(self, interaction: discord.Interaction, code: str):
         row = await find_license(code)
-        await db.execute("DELETE FROM license_events WHERE license_id = ?", (row["id"],))
-        await db.execute("DELETE FROM licenses WHERE id = ?", (row["id"],))
-        await db.execute("UPDATE orders SET license_code = NULL WHERE license_code = ?", (row["code"],))
+        await _delete_licenses([row])
         await interaction.response.send_message(embed=ui.card("🗑️ Key deleted", f"`{row['code']}` no longer exists.", color=SUCCESS), ephemeral=True)
+
+    @app_commands.command(description="Delete ALL of a member's keys at once (asks for confirmation first)")
+    @app_commands.describe(member="Delete every key this member owns")
+    async def deleteall(self, interaction: discord.Interaction, member: discord.Member):
+        rows = await db.fetch_all("SELECT * FROM licenses WHERE user_id = ? ORDER BY id DESC", (member.id,))
+        if not rows:
+            raise UserError(f"{member.mention} doesn't own any keys.")
+        lines = "\n".join(f"{status_text(r)[:1]} `{r['code']}` · **{macro_label(r['macro'])}** · {expiry_text(r)}"
+                          for r in rows[:25])
+        more = f"\n…and {len(rows) - 25} more" if len(rows) > 25 else ""
+        view = ConfirmDeleteAllView(interaction.user.id, member, rows, self.bot)
+        await interaction.response.send_message(
+            embed=ui.card(f"⚠️ Delete all {len(rows)} key(s) for {member}?",
+                          lines + more + "\n\n**This cannot be undone.**", color=DANGER),
+            view=view, ephemeral=True)
+        view.message = await interaction.original_response()
+
+    @app_commands.command(description="Pick exactly which of a member's keys to delete")
+    @app_commands.describe(member="Choose which of this member's keys to delete")
+    async def deleteselect(self, interaction: discord.Interaction, member: discord.Member):
+        rows = await db.fetch_all("SELECT * FROM licenses WHERE user_id = ? ORDER BY id DESC", (member.id,))
+        if not rows:
+            raise UserError(f"{member.mention} doesn't own any keys.")
+        note = (f"\n\nOnly the first 25 are selectable here — {member.mention} has {len(rows)} keys in total."
+               if len(rows) > 25 else "")
+        view = DeleteSelectView(interaction.user.id, member, rows, self.bot)
+        await interaction.response.send_message(
+            embed=ui.card(f"🔑 {member}'s keys", f"Pick which key(s) to delete from the dropdown below.{note}",
+                          color=WARN),
+            view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
     @app_commands.command(description="Bring over keys from the old license website (its CSV export)")
     @app_commands.describe(csv_file="The coop-licenses.csv from the old dashboard's Export button")
