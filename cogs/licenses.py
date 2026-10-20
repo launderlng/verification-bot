@@ -39,6 +39,8 @@ from fileutil import public_base_url
 from logutil import emit, send_log
 from macros import DEFAULT_MACRO, FILTER_MACRO_CHOICES, KEY_MACRO_CHOICES, MACROS, clean_macro, macro_label, macro_name
 
+XZX_API_BASE = os.getenv("XZX_API_BASE", "https://api.xzxsuite.com")
+
 log = logging.getLogger("verification-bot")
 
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I mix-ups
@@ -1053,9 +1055,25 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             try:
                 embed = ui.card("🔑 Your macro key" + ("s" if count > 1 else ""),
                                 "\n".join(f"```{c}```" for c in codes) + f"\n**For** · {which}\n**Length** · {length}\n"
-                                f"Paste it into the {macro_name(macro)} macro's login screen.",
+                                f"Paste it into the {macro_name(macro)} macro's login screen — "
+                                f"or just press **Launch** below if you already have XZX Loader set up.",
                                 color=SUCCESS, guild=interaction.guild, section="Keys")
-                await member.send(embed=embed)
+                # Same Download/Launch buttons as the shop receipt — a staff-issued
+                # key should auto-open the loader too, not just the Stripe flow.
+                key_view = discord.ui.View()
+                key_view.add_item(discord.ui.Button(
+                    style=discord.ButtonStyle.link,
+                    label="First time? Download XZX Loader",
+                    emoji="⬇️",
+                    url=f"{XZX_API_BASE}/tray/install?discord_id={member.id}",
+                ))
+                key_view.add_item(discord.ui.Button(
+                    style=discord.ButtonStyle.primary,
+                    label="Launch XZX Loader",
+                    emoji="🚀",
+                    custom_id=f"launch_xzx:{member.id}",
+                ))
+                await member.send(embed=embed, view=key_view)
                 dm = f"\n📬 Sent to {member.mention} by DM."
             except discord.HTTPException:
                 dm = f"\n📪 Couldn't DM {member.mention} (DMs closed). Give them the key yourself."
