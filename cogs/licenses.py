@@ -577,6 +577,8 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         row = await db.fetch_one("SELECT * FROM auth_sessions WHERE id = ?", (session,)) if session else None
         if not self.linking_enabled() or not row:
             return page("Link expired", "Go back to the macro and press <b>Link Discord account</b> again.", ok=False)
+        open_ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "?")
+        await db.execute("UPDATE auth_sessions SET open_ip = ? WHERE id = ?", (open_ip, session))
         from urllib.parse import urlencode
         query = urlencode({"client_id": self.client_id(), "redirect_uri": redirect_uri(), "response_type": "code",
                            "scope": "identify", "state": session, "prompt": "consent"})
@@ -590,6 +592,8 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if request.query.get("error"):
             await db.execute("UPDATE auth_sessions SET error = ? WHERE id = ?", ("AUTHORIZE WAS CANCELLED", session))
             return page("Cancelled", "You didn't authorize. Go back to the macro and try again.", ok=False)
+        callback_ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "?")
+        await db.execute("UPDATE auth_sessions SET callback_ip = ? WHERE id = ?", (callback_ip, session))
         code = request.query.get("code", "")
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
@@ -621,8 +625,17 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             guild = None
         if guild is not None:
             try:
-                await emit(guild, "keys", "🔗 Discord account linked to the macro",
-                           ui.kv(("👤 Discord", f"<@{user_id}> · `{user_id}`"), ("🏷️ Name", name)), SUCCESS, subject=user_id)
+                open_ip = row["open_ip"] or "?"
+                ip_mismatch = open_ip != "?" and callback_ip != "?" and open_ip != callback_ip
+                ip_lines = [("🌐 Opened login from", f"`{open_ip}`"), ("🌐 Signed in from", f"`{callback_ip}`")]
+                title = "🔗 Discord account linked to the macro"
+                color = SUCCESS
+                if ip_mismatch:
+                    title = "@here ⚠️ Discord account linked — login IP changed mid-flow"
+                    color = WARN
+                await emit(guild, "keys", title,
+                           ui.kv(("👤 Discord", f"<@{user_id}> · `{user_id}`"), ("🏷️ Name", name), *ip_lines),
+                           color, subject=user_id)
             except Exception:
                 log.exception("Couldn't post a link log")
         return page("Account linked", f"Signed in as <b>{html.escape(name)}</b>.<br>You can close this tab and go back to the macro.")

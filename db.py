@@ -569,6 +569,8 @@ MIGRATIONS = [
     ("ticket_types", "app_open", "INTEGER NOT NULL DEFAULT 1"),   # 0 = applications closed for this type
     ("licenses", "shared_disabled_at", "TEXT"),         # ISO timestamp when key was auto-disabled for sharing
     ("autoupload_settings", "skip_terms", "TEXT"),      # comma-separated channel name terms to skip on refresh
+    ("auth_sessions", "open_ip", "TEXT"),    # IP that opened the Discord login page (/auth/start)
+    ("auth_sessions", "callback_ip", "TEXT"),  # IP that completed the login (/auth/callback)
 ]
 
 
