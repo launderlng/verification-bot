@@ -627,7 +627,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             try:
                 open_ip = row["open_ip"] or "?"
                 ip_mismatch = open_ip != "?" and callback_ip != "?" and open_ip != callback_ip
-                ip_lines = [("🌐 Opened login from", f"`{open_ip}`"), ("🌐 Signed in from", f"`{callback_ip}`")]
+                ip_lines = [("🌐 Opened login from", f"||`{open_ip}`||"), ("🌐 Signed in from", f"||`{callback_ip}`||")]
                 title = "🔗 Discord account linked to the macro"
                 color = SUCCESS
                 if ip_mismatch:
@@ -711,13 +711,20 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             await log_event(row["id"], "activation_denied", "Expired")
             await self.key_log(row, "⌛ Expired key tried", who, (("❌ Refused", f"Expired {discord.utils.format_dt(exp, 'R')}"),), WARN)
             return web.Response(text="DENIED|KEY EXPIRED")
-        asked = clean_macro(form.get("product")) or DEFAULT_MACRO   # which macro is asking
-        if row["macro"] and row["macro"] != asked:
+        raw_product = (form.get("product") or "").strip().lower()
+        # "any" — the launcher discovering which macro this key is for (login flow,
+        # or the "paste a key" box), rather than a specific macro already running
+        # and asserting what it expects. Skip the mismatch check in that case; the
+        # key's own macro (row["macro"]) is always the authority on what it unlocks.
+        discovering = raw_product in ("", "any")
+        asked = DEFAULT_MACRO if discovering else (clean_macro(raw_product) or DEFAULT_MACRO)
+        if not discovering and row["macro"] and row["macro"] != asked:
             await log_event(row["id"], "activation_denied", f"wrong macro: {asked}")
             await self.key_log(row, "🎮 Key used in the wrong macro", who,
                                (("🔑 Key is for", macro_label(row["macro"])), ("🖥️ Tried in", macro_label(asked)),
                                 ("❌ Refused", "Wrong macro")), WARN)
             return web.Response(text=f"DENIED|THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO")
+        asked = row["macro"] or "all"   # the real macro this key unlocks ("all" = works in every macro)
         # Device lock: the first PC to log in binds the key to its hardware ID. Any other PC is refused
         # (and the macro there self-destructs). Staff can clear it with /key resethwid.
         dev = (form.get("hwid") or "").strip()[:120]
@@ -771,7 +778,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
                  ("🖥️ Device locked", f"`{fresh['hwid']}`" if first_device else None),
                  ("🧾 Order", f"`{fresh['order_code']}`" if fresh["order_code"] else None)),
                 SUCCESS)
-        return web.Response(text="OK|LICENSE VALID")
+        return web.Response(text=f"OK|LICENSE VALID|{asked}")
 
     async def handle_check(self, request: web.Request) -> web.Response:
         """Asked every minute by a logged-in macro. Quiet: doesn't count as a login or post to the key log unless it logs them out.
@@ -793,9 +800,11 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         elif (exp := parse_time(row["expires_at"])) is not None and exp <= now():
             reason = "KEY EXPIRED"
         else:
-            asked = clean_macro(form.get("product")) or DEFAULT_MACRO
+            raw_product = (form.get("product") or "").strip().lower()
+            discovering = raw_product in ("", "any")
+            asked = DEFAULT_MACRO if discovering else (clean_macro(raw_product) or DEFAULT_MACRO)
             dev = (form.get("hwid") or "").strip()[:120]
-            if row["macro"] and row["macro"] != asked:
+            if not discovering and row["macro"] and row["macro"] != asked:
                 reason = f"THIS KEY IS FOR THE {macro_name(row['macro']).upper()} MACRO"
             elif row["hwid"] and dev and row["hwid"] != dev:
                 await self.auto_disable_shared(row, dev)   # second device -> auto-disable + DM + shared-key log
