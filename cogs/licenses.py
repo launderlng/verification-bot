@@ -389,6 +389,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             app.router.add_post("/api/report", self.handle_report)
             app.router.add_post("/api/auth/new", self.handle_auth_new)
             app.router.add_get("/api/auth/status", self.handle_auth_status)
+            app.router.add_get("/api/mykeys", self.handle_my_keys)
             app.router.add_get("/auth/start", self.handle_auth_start)
             app.router.add_get("/auth/callback", self.handle_auth_callback)
             log.info("License check route is ready at /api/activate (Discord linking %s)",
@@ -527,6 +528,24 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if created is None or created + timedelta(minutes=PENDING_MINUTES) <= now():
             return web.Response(text="EXPIRED")
         return web.Response(text="PENDING")
+
+    async def handle_my_keys(self, request: web.Request) -> web.Response:
+        """A linked session asks here for any key already tied to that Discord account
+        (e.g. from a manually created order) so the launcher can activate it automatically
+        instead of the person having to paste a code in."""
+        if not self.linking_enabled():
+            return web.Response(text="OFF")
+        link = await self.linked_user(clean_session(request.query.get("session") or request.query.get("s")))
+        if link is None:
+            return web.Response(text="DENIED|NOT LINKED")
+        rows = await db.fetch_all(
+            "SELECT * FROM licenses WHERE user_id = ? AND active = 1 ORDER BY id DESC LIMIT 10",
+            (link["user_id"],))
+        rows = [r for r in rows if not ((exp := parse_time(r["expires_at"])) is not None and exp <= now())]
+        if not rows:
+            return web.Response(text="DENIED|NO LICENSE")
+        codes = ",".join(r["code"] for r in rows)
+        return web.Response(text=f"OK|{codes}")
 
     async def handle_auth_start(self, request: web.Request) -> web.Response:
         session = clean_session(request.query.get("s"))
