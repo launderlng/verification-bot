@@ -390,6 +390,7 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
             app.router.add_post("/api/auth/new", self.handle_auth_new)
             app.router.add_get("/api/auth/status", self.handle_auth_status)
             app.router.add_get("/api/mykeys", self.handle_my_keys)
+            app.router.add_get("/api/keyinfo", self.handle_key_info)
             app.router.add_get("/auth/start", self.handle_auth_start)
             app.router.add_get("/auth/callback", self.handle_auth_callback)
             log.info("License check route is ready at /api/activate (Discord linking %s)",
@@ -528,6 +529,30 @@ class Keys(commands.GroupCog, group_name="key", group_description="Macro license
         if created is None or created + timedelta(minutes=PENDING_MINUTES) <= now():
             return web.Response(text="EXPIRED")
         return web.Response(text="PENDING")
+
+    async def handle_key_info(self, request: web.Request) -> web.Response:
+        """Plain-text (no Discord markdown) macro + length/expiry for a key,
+        for the launcher UI to show after activation."""
+        code = clean_code(request.query.get("code"))
+        if not code:
+            return web.Response(text="DENIED|INVALID REQUEST")
+        row = await db.fetch_one("SELECT * FROM licenses WHERE code = ?", (code,))
+        if not row:
+            return web.Response(text="DENIED|INVALID KEY")
+        macro = macro_label(row["macro"])
+        exp = parse_time(row["expires_at"])
+        if exp is None:
+            length = (f"{length_label(row['duration_days'])} (starts on first login)"
+                      if row["duration_days"] else "Lifetime")
+        elif exp <= now():
+            length = "Expired"
+        else:
+            delta = exp - now()
+            if delta.days >= 1:
+                length = f"Expires in {delta.days}d"
+            else:
+                length = f"Expires in {max(1, delta.seconds // 3600)}h"
+        return web.Response(text=f"OK|{macro}|{length}")
 
     async def handle_my_keys(self, request: web.Request) -> web.Response:
         """A linked session asks here for any key already tied to that Discord account
