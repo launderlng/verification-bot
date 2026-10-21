@@ -779,6 +779,15 @@ async def get_target_channel_id(target_guild_id: int, main_channel_id: int) -> i
     return row["target_channel_id"] if row else None
 
 
+async def get_main_channel_id(target_guild_id: int, target_channel_id: int) -> int | None:
+    """Reverse lookup: given a channel in the linked (vault) server, which main-server channel does it mirror?"""
+    row = await fetch_one(
+        "SELECT main_channel_id FROM channel_link_map WHERE target_guild_id = ? AND target_channel_id = ?",
+        (target_guild_id, target_channel_id),
+    )
+    return row["main_channel_id"] if row else None
+
+
 async def set_channel_map(target_guild_id: int, main_channel_id: int, target_channel_id: int) -> None:
     await execute(
         "INSERT INTO channel_link_map (target_guild_id, main_channel_id, target_channel_id) VALUES (?, ?, ?) "

@@ -1,3 +1,4 @@
+import io
 import logging
 from typing import Optional
 
@@ -17,6 +18,12 @@ REASON_UPDATE = "Renamed/moved on the linked main server"
 REASON_DELETE = "Removed: deleted on the linked main server"
 MAX_MIRROR_ITEMS = 150  # keeps the first sync inside Discord's 15 minute reply window
 MIRRORABLE = (discord.TextChannel, discord.VoiceChannel)
+MAX_FORWARD_FILES = 10
+
+
+def _is_normal(message: discord.Message) -> bool:
+    """Real messages and replies only (not joins, pins, boosts and other system messages)."""
+    return getattr(getattr(message, "type", None), "name", "default") in ("default", "reply")
 
 
 def simple(title: str, text: str, color: discord.Color = INFO) -> discord.Embed:
@@ -25,9 +32,10 @@ def simple(title: str, text: str, color: discord.Color = INFO) -> discord.Embed:
 
 @app_commands.guild_only()
 class ServerLink(commands.Cog):
-    """/linkserver: mirror a main server's channels into this (second) server, live. After the first catch-up
-    sync, any channel created, renamed, moved or deleted on the main server automatically happens here too.
-    One-way only (main -> this server) — channels made directly here are never touched or copied back."""
+    """/linkserver: mirror a main server's channels into this (second, "vault") server, live. After the first
+    catch-up sync, any channel created, renamed, moved or deleted on the main server automatically happens here
+    too — channels made directly here are never touched or copied back. The other direction, for CONTENT: any
+    message posted in a mirrored vault channel is forwarded into the matching channel on the main server."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -169,6 +177,53 @@ class ServerLink(commands.Cog):
         await interaction.response.send_message(embed=simple(
             "🔗 Linked", f"Mirroring **{main_guild.name if main_guild else link['main_guild_id']}** live. **{mapped}** channel(s)/category(s) tracked so far.", COLOR,
         ), ephemeral=True)
+
+    # --------------------------------------------------------- forwarding ----
+
+    async def _forward_message(self, message: discord.Message, main_channel: discord.TextChannel) -> None:
+        content = (message.content or "").strip()
+        attachments = list(message.attachments)
+        if not content and not attachments and not message.embeds:
+            return
+        perms = main_channel.permissions_for(main_channel.guild.me)
+        if not perms.send_messages or (attachments and not perms.attach_files):
+            return
+        embed = discord.Embed(description=content[:4000] or None, color=COLOR)
+        embed.set_author(name=f"{message.author.display_name} · #{message.channel.name}", icon_url=message.author.display_avatar.url)
+        embed.timestamp = message.created_at
+        limit = main_channel.guild.filesize_limit
+        files = []
+        too_big = 0
+        for a in attachments[:MAX_FORWARD_FILES]:
+            if a.size > limit:
+                too_big += 1
+                continue
+            try:
+                files.append(discord.File(io.BytesIO(await a.read()), filename=a.filename, spoiler=a.is_spoiler()))
+            except discord.HTTPException:
+                too_big += 1
+        if too_big:
+            embed.add_field(name="⚠️ Not copied (too big)", value=f"{too_big} file(s) over this server's upload limit", inline=False)
+        try:
+            kwargs = {"files": files} if files else {}
+            await main_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+        except discord.HTTPException:
+            log.exception("Vault->main forward failed: %s -> %s", message.channel.id, main_channel.id)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.guild is None or message.author.bot or not _is_normal(message):
+            return
+        link = await db.get_server_link(message.guild.id)
+        if link is None:
+            return
+        main_channel_id = await db.get_main_channel_id(message.guild.id, message.channel.id)
+        if main_channel_id is None:
+            return
+        main_guild = self.bot.get_guild(link["main_guild_id"])
+        main_channel = main_guild.get_channel(main_channel_id) if main_guild else None
+        if isinstance(main_channel, discord.TextChannel):
+            await self._forward_message(message, main_channel)
 
     # ------------------------------------------------------------- listeners ----
 
