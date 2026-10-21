@@ -348,5 +348,143 @@ class Templates(commands.GroupCog, group_name="template", group_description="Cop
         await interaction.edit_original_response(embed=embed, view=None)
 
 
+# ── duplicate-channel cleanup ───────────────────────────────────────────────
+# Complements /import: that command only SKIPS creating a new channel when
+# one of the same name already exists here — it never touches duplicates
+# that already exist from before (e.g. a server template left two
+# "general"s). This finds those and removes the extras.
+DEDUPE_REASON = "Removed as a duplicate channel (kept the one with content)"
+
+
+async def _has_content(channel) -> bool:
+    """Best content signal available without walking full history (which
+    could be slow/rate-limited on a busy channel): does it have a message
+    at all. Voice/stage channels have no history, so always False for
+    those — handled separately by creation time instead."""
+    if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+        return False
+    return channel.last_message_id is not None
+
+
+async def _plan_dedupe(guild: discord.Guild) -> list[dict]:
+    """Group every text/voice/forum/stage channel by (name, type), and for
+    each group with more than one member, decide which to keep: prefer one
+    with message content over one without, and break ties (or decide
+    voice/stage, which have no content signal) by keeping the oldest."""
+    groups: dict[tuple, list] = {}
+    for ch in guild.channels:
+        if isinstance(ch, discord.CategoryChannel):
+            continue
+        key = (ch.name.lower().strip(), type(ch).__name__)
+        groups.setdefault(key, []).append(ch)
+
+    plans = []
+    for (name, _type), chans in groups.items():
+        if len(chans) < 2:
+            continue
+        scored = []
+        for ch in chans:
+            has_content = await _has_content(ch)
+            scored.append((has_content, -ch.created_at.timestamp(), ch))
+        # content first, then oldest (negative timestamp sorts oldest first)
+        scored.sort(key=lambda t: (not t[0], t[1]))
+        keep = scored[0][2]
+        remove = [t[2] for t in scored[1:]]
+        plans.append({"name": name, "keep": keep, "remove": remove})
+    return plans
+
+
+class DedupeConfirmView(discord.ui.View):
+    def __init__(self, invoker_id: int, plans: list[dict]):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.plans = plans
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the admin who ran this command can confirm it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Delete duplicates", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        removed, failed = 0, 0
+        for plan in self.plans:
+            for ch in plan["remove"]:
+                try:
+                    await ch.delete(reason=DEDUPE_REASON)
+                    removed += 1
+                except discord.HTTPException:
+                    failed += 1
+        for item in self.children:
+            item.disabled = True
+        summary = f"Removed **{removed}** duplicate channel(s)." + (f" **{failed}** couldn't be deleted." if failed else "")
+        await interaction.edit_original_response(
+            embed=simple("✅ Cleanup done", summary, COLOR), view=self)
+        guild = interaction.guild
+        if guild is not None:
+            await emit(guild, "server", "🗑️ Duplicate channels removed",
+                       ui.kv(("🛡️ By", interaction.user.mention), ("Removed", str(removed)),
+                             ("Failed", str(failed) if failed else None)))
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.invoker_id:
+            return await interaction.response.send_message(
+                "Only the admin who ran this command can cancel it.", ephemeral=True)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            embed=simple("Cancelled", "No channels were touched.", COLOR), view=self)
+        self.stop()
+
+
+class Dedupe(commands.Cog):
+    """/dedupechannels: find channels in this server that share a name and
+    remove the extras, keeping whichever one actually has content. Use
+    alongside /import (skip_existing:true) when syncing a server's channel
+    list from a template of your main server — /import only avoids
+    creating NEW duplicates, this cleans up ones that already exist."""
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="dedupechannels",
+                          description="Find and remove duplicate channels (same name), keeping the one with content")
+    @app_commands.default_permissions(manage_channels=True)
+    @app_commands.checks.has_permissions(manage_channels=True)
+    @app_commands.guild_only()
+    async def dedupechannels(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild.me.guild_permissions.manage_channels:
+            raise UserError("I need the **Manage Channels** permission here.")
+        await interaction.response.defer(ephemeral=True)
+        plans = await _plan_dedupe(guild)
+        if not plans:
+            await interaction.followup.send(
+                embed=simple("✅ No duplicates found", "Every channel name here is already unique.", COLOR))
+            return
+        lines = []
+        for p in plans[:20]:
+            removed_mentions = ", ".join(c.mention for c in p["remove"])
+            lines.append(f"**{p['name']}** — keep {p['keep'].mention}, remove {removed_mentions}")
+        body = "\n".join(lines)
+        if len(plans) > 20:
+            body += f"\n…and {len(plans) - 20} more group(s)."
+        total_remove = sum(len(p["remove"]) for p in plans)
+        embed = simple(f"⚠️ {total_remove} duplicate channel(s) found",
+                       body + "\n\nThe kept channel is whichever has message content (or, for voice channels "
+                              "or a tie, whichever is oldest). This can't be undone — double-check before confirming.",
+                       WARN)
+        view = DedupeConfirmView(interaction.user.id, plans)
+        await interaction.followup.send(embed=embed, view=view)
+        view.message = await interaction.original_response()
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(Templates(bot))
+    await bot.add_cog(Dedupe(bot))
