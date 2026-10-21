@@ -488,6 +488,24 @@ CREATE TABLE IF NOT EXISTS tray_signals (
     created_at  TEXT NOT NULL,
     acked       INTEGER NOT NULL DEFAULT 0
 );
+
+-- /linkserver: live, one-way channel mirroring (main server -> a linked/second server)
+CREATE TABLE IF NOT EXISTS server_links (
+    target_guild_id INTEGER PRIMARY KEY,   -- the second server being mirrored INTO
+    main_guild_id   INTEGER NOT NULL,      -- the main server channels are mirrored FROM
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_by      INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_server_links_main ON server_links (main_guild_id, enabled);
+
+CREATE TABLE IF NOT EXISTS channel_link_map (
+    target_guild_id   INTEGER NOT NULL,
+    main_channel_id   INTEGER NOT NULL,
+    target_channel_id INTEGER NOT NULL,
+    PRIMARY KEY (target_guild_id, main_channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_link_map_target ON channel_link_map (target_guild_id, target_channel_id);
 """
 
 CONFIG_COLUMNS = {
@@ -720,3 +738,54 @@ async def message_total(guild_id: int, user_id: int, channel_id: int | None = No
     else:
         row = await fetch_one("SELECT COALESCE(SUM(count), 0) AS n FROM message_counts WHERE guild_id = ? AND user_id = ? AND channel_id = ?", (guild_id, user_id, channel_id))
     return row["n"]
+
+
+# ── server links (/linkserver): live one-way channel mirroring ──────────────
+
+async def get_server_link(target_guild_id: int) -> aiosqlite.Row | None:
+    return await fetch_one("SELECT * FROM server_links WHERE target_guild_id = ? AND enabled = 1", (target_guild_id,))
+
+
+async def get_server_links_for_main(main_guild_id: int) -> list[aiosqlite.Row]:
+    """Every linked (second) server that mirrors FROM this main server."""
+    return await fetch_all("SELECT * FROM server_links WHERE main_guild_id = ? AND enabled = 1", (main_guild_id,))
+
+
+async def set_server_link(target_guild_id: int, main_guild_id: int, created_by: int) -> None:
+    import datetime
+    await execute(
+        "INSERT INTO server_links (target_guild_id, main_guild_id, enabled, created_by, created_at) VALUES (?, ?, 1, ?, ?) "
+        "ON CONFLICT (target_guild_id) DO UPDATE SET main_guild_id = ?, enabled = 1, created_by = ?",
+        (target_guild_id, main_guild_id, created_by, datetime.datetime.utcnow().isoformat(), main_guild_id, created_by),
+    )
+
+
+async def delete_server_link(target_guild_id: int) -> None:
+    await execute("DELETE FROM server_links WHERE target_guild_id = ?", (target_guild_id,))
+    await execute("DELETE FROM channel_link_map WHERE target_guild_id = ?", (target_guild_id,))
+
+
+async def get_channel_map(target_guild_id: int) -> dict:
+    """{main_channel_id: target_channel_id} for everything mirrored into this linked server so far."""
+    rows = await fetch_all("SELECT main_channel_id, target_channel_id FROM channel_link_map WHERE target_guild_id = ?", (target_guild_id,))
+    return {row["main_channel_id"]: row["target_channel_id"] for row in rows}
+
+
+async def get_target_channel_id(target_guild_id: int, main_channel_id: int) -> int | None:
+    row = await fetch_one(
+        "SELECT target_channel_id FROM channel_link_map WHERE target_guild_id = ? AND main_channel_id = ?",
+        (target_guild_id, main_channel_id),
+    )
+    return row["target_channel_id"] if row else None
+
+
+async def set_channel_map(target_guild_id: int, main_channel_id: int, target_channel_id: int) -> None:
+    await execute(
+        "INSERT INTO channel_link_map (target_guild_id, main_channel_id, target_channel_id) VALUES (?, ?, ?) "
+        "ON CONFLICT (target_guild_id, main_channel_id) DO UPDATE SET target_channel_id = ?",
+        (target_guild_id, main_channel_id, target_channel_id, target_channel_id),
+    )
+
+
+async def delete_channel_map_by_main(target_guild_id: int, main_channel_id: int) -> None:
+    await execute("DELETE FROM channel_link_map WHERE target_guild_id = ? AND main_channel_id = ?", (target_guild_id, main_channel_id))

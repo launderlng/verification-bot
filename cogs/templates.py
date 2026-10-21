@@ -9,6 +9,7 @@ from discord.ext import commands
 import ui
 
 from common import COLOR, DANGER, INFO, WARN, UserError
+from logutil import emit
 import presets
 from templateutil import extract_template_code, is_invite, parse_template, safe_permissions, tree_text
 
