@@ -183,30 +183,23 @@ class ServerLink(commands.Cog):
     async def _forward_message(self, message: discord.Message, main_channel: discord.TextChannel) -> None:
         content = (message.content or "").strip()
         attachments = list(message.attachments)
-        if not content and not attachments and not message.embeds:
+        if not content and not attachments:
             return
         perms = main_channel.permissions_for(main_channel.guild.me)
         if not perms.send_messages or (attachments and not perms.attach_files):
             return
-        embed = discord.Embed(description=content[:4000] or None, color=COLOR)
-        embed.set_author(name=f"{message.author.display_name} · #{message.channel.name}", icon_url=message.author.display_avatar.url)
-        embed.timestamp = message.created_at
         limit = main_channel.guild.filesize_limit
         files = []
-        too_big = 0
         for a in attachments[:MAX_FORWARD_FILES]:
             if a.size > limit:
-                too_big += 1
                 continue
             try:
                 files.append(discord.File(io.BytesIO(await a.read()), filename=a.filename, spoiler=a.is_spoiler()))
             except discord.HTTPException:
-                too_big += 1
-        if too_big:
-            embed.add_field(name="⚠️ Not copied (too big)", value=f"{too_big} file(s) over this server's upload limit", inline=False)
+                pass
         try:
             kwargs = {"files": files} if files else {}
-            await main_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+            await main_channel.send(content=content[:2000] or None, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
         except discord.HTTPException:
             log.exception("Vault->main forward failed: %s -> %s", message.channel.id, main_channel.id)
 
