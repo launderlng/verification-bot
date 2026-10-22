@@ -235,17 +235,44 @@ def clean_session(value: Optional[str]) -> str:
 
 
 def page(title: str, text: str, ok: bool = True) -> web.Response:
-    """The little page shown in the browser after Authorize - same purple look as the macro."""
+    """The little page shown in the browser after Authorize - pure black/white, with
+    the same falling snow as the macro's own windows, so this page actually matches
+    the app instead of the old purple gradient look it used to have."""
     icon = "✓" if ok else "!"
-    accent = "#9d4eff" if ok else "#f0587e"
+    accent = "#ffffff" if ok else "#ff4d5e"
+    icon_fg = "#000000" if ok else "#ffffff"
     body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title><style>
-body{{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Segoe UI,system-ui,sans-serif;color:#f4eeff;
-background:radial-gradient(ellipse at 15% 0%,#3a1474 0%,#09060f 65%)}}
-.c{{width:min(420px,88vw);padding:36px 32px;border-radius:22px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.13);text-align:center}}
-.i{{width:56px;height:56px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center;font-size:28px;background:{accent};box-shadow:0 0 34px {accent}}}
-h1{{font-size:22px;margin:0 0 10px}}p{{margin:0;color:#a99cc4;line-height:1.5}}</style></head>
-<body><div class="c"><div class="i">{icon}</div><h1>{html.escape(title)}</h1><p>{text}</p></div></body></html>"""
+*{{box-sizing:border-box}}
+html,body{{margin:0;min-height:100vh;background:#000}}
+body{{display:grid;place-items:center;font-family:'Segoe UI',system-ui,sans-serif;color:#fff;overflow:hidden;position:relative}}
+#snow{{position:fixed;inset:0;pointer-events:none}}
+.flake{{position:absolute;top:-8px;border-radius:50%;background:#fff;opacity:.85;animation:fall linear infinite}}
+@keyframes fall{{to{{transform:translateY(110vh)}}}}
+.c{{position:relative;z-index:1;width:min(420px,88vw);padding:36px 32px;border-radius:22px;background:#000;border:1px solid #2a2a2a;text-align:center}}
+.i{{width:56px;height:56px;margin:0 auto 18px;border-radius:50%;display:grid;place-items:center;font-size:26px;font-weight:700;background:{accent};color:{icon_fg}}}
+h1{{font-size:22px;margin:0 0 10px;font-weight:800}}p{{margin:0;color:#9a9a9a;line-height:1.5}}
+</style></head>
+<body><div id="snow"></div><div class="c"><div class="i">{icon}</div><h1>{html.escape(title)}</h1><p>{text}</p></div>
+<script>
+(function(){{
+  var n = Math.min(70, Math.floor(window.innerWidth / 14));
+  var host = document.getElementById('snow');
+  for (var i = 0; i < n; i++) {{
+    var f = document.createElement('div');
+    f.className = 'flake';
+    var size = 2 + Math.random() * 3;
+    f.style.width = size + 'px';
+    f.style.height = size + 'px';
+    f.style.left = (Math.random() * 100) + 'vw';
+    f.style.animationDuration = (6 + Math.random() * 8) + 's';
+    f.style.animationDelay = (-Math.random() * 12) + 's';
+    f.style.opacity = 0.4 + Math.random() * 0.5;
+    host.appendChild(f);
+  }}
+}})();
+</script>
+</body></html>"""
     return web.Response(text=body, content_type="text/html")
 
 
