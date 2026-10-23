@@ -306,6 +306,10 @@ class AutoUploadMenuView(discord.ui.View):
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.refresh_main_channels(interaction)
 
+    @discord.ui.button(label="Fix broken", emoji="🔧", style=discord.ButtonStyle.danger, row=3)
+    async def fix_broken_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.fix_broken(interaction)
+
 
 class AutoUpload(commands.Cog):
     """Everything here is reached through the single `/autoupload` menu command below -- its buttons and modals
@@ -330,7 +334,8 @@ class AutoUpload(commands.Cog):
             "**📥 Bulk add category** — pair a whole category by matching channel names\n"
             "**🌱 Seed empty vault** — build matching empty channels in a brand-new vault server\n"
             "**🌐 Link main server** — save your main server so you can use Refresh Channels\n"
-            "**🔄 Refresh channels** — scan the linked main server and auto-link any new text channels (skips logs, voice, tickets)"
+            "**🔄 Refresh channels** — scan the linked main server and auto-link any new text channels (skips logs, voice, tickets)\n"
+            "**🔧 Fix broken** — re-match any drop zone whose destination channel I can no longer see (deleted, recreated, or access lost), by name"
         )
         await interaction.response.send_message(
             embed=ui.card("📂 Auto-Upload Menu", body, guild=interaction.guild, section="Files"),
@@ -593,11 +598,11 @@ class AutoUpload(commands.Cog):
             raise UserError("That needs to be a text channel.")
         check_can_send(post_channel, interaction.guild.me, files=False)
         await db.execute(
-            "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
+            "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, post_guild_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, post_guild_id = excluded.post_guild_id, pack_name = excluded.pack_name, "
             "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
-            (channel.guild.id, channel.id, post_channel.id, pack.strip(), required_role.id if required_role else None,
+            (channel.guild.id, channel.id, post_channel.id, post_channel.guild.id, pack.strip(), required_role.id if required_role else None,
              int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat(), gif_url.strip() if gif_url else None),
         )
         where = f"**#{channel.name}** on **{channel.guild.name}**" if channel.guild.id != interaction.guild_id else channel.mention
@@ -672,11 +677,11 @@ class AutoUpload(commands.Cog):
         for vc, target in matched:
             check_can_send(target, interaction.guild.me, files=False)
             await db.execute(
-                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, post_guild_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, post_guild_id = excluded.post_guild_id, pack_name = excluded.pack_name, "
                 "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
-                (vc.guild.id, vc.id, target.id, vc.name.replace("-", " ").title(), required_role.id if required_role else None,
+                (vc.guild.id, vc.id, target.id, target.guild.id, vc.name.replace("-", " ").title(), required_role.id if required_role else None,
                  int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat(), gif_url),
             )
         return matched, unmatched, created
@@ -789,11 +794,11 @@ class AutoUpload(commands.Cog):
                 created.append((vc, mc))
             check_can_send(mc, interaction.guild.me, files=False)
             await db.execute(
-                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, pack_name = excluded.pack_name, "
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, post_guild_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, post_guild_id = excluded.post_guild_id, pack_name = excluded.pack_name, "
                 "required_role_id = excluded.required_role_id, once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
-                (vc.guild.id, vc.id, mc.id, mc.name.replace("-", " ").title(), required_role.id if required_role else None,
+                (vc.guild.id, vc.id, mc.id, mc.guild.id, mc.name.replace("-", " ").title(), required_role.id if required_role else None,
                  int(once_per_user), interaction.user.id, discord.utils.utcnow().isoformat(), gif_url),
             )
             paired.append((vc, mc))
@@ -952,12 +957,12 @@ class AutoUpload(commands.Cog):
                 continue
             await db.execute(
                 "INSERT INTO upload_channels "
-                "(guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, "
+                "(guild_id, channel_id, post_channel_id, post_guild_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, post_guild_id = excluded.post_guild_id, "
                 "pack_name = excluded.pack_name, required_role_id = excluded.required_role_id, "
                 "once_per_user = excluded.once_per_user, gif_url = excluded.gif_url",
-                (vc.guild.id, vc.id, target.id,
+                (vc.guild.id, vc.id, target.id, target.guild.id,
                  vc.name.replace("-", " ").title(),
                  None, 0, interaction.user.id, discord.utils.utcnow().isoformat(), None),
             )
@@ -999,6 +1004,68 @@ class AutoUpload(commands.Cog):
                 + (f" · 🔒 <@&{r['required_role_id']}>" if r["required_role_id"] else "") + (" · 🔁 once" if r["once_per_user"] else "")
             )
         await interaction.response.send_message(embed=ui.card("📥 Drop zones", "\n".join(lines), guild=interaction.guild, section="Files"), ephemeral=True)
+
+    async def fix_broken(self, interaction: discord.Interaction):
+        """Re-matches any drop zone involving this server whose destination channel the bot can no longer see
+        (deleted, recreated with a new ID, or access revoked) -- the same "Can't post" failure `list` now
+        surfaces instead of hiding. For a row saved after post_guild_id started being tracked, this looks for
+        a current same-named text channel in that exact destination server. For an older row saved before
+        that (post_guild_id is NULL), it falls back to scanning every server the bot is in and only applies a
+        fix when exactly one server has an unambiguous same-named match -- anything less certain is left for
+        staff to fix by hand with Remove + Add, rather than risk wiring a pack to the wrong server."""
+        all_rows = await db.fetch_all("SELECT * FROM upload_channels")
+        rows = [r for r in all_rows if r["guild_id"] == interaction.guild_id or r["post_guild_id"] == interaction.guild_id
+                or interaction.guild.get_channel(r["post_channel_id"]) is not None]
+        broken = [r for r in rows if self.bot.get_channel(r["post_channel_id"]) is None]
+        if not broken:
+            await interaction.response.send_message(
+                embed=ui.card("✅ Nothing broken", "Every drop zone involving this server still has a working destination channel.",
+                               color=SUCCESS, guild=interaction.guild, section="Files"),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        fixed, unresolved = [], []
+        for r in broken:
+            src = self.bot.get_channel(r["channel_id"])
+            if src is None:
+                unresolved.append((r, "the drop channel itself is also gone — remove this one by hand"))
+                continue
+
+            match = None
+            if r["post_guild_id"]:
+                post_guild = self.bot.get_guild(r["post_guild_id"])
+                if post_guild is not None:
+                    _, texts = await fetch_live(post_guild)
+                    match = find_match(src.name, texts)
+            if match is None and not r["post_guild_id"]:
+                # Pre-dates post_guild_id -- only act when exactly one OTHER server the bot is in has an
+                # unambiguous same-named text channel, so a stale row never gets silently wired to the wrong place.
+                found = [
+                    c for g in self.bot.guilds if g.id != src.guild.id
+                    for c in g.text_channels if normalize(c.name) == normalize(src.name)
+                ]
+                if len(found) == 1:
+                    match = found[0]
+
+            if match is None:
+                unresolved.append((r, f"no same-named channel found to re-match (upload channel: `{r['channel_id']}`)"))
+                continue
+
+            await db.execute(
+                "UPDATE upload_channels SET post_channel_id = ?, post_guild_id = ? WHERE id = ?",
+                (match.id, match.guild.id, r["id"]),
+            )
+            fixed.append((r, match))
+
+        body = ""
+        if fixed:
+            body += "**✅ Fixed**\n" + "\n".join(f"📦 **{r['pack_name']}** → {m.mention} ({m.guild.name})" for r, m in fixed) + "\n\n"
+        if unresolved:
+            body += "**⚠️ Couldn't fix automatically**\n" + "\n".join(f"📦 **{r['pack_name']}** — {why}" for r, why in unresolved)
+        await interaction.followup.send(embed=ui.card("🔧 Fix broken drop zones", body or "Nothing to report.", color=SUCCESS if fixed else WARN,
+                                                       guild=interaction.guild, section="Files"), ephemeral=True)
 
     async def guide(self, interaction: discord.Interaction):
         all_rows = await db.fetch_all("SELECT * FROM upload_channels ORDER BY pack_name")

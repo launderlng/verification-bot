@@ -543,6 +543,7 @@ MIGRATIONS = [
     ("shop_settings", "receipt_note", "TEXT"),
     ("reviews", "kind", "TEXT NOT NULL DEFAULT 'product'"),
     ("upload_channels", "gif_url", "TEXT"),
+    ("upload_channels", "post_guild_id", "INTEGER"),  # the destination channel's guild, kept even if the channel itself later vanishes -- lets /autoupload re-match a dead destination by name instead of needing it re-added by hand
     ("reviews", "staff_id", "INTEGER"),
     ("reviews", "ticket_id", "INTEGER"),
     ("products", "file_id", "INTEGER"),

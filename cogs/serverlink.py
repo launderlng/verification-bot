@@ -396,11 +396,11 @@ class ServerLink(commands.Cog):
             if not self._in_scope(category_ids, main_channel):
                 continue
             await db.execute(
-                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, "
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, post_guild_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, post_guild_id = excluded.post_guild_id, "
                 "pack_name = excluded.pack_name, gif_url = excluded.gif_url",
-                (target_guild.id, target_channel.id, main_channel.id, main_channel.name.replace("-", " ").title(),
+                (target_guild.id, target_channel.id, main_channel.id, main_channel.guild.id, main_channel.name.replace("-", " ").title(),
                  None, 0, invoker_id, discord.utils.utcnow().isoformat(), gif_url),
             )
             wired += 1
