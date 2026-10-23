@@ -30,9 +30,40 @@ def simple(title: str, text: str, color: discord.Color = INFO) -> discord.Embed:
     return ui.card(title, text, color=color, section="Server link")
 
 
+class CategoryGifModal(discord.ui.Modal, title="🎬 Branding GIF"):
+    """Opened from CategoryLinkView's GIF button -- a single optional field, kept separate from the picker's
+    select/buttons since Discord can't put a text input directly on a view."""
+
+    gif_url = discord.ui.TextInput(label="GIF URL (optional)", placeholder="https://....gif", required=False, max_length=512)
+
+    def __init__(self, view: "CategoryLinkView"):
+        super().__init__()
+        self.view_ref = view
+        self.gif_url.default = view.gif_url
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view_ref.gif_url = self.gif_url.value.strip() or None
+        self.view_ref.gif_btn.label = "🎬 GIF set ✅" if self.view_ref.gif_url else "🎬 Add branding GIF"
+        self.view_ref.gif_btn.style = discord.ButtonStyle.success if self.view_ref.gif_url else discord.ButtonStyle.secondary
+        if interaction.message is not None:
+            await interaction.response.edit_message(view=self.view_ref)
+        else:
+            await interaction.response.send_message(
+                "🎬 GIF saved — it'll be attached to auto-posted drops." if self.view_ref.gif_url else "GIF cleared.",
+                ephemeral=True,
+            )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Branding GIF modal error", exc_info=error)
+
+
 class CategoryLinkView(discord.ui.View):
     """/linkserver's category picker: a dropdown of the main server's categories (plus a "whole server"
-    option) so staff choose exactly what gets mirrored, instead of always linking everything."""
+    option) so staff choose exactly what gets mirrored, instead of always linking everything. Also offers,
+    for the same picked scope, turning each mirrored channel into an auto-upload drop zone (file dropped in
+    the vault/staff channel -> stored + auto-posted with a Get-file button on the main server), optionally
+    branded with a GIF -- combining what used to be two separate setup steps (/linkserver then /autoupload
+    bulkadd) into one."""
 
     def __init__(self, cog: "ServerLink", invoker_id: int, main_guild: discord.Guild, target_guild: discord.Guild):
         super().__init__(timeout=180)
@@ -41,23 +72,35 @@ class CategoryLinkView(discord.ui.View):
         self.main_guild = main_guild
         self.target_guild = target_guild
         self.message: Optional[discord.Message] = None
+        self.autopost_enabled = False
+        self.gif_url: Optional[str] = None
 
         cats = main_guild.categories[:24]  # Discord caps a select at 25 options — leave one for "whole server"
         options = [discord.SelectOption(label="🌐 Mirror the whole server", value="__ALL__",
                                         description="Every category and channel, including uncategorized ones")]
         options += [discord.SelectOption(label=c.name[:100], value=str(c.id)) for c in cats]
         select = discord.ui.Select(placeholder="Choose categories to mirror (or the whole server)…",
-                                   min_values=1, max_values=len(options), options=options)
+                                   min_values=1, max_values=len(options), options=options, row=0)
         select.callback = self._on_select
         self.select = select
         self.add_item(select)
 
-        confirm_btn = discord.ui.Button(label="Link it", style=discord.ButtonStyle.success, emoji="🔗", disabled=True)
+        autopost_btn = discord.ui.Button(label="📤 Also auto-post dropped files", style=discord.ButtonStyle.secondary, row=1)
+        autopost_btn.callback = self._on_toggle_autopost
+        self.autopost_btn = autopost_btn
+        self.add_item(autopost_btn)
+
+        gif_btn = discord.ui.Button(label="🎬 Add branding GIF", style=discord.ButtonStyle.secondary, row=1)
+        gif_btn.callback = self._on_set_gif
+        self.gif_btn = gif_btn
+        self.add_item(gif_btn)
+
+        confirm_btn = discord.ui.Button(label="Link it", style=discord.ButtonStyle.success, emoji="🔗", disabled=True, row=2)
         confirm_btn.callback = self._on_confirm
         self.confirm_btn = confirm_btn
         self.add_item(confirm_btn)
 
-        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, row=2)
         cancel_btn.callback = self._on_cancel
         self.add_item(cancel_btn)
 
@@ -75,6 +118,15 @@ class CategoryLinkView(discord.ui.View):
             n = len(self.select.values)
             self.confirm_btn.label = f"Link {n} categor{'y' if n == 1 else 'ies'}"
         await interaction.response.edit_message(view=self)
+
+    async def _on_toggle_autopost(self, interaction: discord.Interaction):
+        self.autopost_enabled = not self.autopost_enabled
+        self.autopost_btn.style = discord.ButtonStyle.success if self.autopost_enabled else discord.ButtonStyle.secondary
+        self.autopost_btn.label = "✅ Auto-posting dropped files" if self.autopost_enabled else "📤 Also auto-post dropped files"
+        await interaction.response.edit_message(view=self)
+
+    async def _on_set_gif(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CategoryGifModal(self))
 
     async def _on_cancel(self, interaction: discord.Interaction):
         for item in self.children:
@@ -96,6 +148,17 @@ class CategoryLinkView(discord.ui.View):
             return
         try:
             embed = await self.cog._run_sync(self.target_guild, self.main_guild, category_ids, self.invoker_id)
+            if self.autopost_enabled:
+                wired = await self.cog._wire_autopost(self.target_guild, self.main_guild, category_ids, self.gif_url, self.invoker_id)
+                embed.add_field(
+                    name="📤 Auto-posting enabled",
+                    value=(
+                        f"Files dropped in **{wired}** linked channel{'s' if wired != 1 else ''} here will also be stored and "
+                        "auto-posted with a **Get file** button on the main server"
+                        + (", branded with your GIF." if self.gif_url else ".")
+                    ) if wired else "No text channels ended up mirrored in this scope, so nothing was wired up as a drop zone.",
+                    inline=False,
+                )
         except UserError as e:
             await interaction.edit_original_response(content=f"⚠️ {e}", view=None)
             self.stop()
@@ -135,7 +198,10 @@ class ServerLink(commands.Cog):
     was picked — channels made directly here are never touched or copied back. CONTENT forwarding, though,
     goes both ways: a message posted in a mirrored vault channel is forwarded into the matching channel on
     the main server, and a message posted in a mirrored main-server channel is forwarded back into the
-    matching vault channel too — each copy is tagged with who sent it and which server it came from."""
+    matching vault channel too — each copy is tagged with who sent it and which server it came from. The same
+    picker also has an optional **📤 Also auto-post dropped files** toggle (with an optional **🎬 branding
+    GIF**) that additionally wires every mirrored channel as an /autoupload drop zone, so a file dropped in a
+    vault channel is also stored and auto-posted with a Get-file button on the matching main-server channel."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -266,7 +332,11 @@ class ServerLink(commands.Cog):
         view = CategoryLinkView(self, interaction.user.id, main_guild, target_guild)
         view.message = await interaction.followup.send(
             f"Which parts of **{main_guild.name}** should this server mirror? Pick one or more categories below, "
-            "or **🌐 Mirror the whole server** for everything (including uncategorized channels).",
+            "or **🌐 Mirror the whole server** for everything (including uncategorized channels).\n\n"
+            "**📤 Also auto-post dropped files** additionally wires each linked channel as an auto-upload drop "
+            "zone — a file dropped here gets stored and auto-posted with a **Get file** button on the main "
+            "server, on top of the normal live message mirroring. **🎬 Add branding GIF** sets an optional GIF "
+            "shown on those auto-posts.",
             view=view, ephemeral=True,
         )
 
@@ -307,6 +377,34 @@ class ServerLink(commands.Cog):
             ("Scope", "Whole server" if category_ids is None else f"{len(category_ids)} categories"),
         ))
         return embed
+
+    async def _wire_autopost(self, target_guild: discord.Guild, main_guild: discord.Guild,
+                              category_ids: Optional[set], gif_url: Optional[str], invoker_id: int) -> int:
+        """On top of the live mirror's plain-text message forwarding, also turn every mapped TEXT channel
+        (within the picked scope) into an /autoupload drop zone: a file dropped in the vault/staff channel is
+        stored and auto-posted into the matching main-server channel behind a Get-file button, optionally
+        branded with `gif_url` -- the same mechanism /autoupload's own bulk-add commands use, just wired up
+        from the channel pairs /linkserver already mirrored instead of a separate manual pairing pass.
+        Returns how many drop zones were wired."""
+        channel_map = await db.get_channel_map(target_guild.id)  # main_channel_id -> target_channel_id
+        wired = 0
+        for main_id, target_id in channel_map.items():
+            main_channel = main_guild.get_channel(main_id)
+            target_channel = target_guild.get_channel(target_id)
+            if not isinstance(main_channel, discord.TextChannel) or not isinstance(target_channel, discord.TextChannel):
+                continue
+            if not self._in_scope(category_ids, main_channel):
+                continue
+            await db.execute(
+                "INSERT INTO upload_channels (guild_id, channel_id, post_channel_id, pack_name, required_role_id, once_per_user, created_by, created_at, gif_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(guild_id, channel_id) DO UPDATE SET post_channel_id = excluded.post_channel_id, "
+                "pack_name = excluded.pack_name, gif_url = excluded.gif_url",
+                (target_guild.id, target_channel.id, main_channel.id, main_channel.name.replace("-", " ").title(),
+                 None, 0, invoker_id, discord.utils.utcnow().isoformat(), gif_url),
+            )
+            wired += 1
+        return wired
 
     @app_commands.command(name="unlinkserver", description="Stop mirroring channels from the linked main server")
     @app_commands.default_permissions(administrator=True)
