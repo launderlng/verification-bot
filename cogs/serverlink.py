@@ -132,9 +132,10 @@ class ServerLink(commands.Cog):
     """/linkserver: mirror a main server's channels into this (second, "vault") server, live. You pick which
     categories to mirror (or the whole server) from a dropdown; after the first catch-up sync, any channel
     created, renamed, moved or deleted on the main server automatically happens here too, scoped to whatever
-    was picked — channels made directly here are never touched or copied back. The other direction, for
-    CONTENT: any message posted in a mirrored vault channel is forwarded into the matching channel on the
-    main server."""
+    was picked — channels made directly here are never touched or copied back. CONTENT forwarding, though,
+    goes both ways: a message posted in a mirrored vault channel is forwarded into the matching channel on
+    the main server, and a message posted in a mirrored main-server channel is forwarded back into the
+    matching vault channel too — each copy is tagged with who sent it and which server it came from."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -390,15 +391,15 @@ class ServerLink(commands.Cog):
 
     # --------------------------------------------------------- forwarding ----
 
-    async def _forward_message(self, message: discord.Message, main_channel: discord.TextChannel) -> None:
+    async def _forward_message(self, message: discord.Message, dest: discord.TextChannel) -> None:
         content = (message.content or "").strip()
         attachments = list(message.attachments)
         if not content and not attachments:
             return
-        perms = main_channel.permissions_for(main_channel.guild.me)
+        perms = dest.permissions_for(dest.guild.me)
         if not perms.send_messages or (attachments and not perms.attach_files):
             return
-        limit = main_channel.guild.filesize_limit
+        limit = dest.guild.filesize_limit
         files = []
         for a in attachments[:MAX_FORWARD_FILES]:
             if a.size > limit:
@@ -407,26 +408,40 @@ class ServerLink(commands.Cog):
                 files.append(discord.File(io.BytesIO(await a.read()), filename=a.filename, spoiler=a.is_spoiler()))
             except discord.HTTPException:
                 pass
+        prefix = f"**{message.author.display_name}** ({message.guild.name}):\n" if content else f"**{message.author.display_name}** ({message.guild.name}):"
+        body = (prefix + content)[:2000]
         try:
             kwargs = {"files": files} if files else {}
-            await main_channel.send(content=content[:2000] or None, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+            await dest.send(content=body, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
         except discord.HTTPException:
-            log.exception("Vault->main forward failed: %s -> %s", message.channel.id, main_channel.id)
+            log.exception("Message mirror failed: %s -> %s", message.channel.id, dest.id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.guild is None or message.author.bot or not _is_normal(message):
             return
+
+        # This server is a linked (vault/staff) server -> forward into the matching main-server channel
         link = await db.get_server_link(message.guild.id)
-        if link is None:
-            return
-        main_channel_id = await db.get_main_channel_id(message.guild.id, message.channel.id)
-        if main_channel_id is None:
-            return
-        main_guild = self.bot.get_guild(link["main_guild_id"])
-        main_channel = main_guild.get_channel(main_channel_id) if main_guild else None
-        if isinstance(main_channel, discord.TextChannel):
-            await self._forward_message(message, main_channel)
+        if link is not None:
+            main_channel_id = await db.get_main_channel_id(message.guild.id, message.channel.id)
+            if main_channel_id is not None:
+                main_guild = self.bot.get_guild(link["main_guild_id"])
+                main_channel = main_guild.get_channel(main_channel_id) if main_guild else None
+                if isinstance(main_channel, discord.TextChannel):
+                    await self._forward_message(message, main_channel)
+
+        # This server is the main server for one or more links -> forward into each linked channel too
+        for sublink in await db.get_server_links_for_main(message.guild.id):
+            target_guild = self.bot.get_guild(sublink["target_guild_id"])
+            if target_guild is None:
+                continue
+            target_channel_id = await db.get_target_channel_id(target_guild.id, message.channel.id)
+            if target_channel_id is None:
+                continue
+            target_channel = target_guild.get_channel(target_channel_id)
+            if isinstance(target_channel, discord.TextChannel):
+                await self._forward_message(message, target_channel)
 
     # ------------------------------------------------------------- listeners ----
 
