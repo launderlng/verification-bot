@@ -30,12 +30,111 @@ def simple(title: str, text: str, color: discord.Color = INFO) -> discord.Embed:
     return ui.card(title, text, color=color, section="Server link")
 
 
+class CategoryLinkView(discord.ui.View):
+    """/linkserver's category picker: a dropdown of the main server's categories (plus a "whole server"
+    option) so staff choose exactly what gets mirrored, instead of always linking everything."""
+
+    def __init__(self, cog: "ServerLink", invoker_id: int, main_guild: discord.Guild, target_guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.invoker_id = invoker_id
+        self.main_guild = main_guild
+        self.target_guild = target_guild
+        self.message: Optional[discord.Message] = None
+
+        cats = main_guild.categories[:24]  # Discord caps a select at 25 options — leave one for "whole server"
+        options = [discord.SelectOption(label="🌐 Mirror the whole server", value="__ALL__",
+                                        description="Every category and channel, including uncategorized ones")]
+        options += [discord.SelectOption(label=c.name[:100], value=str(c.id)) for c in cats]
+        select = discord.ui.Select(placeholder="Choose categories to mirror (or the whole server)…",
+                                   min_values=1, max_values=len(options), options=options)
+        select.callback = self._on_select
+        self.select = select
+        self.add_item(select)
+
+        confirm_btn = discord.ui.Button(label="Link it", style=discord.ButtonStyle.success, emoji="🔗", disabled=True)
+        confirm_btn.callback = self._on_confirm
+        self.confirm_btn = confirm_btn
+        self.add_item(confirm_btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("Only the admin who ran `/linkserver` can use this.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        self.confirm_btn.disabled = False
+        if "__ALL__" in self.select.values:
+            self.confirm_btn.label = "Link whole server"
+        else:
+            n = len(self.select.values)
+            self.confirm_btn.label = f"Link {n} categor{'y' if n == 1 else 'ies'}"
+        await interaction.response.edit_message(view=self)
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Cancelled — nothing was linked.", view=self)
+        self.stop()
+
+    async def _on_confirm(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="🔄 Linking and syncing…", view=self)
+
+        values = self.select.values
+        category_ids = None if "__ALL__" in values else {int(v) for v in values if v.isdigit()}
+
+        if self.target_guild.id in self.cog.syncing:
+            await interaction.edit_original_response(content="A sync is already running here. Wait for it to finish.", view=None)
+            self.stop()
+            return
+        try:
+            embed = await self.cog._run_sync(self.target_guild, self.main_guild, category_ids, self.invoker_id)
+        except UserError as e:
+            await interaction.edit_original_response(content=f"⚠️ {e}", view=None)
+            self.stop()
+            return
+        await interaction.edit_original_response(content=None, embed=embed, view=None)
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message is None:
+            return
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.exception("Server-link category picker error", exc_info=error)
+        msg = f"⚠️ {error}" if isinstance(error, UserError) else "Something went wrong linking that. Try `/linkserver` again."
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(content=msg, embed=None, view=None)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        self.cog.syncing.discard(self.target_guild.id)
+        self.stop()
+
+
 @app_commands.guild_only()
 class ServerLink(commands.Cog):
-    """/linkserver: mirror a main server's channels into this (second, "vault") server, live. After the first
-    catch-up sync, any channel created, renamed, moved or deleted on the main server automatically happens here
-    too — channels made directly here are never touched or copied back. The other direction, for CONTENT: any
-    message posted in a mirrored vault channel is forwarded into the matching channel on the main server."""
+    """/linkserver: mirror a main server's channels into this (second, "vault") server, live. You pick which
+    categories to mirror (or the whole server) from a dropdown; after the first catch-up sync, any channel
+    created, renamed, moved or deleted on the main server automatically happens here too, scoped to whatever
+    was picked — channels made directly here are never touched or copied back. The other direction, for
+    CONTENT: any message posted in a mirrored vault channel is forwarded into the matching channel on the
+    main server."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -78,29 +177,44 @@ class ServerLink(commands.Cog):
         await db.set_channel_map(target_guild.id, channel.id, created.id)
         return created
 
-    async def _full_sync(self, main_guild: discord.Guild, target_guild: discord.Guild) -> int:
-        total = len(main_guild.categories) + sum(1 for c in main_guild.channels if not isinstance(c, discord.CategoryChannel))
+    async def _full_sync(self, main_guild: discord.Guild, target_guild: discord.Guild, category_ids: Optional[set] = None) -> int:
+        """Mirror categories/channels from main_guild into target_guild. category_ids=None mirrors everything
+        (including uncategorized channels); a set scopes this to just those main-server categories and the
+        channels inside them."""
+        cats = main_guild.categories if category_ids is None else [c for c in main_guild.categories if c.id in category_ids]
+        if category_ids is None:
+            chans = [c for c in main_guild.channels if not isinstance(c, discord.CategoryChannel)]
+        else:
+            chans = [c for c in main_guild.channels
+                     if not isinstance(c, discord.CategoryChannel) and c.category_id in category_ids]
+        total = len(cats) + len(chans)
         if total > MAX_MIRROR_ITEMS:
-            raise UserError(f"The main server has more than {MAX_MIRROR_ITEMS} channels/categories — too many to mirror in one go.")
+            raise UserError(f"That's more than {MAX_MIRROR_ITEMS} channels/categories — too many to mirror in one go. Pick fewer categories.")
         existing_map = await db.get_channel_map(target_guild.id)
         count = 0
-        for cat in main_guild.categories:
+        for cat in cats:
             if cat.id in existing_map and target_guild.get_channel(existing_map[cat.id]):
                 continue
             await self._ensure_category(target_guild, cat)
             count += 1
-        for ch in main_guild.channels:
-            if isinstance(ch, discord.CategoryChannel):
-                continue
+        for ch in chans:
             if ch.id in existing_map and target_guild.get_channel(existing_map[ch.id]):
                 continue
             if await self._mirror_channel(target_guild, ch) is not None:
                 count += 1
         return count
 
+    def _in_scope(self, category_ids: Optional[set], channel: discord.abc.GuildChannel) -> bool:
+        """Whether `channel` (or the category itself) falls inside a link's scope. None scope = whole server."""
+        if category_ids is None:
+            return True
+        if isinstance(channel, discord.CategoryChannel):
+            return channel.id in category_ids
+        return getattr(channel, "category_id", None) in category_ids
+
     # ------------------------------------------------------------- commands ----
 
-    @app_commands.command(name="linkserver", description="Mirror a main server's channels into this server, live")
+    @app_commands.command(name="linkserver", description="Mirror a main server's channels into this server, live — pick categories or the whole thing")
     @app_commands.describe(main_server_id="The ID of the main server to mirror channels from (I must be in it too)")
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
@@ -125,10 +239,29 @@ class ServerLink(commands.Cog):
             raise UserError("A sync is already running here. Wait for it to finish.")
 
         await interaction.response.defer(ephemeral=True)
-        await db.set_server_link(target_guild.id, main_guild.id, interaction.user.id)
+
+        if not main_guild.categories:
+            # nothing to choose between — mirror the (flat) server straight away
+            result = await self._run_sync(target_guild, main_guild, None, interaction.user.id)
+            await interaction.followup.send(embed=result, ephemeral=True)
+            return
+
+        view = CategoryLinkView(self, interaction.user.id, main_guild, target_guild)
+        view.message = await interaction.followup.send(
+            f"Which parts of **{main_guild.name}** should this server mirror? Pick one or more categories below, "
+            "or **🌐 Mirror the whole server** for everything (including uncategorized channels).",
+            view=view, ephemeral=True,
+        )
+
+    async def _run_sync(self, target_guild: discord.Guild, main_guild: discord.Guild,
+                         category_ids: Optional[set], invoker_id: int) -> discord.Embed:
+        """Sets the link + its scope, runs the catch-up sync, and returns the result embed. Raises UserError
+        on failure (caller decides how to surface it)."""
+        await db.set_server_link(target_guild.id, main_guild.id, invoker_id)
+        await db.set_linked_category_ids(target_guild.id, category_ids)
         self.syncing.add(target_guild.id)
         try:
-            created = await self._full_sync(main_guild, target_guild)
+            created = await self._full_sync(main_guild, target_guild, category_ids)
         except UserError:
             self.syncing.discard(target_guild.id)
             raise
@@ -136,20 +269,27 @@ class ServerLink(commands.Cog):
             log.exception("Initial server-link sync failed")
             self.syncing.discard(target_guild.id)
             raise UserError(
-                "The first sync hit an error partway through. What was already created is still linked and will keep syncing live — "
+                "The first sync hit an error partway through. What was already created is still linked and will keep syncing live for the picked scope — "
                 "check my Manage Channels permission in both servers and run `/linkserver` again to catch up on the rest."
             ) from None
         self.syncing.discard(target_guild.id)
 
         noun = "channel/category" if created == 1 else "channels/categories"
-        await interaction.followup.send(embed=simple(
+        scope_text = "the **whole server**" if category_ids is None else (
+            f"**{len(category_ids)}** selected categor{'y' if len(category_ids) == 1 else 'ies'}"
+        )
+        embed = simple(
             "🔗 Server linked",
-            f"This server now mirrors **{main_guild.name}**. Created **{created}** {noun} to catch up.\n\n"
-            "From now on, channels created, renamed, moved or deleted on the main server automatically happen here too — "
-            "one-way only, nothing made directly in this server is touched or copied back.",
+            f"This server now mirrors {scope_text} from **{main_guild.name}**. Created **{created}** {noun} to catch up.\n\n"
+            "From now on, channels created, renamed, moved or deleted within that scope on the main server automatically "
+            "happen here too — one-way only, nothing made directly in this server is touched or copied back.",
             COLOR,
-        ), ephemeral=True)
-        await emit(target_guild, "server", "🔗 Server link set up", ui.kv(("🛡️ By", interaction.user.mention), ("Main server", main_guild.name)))
+        )
+        await emit(target_guild, "server", "🔗 Server link set up", ui.kv(
+            ("🛡️ By", f"<@{invoker_id}>"), ("Main server", main_guild.name),
+            ("Scope", "Whole server" if category_ids is None else f"{len(category_ids)} categories"),
+        ))
+        return embed
 
     @app_commands.command(name="unlinkserver", description="Stop mirroring channels from the linked main server")
     @app_commands.default_permissions(administrator=True)
@@ -174,8 +314,21 @@ class ServerLink(commands.Cog):
             return await interaction.response.send_message(embed=simple("Not linked", "This server isn't mirroring any main server. Use `/linkserver` to set it up.", INFO), ephemeral=True)
         main_guild = self.bot.get_guild(link["main_guild_id"])
         mapped = len(await db.get_channel_map(interaction.guild.id))
+        category_ids = db.parse_category_ids(link["category_ids"])
+        if category_ids is None:
+            scope_line = "Scope: the **whole server**."
+        else:
+            names = []
+            if main_guild:
+                names = [c.name for c in main_guild.categories if c.id in category_ids]
+            scope_line = f"Scope: **{len(category_ids)}** categor{'y' if len(category_ids) == 1 else 'ies'}" + (
+                f" ({', '.join(names)})" if names else ""
+            ) + "."
         await interaction.response.send_message(embed=simple(
-            "🔗 Linked", f"Mirroring **{main_guild.name if main_guild else link['main_guild_id']}** live. **{mapped}** channel(s)/category(s) tracked so far.", COLOR,
+            "🔗 Linked",
+            f"Mirroring **{main_guild.name if main_guild else link['main_guild_id']}** live. "
+            f"**{mapped}** channel(s)/category(s) tracked so far.\n{scope_line}",
+            COLOR,
         ), ephemeral=True)
 
     # --------------------------------------------------------- forwarding ----
@@ -226,6 +379,8 @@ class ServerLink(commands.Cog):
             target_guild = self.bot.get_guild(link["target_guild_id"])
             if target_guild is None or not target_guild.me.guild_permissions.manage_channels:
                 continue
+            if not self._in_scope(db.parse_category_ids(link["category_ids"]), channel):
+                continue  # outside this link's picked categories — leave it alone
             try:
                 await self._mirror_channel(target_guild, channel)
             except discord.HTTPException:
@@ -253,13 +408,35 @@ class ServerLink(commands.Cog):
             return
         for link in await db.get_server_links_for_main(after.guild.id):
             target_guild_id = link["target_guild_id"]
-            mapped_id = await db.get_target_channel_id(target_guild_id, after.id)
-            if mapped_id is None:
-                continue
             target_guild = self.bot.get_guild(target_guild_id)
-            target_channel = target_guild.get_channel(mapped_id) if target_guild else None
+            if target_guild is None:
+                continue
+            category_ids = db.parse_category_ids(link["category_ids"])
+            mapped_id = await db.get_target_channel_id(target_guild_id, after.id)
+            now_in_scope = self._in_scope(category_ids, after)
+
+            if mapped_id is None:
+                if now_in_scope:
+                    # moved into a picked category it wasn't mirrored from before — start mirroring it now
+                    try:
+                        await self._mirror_channel(target_guild, after)
+                    except discord.HTTPException:
+                        log.exception("Mirror create-on-move failed: %s -> guild %s", after.id, target_guild_id)
+                continue
+
+            target_channel = target_guild.get_channel(mapped_id)
             if target_channel is None:
                 continue
+
+            if not now_in_scope:
+                # moved out of this link's picked categories — stop mirroring it
+                try:
+                    await target_channel.delete(reason=REASON_DELETE)
+                except discord.HTTPException:
+                    log.exception("Mirror delete-on-move failed: %s -> %s", after.id, mapped_id)
+                await db.delete_channel_map_by_main(target_guild_id, after.id)
+                continue
+
             try:
                 kwargs = {}
                 if before.name != after.name:

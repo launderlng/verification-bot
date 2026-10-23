@@ -589,6 +589,7 @@ MIGRATIONS = [
     ("autoupload_settings", "skip_terms", "TEXT"),      # comma-separated channel name terms to skip on refresh
     ("auth_sessions", "open_ip", "TEXT"),    # IP that opened the Discord login page (/auth/start)
     ("auth_sessions", "callback_ip", "TEXT"),  # IP that completed the login (/auth/callback)
+    ("server_links", "category_ids", "TEXT"),  # comma-separated main-server category IDs this link is scoped to (NULL = whole server)
 ]
 
 
@@ -763,6 +764,24 @@ async def set_server_link(target_guild_id: int, main_guild_id: int, created_by: 
 async def delete_server_link(target_guild_id: int) -> None:
     await execute("DELETE FROM server_links WHERE target_guild_id = ?", (target_guild_id,))
     await execute("DELETE FROM channel_link_map WHERE target_guild_id = ?", (target_guild_id,))
+
+
+def parse_category_ids(raw: str | None) -> set[int] | None:
+    """NULL/empty = mirror the whole server. Otherwise the set of main-server category IDs in scope."""
+    if not raw:
+        return None
+    return {int(x) for x in raw.split(",") if x.strip().isdigit()}
+
+
+async def get_linked_category_ids(target_guild_id: int) -> set[int] | None:
+    link = await get_server_link(target_guild_id)
+    return parse_category_ids(link["category_ids"]) if link else None
+
+
+async def set_linked_category_ids(target_guild_id: int, category_ids: set[int] | None) -> None:
+    """None/empty = mirror the whole server; otherwise scope this link to just these main-server categories."""
+    raw = ",".join(str(i) for i in category_ids) if category_ids else None
+    await execute("UPDATE server_links SET category_ids = ? WHERE target_guild_id = ?", (raw, target_guild_id))
 
 
 async def get_channel_map(target_guild_id: int) -> dict:
