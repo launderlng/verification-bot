@@ -164,6 +164,22 @@ class ServerLink(commands.Cog):
         if not isinstance(channel, MIRRORABLE):
             return None  # forum/stage/announcement channels aren't mirrored, to keep this simple and reliable
         parent = await self._ensure_category(target_guild, channel.category)
+
+        # Already got a same-name channel sitting there (made by hand before this was linked)? Link to that
+        # instead of creating a duplicate — only genuinely missing channels get created.
+        mapped_target_ids = set((await db.get_channel_map(target_guild.id)).values())
+        pool = parent.channels if parent is not None else [
+            c for c in target_guild.channels if isinstance(c, MIRRORABLE) and c.category_id is None
+        ]
+        by_name = next(
+            (c for c in pool if c.id not in mapped_target_ids
+             and type(c) is type(channel) and c.name.lower() == channel.name.lower()),
+            None,
+        )
+        if by_name is not None:
+            await db.set_channel_map(target_guild.id, channel.id, by_name.id)
+            return by_name
+
         kwargs = {"category": parent, "reason": REASON_CREATE}
         if isinstance(channel, discord.TextChannel):
             if channel.topic:
@@ -330,6 +346,47 @@ class ServerLink(commands.Cog):
             f"**{mapped}** channel(s)/category(s) tracked so far.\n{scope_line}",
             COLOR,
         ), ephemeral=True)
+
+    @app_commands.command(name="linkrefresh", description="Catch this server up with the linked main server — no new duplicates")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def linkrefresh(self, interaction: discord.Interaction):
+        target_guild = interaction.guild
+        link = await db.get_server_link(target_guild.id)
+        if not link:
+            raise UserError("This server isn't linked to a main server yet. Use `/linkserver` to set that up first.")
+        main_guild = self.bot.get_guild(link["main_guild_id"])
+        if main_guild is None:
+            raise UserError("I'm no longer in the linked main server, so I can't refresh from it.")
+        if not target_guild.me.guild_permissions.manage_channels:
+            raise UserError("I need the **Manage Channels** permission here.")
+        if not main_guild.me.guild_permissions.view_channel:
+            raise UserError(f"I need **View Channel** in **{main_guild.name}** to see its channels.")
+        if target_guild.id in self.syncing:
+            raise UserError("A sync is already running here. Wait for it to finish.")
+
+        await interaction.response.defer(ephemeral=True)
+        category_ids = db.parse_category_ids(link["category_ids"])
+        self.syncing.add(target_guild.id)
+        try:
+            created = await self._full_sync(main_guild, target_guild, category_ids)
+        except UserError:
+            self.syncing.discard(target_guild.id)
+            raise
+        except Exception:
+            log.exception("linkrefresh sync failed")
+            self.syncing.discard(target_guild.id)
+            raise UserError("The refresh hit an error partway through. What's already linked is unaffected — try again in a moment.") from None
+        self.syncing.discard(target_guild.id)
+
+        scope_text = "the whole server" if category_ids is None else f"{len(category_ids)} linked categories"
+        if created == 0:
+            text = f"Already caught up — nothing new found in {scope_text} on **{main_guild.name}**."
+        else:
+            noun = "channel/category" if created == 1 else "channels/categories"
+            text = (f"Caught up with **{main_guild.name}** ({scope_text}). Linked/created **{created}** new {noun} — "
+                    "existing channels with matching names were reused, not duplicated.")
+        await interaction.followup.send(embed=simple("🔄 Refreshed", text, COLOR), ephemeral=True)
 
     # --------------------------------------------------------- forwarding ----
 
