@@ -979,17 +979,23 @@ class AutoUpload(commands.Cog):
 
     async def list(self, interaction: discord.Interaction):
         all_rows = await db.fetch_all("SELECT * FROM upload_channels ORDER BY pack_name")
-        # upload_channels isn't keyed by the posting guild (the upload side may be on another server),
-        # so filter here to just the rows that actually post into this server.
-        rows = [r for r in all_rows if interaction.guild.get_channel(r["post_channel_id"]) is not None]
+        # upload_channels isn't keyed by a single "which server does this involve" column -- a row belongs to
+        # this server if EITHER side is here: the drop (upload) channel lives here (guild_id), or the files
+        # post here. Matching post_channel_id alone used to be the only check, which silently hid any row
+        # whose destination channel the bot had lost access to (deleted, bot kicked, channel recreated with a
+        # new ID) -- exactly the broken rows staff need to see in order to fix or remove them. Now a broken
+        # destination still shows up (flagged ⚠️) as long as the upload side is this server.
+        rows = [r for r in all_rows if r["guild_id"] == interaction.guild_id or interaction.guild.get_channel(r["post_channel_id"]) is not None]
         if not rows:
-            raise UserError("No drop zones post into this server yet. Add one from the menu's **Add drop zone** or **Bulk add** button.")
+            raise UserError("No drop zones involve this server yet. Add one from the menu's **Add drop zone** or **Bulk add** button.")
         lines = []
         for r in rows:
             src = self.bot.get_channel(r["channel_id"])
             src_label = f"#{src.name} ({src.guild.name})" if src and src.guild.id != interaction.guild_id else (f"#{src.name}" if src else f"`{r['channel_id']}`")
+            dest = self.bot.get_channel(r["post_channel_id"])
+            dest_label = dest.mention if dest else f"⚠️ missing (`{r['post_channel_id']}`)"
             lines.append(
-                f"📦 **{r['pack_name']}** · {src_label} → <#{r['post_channel_id']}>"
+                f"📦 **{r['pack_name']}** · {src_label} (`{r['channel_id']}`) → {dest_label}"
                 + (f" · 🔒 <@&{r['required_role_id']}>" if r["required_role_id"] else "") + (" · 🔁 once" if r["once_per_user"] else "")
             )
         await interaction.response.send_message(embed=ui.card("📥 Drop zones", "\n".join(lines), guild=interaction.guild, section="Files"), ephemeral=True)
